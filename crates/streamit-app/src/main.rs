@@ -62,7 +62,7 @@ fn run_app() -> anyhow::Result<()> {
         for (kind, health) in &wired.health {
             let _ = tx.send(Command::DeviceHealth(*kind, health.clone())).await;
         }
-        wiring::spawn_health_poll(wired.probes, shared.clone(), tx.clone(), &wired.health);
+        wiring::spawn_health_poll(wired.probes, shared.clone(), tx.clone(), engine.rx.clone(), &wired.health);
         spawn_snapshot_log(engine.rx.clone());
         DeckSurface::run(EngineHandle { tx: tx.clone(), rx: engine.rx.clone() });
         ui::Started { tx, snap: engine.rx, yt: wired.devices.yt.clone() }

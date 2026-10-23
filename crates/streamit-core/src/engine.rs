@@ -859,8 +859,11 @@ impl Engine {
         self.apply_assessment(r.assessment, r.epoch);
     }
 
-    /// A current assessment sets the offers, and the stage when no job runs. A
-    /// stale one (the epoch has moved on) never sets the stage and only adds offers.
+    /// A current assessment sets the offers, and the stage only when no job runs and
+    /// the stage is Idle (R20): an assessment can raise Idle to Prepared or Live, but
+    /// never lowers Prepared/Countdown/Live/Ending/Ended, because a single failed read
+    /// mid-service would otherwise show Idle. A stale one (the epoch has moved on)
+    /// never sets the stage and only adds offers.
     fn apply_assessment(&self, a: Assessment, epoch: u64) {
         let current = epoch == self.epoch;
         let busy = self.running.is_some();
@@ -870,8 +873,10 @@ impl Engine {
         self.set(|s| {
             if current {
                 s.offers = a.offer;
-                if !busy {
+                if !busy && s.stage == Stage::Idle {
                     s.stage = a.stage;
+                } else if !busy && s.stage != a.stage {
+                    info!(stage = ?s.stage, assessed = ?a.stage, "assessment does not change the stage");
                 }
             } else {
                 for o in a.offer {
@@ -1749,5 +1754,38 @@ mod tests {
         assert_eq!(snap(&e).job, Some("a video"));
         h.player.emit(PlayerEvent::Ended);
         until(&mut e, "no job", |s| s.job.is_none() && s.playing.is_none()).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_never_downgrades_prepared_or_live() {
+        // Prepared: the encoder read fails, so a fresh assessment says Idle.
+        let (d, log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Prepare).await;
+        until(&mut e, "Prepared", |s| s.stage == Stage::Prepared(Readiness::Ready) && s.job.is_none()).await;
+        h.encoder.fail_times("status", 20);
+        send(&e, Command::Refresh).await;
+        until(&mut e, "the refresh's warning", |s| {
+            s.last_warning.as_deref().is_some_and(|w| w.contains("disconnected"))
+        })
+        .await;
+        sleep(MS(500)).await;
+        assert_eq!(snap(&e).stage, Stage::Prepared(Readiness::Ready));
+        assert!(log.calls().contains(&Call::EncoderStart));
+
+        // Live: the YouTube life-cycle read fails, so a fresh assessment says Idle.
+        let (d, _log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::GoLive).await;
+        until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        h.yt.fail_times("life_cycle", 20);
+        h.encoder.fail_times("status", 20);
+        send(&e, Command::Refresh).await;
+        until(&mut e, "the refresh's warning", |s| {
+            s.last_warning.as_deref().is_some_and(|w| w.contains("disconnected"))
+        })
+        .await;
+        sleep(MS(500)).await;
+        assert_eq!(snap(&e).stage, Stage::Live);
     }
 }

@@ -15,8 +15,9 @@ use streamit_core::devices::{
     self, BroadcastCheck, BroadcastSummary, Broadcasts, Counter, DeviceError, Devices, Encoder,
     EncoderStatus, Fix, Health, Phase, Player, PlayerEvent, Router, StreamSwitcher, Switcher,
 };
-use streamit_core::engine::{Command, DeviceHealth, DeviceKind};
-use tokio::sync::{broadcast, mpsc};
+use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
+use streamit_core::golive::Stage;
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use crate::logged::Logged;
 use std::collections::BTreeSet;
@@ -570,12 +571,13 @@ fn log_health(kind: DeviceKind, h: &DeviceHealth) {
 /// Polls every `POLL_EVERY` and sends `Command::DeviceHealth` for each change. `seed` is
 /// the health already sent. The first time a network device turns Ok after startup it
 /// also sends one `Command::Refresh` (per poll), so the engine reassesses with that
-/// device's state (a restart mid-service may come up before every device has answered).
-/// Stops when the engine is gone.
+/// device's state (a restart mid-service may come up before every device has answered),
+/// but only while `snap` shows stage Idle and no job (R20). Stops when the engine is gone.
 pub fn spawn_health_poll(
     probes: Probes,
     config: Arc<RwLock<Config>>,
     tx: mpsc::Sender<Command>,
+    snap: watch::Receiver<Snapshot>,
     seed: &[(DeviceKind, DeviceHealth)],
 ) -> JoinHandle<()> {
     let mut tracker = HealthTracker::default();
@@ -597,9 +599,19 @@ pub fn spawn_health_poll(
                 }
             }
             if !came_up.is_empty() {
-                info!(devices = ?came_up, "first contact after startup: reassessing");
-                if tx.send(Command::Refresh).await.is_err() {
-                    return;
+                // R20: only while nothing has started; mid-service the engine's stage
+                // stands, and the device stays marked so it never triggers later.
+                let idle = {
+                    let s = snap.borrow();
+                    s.stage == Stage::Idle && s.job.is_none()
+                };
+                if idle {
+                    info!(devices = ?came_up, "first contact after startup: reassessing");
+                    if tx.send(Command::Refresh).await.is_err() {
+                        return;
+                    }
+                } else {
+                    info!(devices = ?came_up, "first contact during a service: not reassessing");
                 }
             }
         }
@@ -746,7 +758,8 @@ mod tests {
         assert!(matches!(seed[0], (DeviceKind::StreamAtem, DeviceHealth::Down(_))));
         let (tx, mut rx) = mpsc::channel(64);
         let cfg = Arc::new(RwLock::new(Config::default()));
-        let poll = spawn_health_poll(p, cfg, tx, &seed);
+        let (_snap_tx, snap_rx) = watch::channel(Snapshot::default());
+        let poll = spawn_health_poll(p, cfg, tx, snap_rx, &seed);
         tokio::time::sleep(Duration::from_secs(13)).await; // six more polls
         // A later drop and recovery is not the first time: no second Refresh.
         h.stream.fail_next("program");
@@ -778,5 +791,52 @@ mod tests {
         let start = tokio::time::Instant::now();
         p.wait_ready(&NETWORK, 0, STARTUP_WAIT).await;
         assert!(start.elapsed() <= STARTUP_WAIT + Duration::from_millis(200));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_contact_during_prepared_sends_no_refresh() {
+        use streamit_core::golive::Readiness;
+        let (d, _log, h) = fake_devices();
+        h.stream.fail_times("program", 2);
+        let p = Probes::new(d, Late::new("x"), Late::new("x"));
+        let seed = p.poll(0).await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let cfg = Arc::new(RwLock::new(Config::default()));
+        let prepared = Snapshot { stage: Stage::Prepared(Readiness::Ready), ..Snapshot::default() };
+        let (snap_tx, snap_rx) = watch::channel(prepared);
+        let poll = spawn_health_poll(p, cfg, tx, snap_rx, &seed);
+        tokio::time::sleep(Duration::from_secs(7)).await; // the Stream ATEM comes up
+        // Back to Idle and a later drop/recover: still the device's first contact was
+        // used up, so no Refresh now either.
+        snap_tx.send_replace(Snapshot::default());
+        h.stream.fail_next("program");
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        poll.abort();
+        let mut cmds = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            cmds.push(c);
+        }
+        assert!(cmds.contains(&Command::DeviceHealth(DeviceKind::StreamAtem, DeviceHealth::Ok)), "{cmds:?}");
+        assert!(!cmds.contains(&Command::Refresh), "{cmds:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_contact_while_a_job_runs_sends_no_refresh() {
+        let (d, _log, h) = fake_devices();
+        h.hub.fail_times("route_of", 2);
+        let p = Probes::new(d, Late::new("x"), Late::new("x"));
+        let seed = p.poll(0).await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let cfg = Arc::new(RwLock::new(Config::default()));
+        let (_snap_tx, snap_rx) = watch::channel(Snapshot { job: Some("Prepare"), ..Snapshot::default() });
+        let poll = spawn_health_poll(p, cfg, tx, snap_rx, &seed);
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        poll.abort();
+        let mut cmds = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            cmds.push(c);
+        }
+        assert!(cmds.contains(&Command::DeviceHealth(DeviceKind::VideoHub, DeviceHealth::Ok)), "{cmds:?}");
+        assert!(!cmds.contains(&Command::Refresh), "{cmds:?}");
     }
 }
