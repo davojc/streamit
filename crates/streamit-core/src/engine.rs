@@ -35,8 +35,9 @@ use tracing::{info, warn};
 
 /// How long an ignored cue key flashes.
 pub const FLASH_FOR: Duration = Duration::from_secs(1);
-/// Longest a startup check or a Refresh may take (a down YouTube otherwise holds the
-/// startup check, and every press queued behind it, for its HTTP timeouts).
+/// Longest the YouTube part of a startup check or a Refresh may take (a down YouTube
+/// otherwise holds the startup check, and every press queued behind it, for its HTTP
+/// timeouts). The equipment part is never bounded by it: its assessment always applies.
 pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Warning shown when a sequence runs with no broadcast selected.
 pub const NO_BROADCAST: &str = "No broadcast selected";
@@ -231,6 +232,8 @@ struct Refreshed {
     selected: Option<String>,
     check: Option<BroadcastCheck>,
     assessment: Assessment,
+    /// YouTube did not answer within `REFRESH_TIMEOUT`: the report and selection are empty.
+    youtube_timed_out: bool,
 }
 
 /// Results of side tasks, applied by the loop.
@@ -321,17 +324,8 @@ impl Engine {
     }
 
     async fn run(mut self, mut rx: mpsc::Receiver<Command>, mut aux_rx: mpsc::UnboundedReceiver<Aux>) {
-        let r = refresh(self.d.clone(), self.config(), None, false, self.epoch, self.sel_gen);
-        match tokio::time::timeout(REFRESH_TIMEOUT, r).await {
-            Ok(r) => self.apply_refresh(r),
-            Err(_) => set_warning(
-                &self.snap,
-                format!(
-                    "The startup check did not finish within {} s; press Refresh to try again",
-                    REFRESH_TIMEOUT.as_secs()
-                ),
-            ),
-        }
+        let r = refresh(self.d.clone(), self.config(), None, false, self.epoch, self.sel_gen).await;
+        self.apply_refresh(r, true);
         loop {
             let wake = tokio::select! {
                 cmd = rx.recv() => match cmd {
@@ -554,20 +548,11 @@ impl Engine {
                 }
             },
             Command::Refresh => {
-                let (d, c, sel, aux, snap) =
-                    (self.d.clone(), self.config(), self.selected(), self.aux.clone(), self.snap.clone());
+                let (d, c, sel, aux) = (self.d.clone(), self.config(), self.selected(), self.aux.clone());
                 let (player_active, epoch, sel_gen) = (self.player_active(), self.epoch, self.sel_gen);
                 tokio::spawn(async move {
-                    let r = refresh(d, c, sel, player_active, epoch, sel_gen);
-                    match tokio::time::timeout(REFRESH_TIMEOUT, r).await {
-                        Ok(r) => {
-                            let _ = aux.send(Aux::Refreshed(Box::new(r)));
-                        }
-                        Err(_) => set_warning(
-                            &snap,
-                            format!("Refresh did not finish within {} s", REFRESH_TIMEOUT.as_secs()),
-                        ),
-                    }
+                    let r = refresh(d, c, sel, player_active, epoch, sel_gen).await;
+                    let _ = aux.send(Aux::Refreshed(Box::new(r)));
                 });
             }
             Command::DeviceHealth(kind, health) => {
@@ -1060,7 +1045,7 @@ impl Engine {
                     }
                 });
             }
-            Aux::Refreshed(r) => self.apply_refresh(*r),
+            Aux::Refreshed(r) => self.apply_refresh(*r, false),
             Aux::ClearFlash(generation) => {
                 if generation == self.flash_gen {
                     self.set(|s| s.flash = None);
@@ -1075,14 +1060,29 @@ impl Engine {
     }
 
     /// R23: a refresh never replaces or clears the operator's selection. It only fills an
-    /// empty one; a failed list read keeps the last list.
-    fn apply_refresh(&mut self, r: Refreshed) {
+    /// empty one; a failed list read keeps the last list. `startup` words the warning
+    /// when YouTube timed out.
+    fn apply_refresh(&mut self, r: Refreshed, startup: bool) {
         if r.report.listed {
             self.broadcasts = r.report.broadcasts;
         }
         let current_sel = r.sel_gen == self.sel_gen;
         let broadcast = r.selected.as_deref().map(|id| self.summary_for(id));
-        let errors = r.report.device_errors.join("; ");
+        let mut errors = r.report.device_errors;
+        if r.youtube_timed_out {
+            let secs = REFRESH_TIMEOUT.as_secs();
+            errors.insert(
+                0,
+                if startup {
+                    format!(
+                        "The startup check did not finish reading YouTube within {secs} s; the equipment was still                          checked. Press Refresh to try again"
+                    )
+                } else {
+                    format!("Refresh did not finish reading YouTube within {secs} s; the equipment was still checked")
+                },
+            );
+        }
+        let errors = errors.join("; ");
         self.set(|s| {
             if current_sel && let Some(b) = broadcast {
                 let same = s.broadcast.as_ref().is_some_and(|x| x.id == b.id);
@@ -1187,7 +1187,9 @@ fn mss(d: Duration) -> String {
 }
 
 /// Stage 0 plus assessment. Keeps `current` selected whatever the list says (R23);
-/// only an empty selection takes stage 0's choice.
+/// only an empty selection takes stage 0's choice. Only the YouTube part is bounded by
+/// `REFRESH_TIMEOUT`; on timeout the rest carries on with no broadcast, so the equipment
+/// assessment is always made (a crash left on the DeckLink still offers Recover).
 async fn refresh(
     d: Devices,
     c: Config,
@@ -1196,20 +1198,29 @@ async fn refresh(
     epoch: u64,
     sel_gen: u64,
 ) -> Refreshed {
-    let mut report = golive::stage0(&d, &c).await;
-    let selected = current.or_else(|| report.selected.clone());
-    let check = match &selected {
-        Some(id) if selected != report.selected => match d.yt.check(id).await {
-            Ok(c) => Some(c),
-            Err(e) => {
-                report.device_errors.push(format!("YouTube broadcast check: {e}"));
-                None
-            }
-        },
-        _ => report.check,
+    let youtube = async {
+        let mut report = golive::stage0_youtube(&d, &c).await;
+        let selected = current.or_else(|| report.selected.clone());
+        let check = match &selected {
+            Some(id) if selected != report.selected => match d.yt.check(id).await {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    report.device_errors.push(format!("YouTube broadcast check: {e}"));
+                    None
+                }
+            },
+            _ => report.check,
+        };
+        (report, selected, check)
     };
+    let (mut report, selected, check, youtube_timed_out) = match tokio::time::timeout(REFRESH_TIMEOUT, youtube).await
+    {
+        Ok((report, selected, check)) => (report, selected, check, false),
+        Err(_) => (Stage0Report::default(), None, None, true),
+    };
+    report.device_errors.extend(golive::stage0_devices(&d).await);
     let assessment = recovery::assess(&d, &c, selected.as_deref(), player_active).await;
-    Refreshed { epoch, sel_gen, report, selected, check, assessment }
+    Refreshed { epoch, sel_gen, report, selected, check, assessment, youtube_timed_out }
 }
 
 fn read(c: &RwLock<Config>) -> Config {
@@ -2198,6 +2209,30 @@ mod tests {
         assert!(w.contains("Refresh did not finish"), "{w}");
     }
 
+    /// The timeout bounds only YouTube: the device assessment always runs and applies,
+    /// at startup and on Refresh.
+    #[tokio::test(start_paused = true)]
+    async fn slow_youtube_still_applies_device_assessment() {
+        let (d, _log, h) = rig();
+        let c = cfg(vec![]);
+        let dk = c.read().unwrap().stream_atem.decklink_input;
+        h.yt.set_delay("upcoming", Duration::from_secs(30));
+        h.stream.set_program_state(dk); // left on the DeckLink by a crash mid-video
+        let start = tokio::time::Instant::now();
+        let mut e = Engine::spawn(d, c);
+        let s = until(&mut e, "Recover offered", |s| s.offers.contains(&Offer::Recover)).await;
+        assert!(start.elapsed() <= REFRESH_TIMEOUT + Duration::from_secs(1), "took {:?}", start.elapsed());
+        assert!(s.last_warning.as_deref().is_some_and(|w| w.contains("YouTube")), "{:?}", s.last_warning);
+
+        // A manual Refresh: the device reading still lands while YouTube is slow.
+        h.stream.set_program_state(1);
+        let start = tokio::time::Instant::now();
+        send(&e, Command::Refresh).await;
+        let s = until(&mut e, "Recover withdrawn", |s| !s.offers.contains(&Offer::Recover)).await;
+        assert!(start.elapsed() <= REFRESH_TIMEOUT + Duration::from_secs(1), "took {:?}", start.elapsed());
+        assert!(s.last_warning.as_deref().is_some_and(|w| w.contains("Refresh did not finish")), "{:?}", s.last_warning);
+    }
+
     // ---- R23 ----
 
     fn selected_id(s: &Snapshot) -> Option<String> {
@@ -2501,8 +2536,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn go_live_skips_public_when_broadcast_already_live() {
         let (d, log, h) = rig();
-        h.yt.set_upcoming(vec![BroadcastSummary { life_cycle: "live".into(), ..summary("b1") }]);
-        let mut e = Engine::spawn(d, cfg(vec![]));
+        // Live and bound to our stream (only then is an active broadcast the default).
+        h.yt.set_upcoming(vec![BroadcastSummary {
+            life_cycle: "live".into(),
+            bound_stream_id: Some("s1".into()),
+            ..summary("b1")
+        }]);
+        let c = cfg(vec![]);
+        c.write().unwrap().youtube.stream_id = Some("s1".into());
+        let mut e = Engine::spawn(d, c);
         until(&mut e, "b1", |s| s.broadcast.as_ref().is_some_and(|b| b.id == "b1")).await;
         send(&e, Command::GoLive).await;
         let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;

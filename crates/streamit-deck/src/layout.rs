@@ -76,6 +76,12 @@ fn go_live_pressable(snap: &Snapshot) -> bool {
     matches!(snap.stage, Stage::Idle | Stage::Prepared(_) | Stage::Countdown { .. }) || offered(snap, Offer::GoLive)
 }
 
+/// UNMUTE lifts a roll-in's mic duck, so it only works while a video plays. The mics
+/// are also down on the holding still or after a failed T-0; UNMUTE is inert then.
+fn unmute_pressable(snap: &Snapshot) -> bool {
+    snap.playing.is_some() && snap.mics_ducked
+}
+
 /// The engine command a press of `key` should send, if any.
 pub fn command_for(key: u8, snap: &Snapshot) -> Option<Command> {
     if let Some(i) = cue_slot(key) {
@@ -92,7 +98,7 @@ pub fn command_for(key: u8, snap: &Snapshot) -> Option<Command> {
         END_BROADCAST => Some(Command::EndBroadcast),
         RECOVER => offered(snap, Offer::Recover).then_some(Command::Recover),
         STOP_VIDEO => snap.playing.is_some().then_some(Command::StopVideo),
-        UNMUTE => snap.mics_ducked.then_some(Command::UnmuteMics),
+        UNMUTE => unmute_pressable(snap).then_some(Command::UnmuteMics),
         _ => None,
     }
 }
@@ -242,7 +248,7 @@ pub fn appearance(key: u8, snap: &Snapshot, blink_phase: bool) -> KeyLook {
             if snap.playing.is_some() { look("STOP\nVIDEO", RED, WHITE) } else { dim("STOP\nVIDEO") }
         }
         UNMUTE => {
-            if snap.mics_ducked { look("UNMUTE\nMICS", AMBER, BLACK) } else { dim("UNMUTE\nMICS") }
+            if unmute_pressable(snap) { look("UNMUTE\nMICS", AMBER, BLACK) } else { dim("UNMUTE\nMICS") }
         }
         _ => look("", BLACK, BLACK),
     }
@@ -362,9 +368,21 @@ mod tests {
         let s = Snapshot::default();
         assert_eq!(command_for(31, &s), None);
         assert_eq!(appearance(31, &s, true).bg, DIM_BG);
-        let s = Snapshot { mics_ducked: true, ..s };
+        let s = Snapshot { mics_ducked: true, playing: Some(0), ..s };
         assert_eq!(command_for(31, &s), Some(Command::UnmuteMics));
         assert_eq!(appearance(31, &s, true).bg, AMBER);
+    }
+
+    /// Mics are also down on the holding still and after a failed T-0 (Recover's job):
+    /// UNMUTE only lifts a roll-in's duck, so it is inert outside a video.
+    #[test]
+    fn unmute_inert_outside_a_video_even_if_ducked() {
+        let s = Snapshot { mics_ducked: true, ..snap_with_cues(1) };
+        assert_eq!(command_for(31, &s), None);
+        assert_eq!(appearance(31, &s, true).bg, DIM_BG);
+        let s = Snapshot { mics_ducked: false, playing: Some(0), ..s };
+        assert_eq!(command_for(31, &s), None);
+        assert_eq!(appearance(31, &s, true).bg, DIM_BG);
     }
 
     #[test]

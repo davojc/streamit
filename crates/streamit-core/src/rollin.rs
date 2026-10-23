@@ -20,6 +20,7 @@ use tokio::sync::Notify;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 /// Most videos the cue list holds in v1.
 pub const MAX_CUES: usize = 14;
@@ -239,6 +240,8 @@ pub async fn play(
 }
 
 /// `play`, also reporting the mics and the video's position (see `RollinReport`).
+/// While the video plays the NDI counter shows the time left every `COUNTER_TICK`; it is
+/// cleared at the start of the return path, however the video ended.
 pub async fn play_reporting(
     d: &Devices,
     c: &Config,
@@ -371,6 +374,7 @@ pub async fn play_reporting(
         note(&mut problems, format!("Could not play {}: {e}", cue.name));
         End::NotPlayed
     } else {
+        let mut counter_warned = false;
         let mut tick = interval(COUNTER_TICK);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
@@ -396,13 +400,23 @@ pub async fn play_reporting(
                 }
                 _ = tick.tick() => {
                     let position = d.player.position().unwrap_or_default().min(duration);
+                    // The NDI counter is a convenience: a failure is logged once, never a problem.
+                    if let Err(e) = d.counter.show(duration - position).await
+                        && !counter_warned
+                    {
+                        counter_warned = true;
+                        warn!(error = %e, "could not update the NDI counter");
+                    }
                     report(RollinReport::Position { position, duration });
                 }
             }
         }
     };
 
-    // 6. Return path. Every step runs whatever failed before it.
+    // 6. Return path. Every step runs whatever failed before it. The counter goes first.
+    if let Err(e) = d.counter.clear().await {
+        warn!(error = %e, "could not clear the NDI counter");
+    }
     // R10: when the video was cut short, its sound goes first so it never lingers online.
     let cut_short = !matches!(end, End::Ended);
     let audio_off_first = video_audio && cut_short;
@@ -1040,6 +1054,46 @@ mod tests {
                 assert_eq!(calls.last(), Some(&Call::HubRoute { output: OUT, input: CAM8 }), "{calls:?}");
             }
         }
+    }
+
+    /// The NDI counter shows the time left from the first tick, follows the position,
+    /// and is cleared once, at the start of the return path, however the video ends.
+    #[tokio::test(start_paused = true)]
+    async fn rollin_drives_ndi_counter_and_clears_it() {
+        for end in ["ended", "stop", "error"] {
+            let (d, log, h) = rig();
+            let run = spawn_play(&d, &cfg(), cue(Destination::HallAndOnline));
+            until(&log, Call::PlayerPlay).await;
+            until(&log, Call::CounterShow(Duration::from_secs(60))).await;
+            h.player.set_position(Some(Duration::from_secs(20)));
+            until(&log, Call::CounterShow(Duration::from_secs(40))).await;
+            sleep(MS(1000)).await;
+            let shows = log.calls().iter().filter(|c| matches!(c, Call::CounterShow(_))).count();
+            assert!(shows >= 10, "{end}: {shows} counter updates in over a second");
+            match end {
+                "ended" => h.player.emit(PlayerEvent::Ended),
+                "stop" => run.stop.cancel(),
+                _ => h.player.emit(PlayerEvent::Error("decode".into())),
+            }
+            run.task.await.unwrap();
+            let tail = after_play(&log.calls());
+            let clear = pos(&tail, &Call::CounterClear);
+            assert_eq!(tail.iter().filter(|c| **c == Call::CounterClear).count(), 1, "{end}: {tail:?}");
+            assert!(!tail[clear..].iter().any(|c| matches!(c, Call::CounterShow(_))), "{end}: {tail:?}");
+            // Before any return step.
+            assert!(clear < pos(&tail, &Call::ScreensAuto), "{end}: {tail:?}");
+            assert!(clear < pos(&tail, &Call::StreamSetAudioOn(IN8, false)), "{end}: {tail:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rollin_clears_counter_when_play_fails() {
+        let (d, log, h) = rig();
+        h.player.fail_next("play");
+        let (r, _) = spawn_play(&d, &cfg(), cue(Destination::HallAndOnline)).task.await.unwrap();
+        assert!(matches!(r, RollinOutcome::Failed { .. }), "{r:?}");
+        let tail = after_play(&log.calls());
+        assert!(pos(&tail, &Call::CounterClear) < pos(&tail, &Call::ScreensAuto), "{tail:?}");
     }
 
     #[test]

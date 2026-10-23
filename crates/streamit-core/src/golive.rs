@@ -44,7 +44,7 @@ pub enum Stage {
     Ended,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stage0Report {
     pub signed_in: bool,
     /// The broadcast list was read. When false, `broadcasts` is empty and says nothing.
@@ -73,18 +73,30 @@ pub enum CountdownOutcome {
 }
 
 /// The broadcast to select when none is: one already in testing or live and bound to
-/// our stream (R23: StreamIt restarted mid-service), else the first in the list.
+/// our stream (R23: StreamIt restarted mid-service), else the first that is not yet
+/// active (an upcoming one), else none. Another active broadcast is stale or someone
+/// else's, so it is never the default.
 pub fn preferred_broadcast(list: &[BroadcastSummary], stream_id: Option<&str>) -> Option<String> {
-    let on_air = |b: &&BroadcastSummary| {
+    // testStarting/liveStarting are YouTube's in-flight forms of testing/live.
+    let active = |b: &BroadcastSummary| {
         matches!(b.life_cycle.as_str(), "testing" | "live" | "testStarting" | "liveStarting")
-            && stream_id.is_some()
-            && b.bound_stream_id.as_deref() == stream_id
     };
-    list.iter().find(on_air).or(list.first()).map(|b| b.id.clone())
+    let ours = |b: &&BroadcastSummary| {
+        active(b) && stream_id.is_some() && b.bound_stream_id.as_deref() == stream_id
+    };
+    list.iter().find(ours).or_else(|| list.iter().find(|b| !active(b))).map(|b| b.id.clone())
 }
 
 /// Stage 0: read-only checks. Changes nothing on any device.
 pub async fn stage0(d: &Devices, c: &Config) -> Stage0Report {
+    let mut report = stage0_youtube(d, c).await;
+    report.device_errors.extend(stage0_devices(d).await);
+    report
+}
+
+/// Stage 0's YouTube part: sign-in, the broadcast list, the default selection and its
+/// check. Read-only. Kept apart so a slow YouTube can be bounded on its own.
+pub async fn stage0_youtube(d: &Devices, c: &Config) -> Stage0Report {
     let mut device_errors = Vec::new();
     let signed_in = match d.yt.signed_in().await {
         Ok(v) => v,
@@ -115,6 +127,12 @@ pub async fn stage0(d: &Devices, c: &Config) -> Stage0Report {
         },
         None => None,
     };
+    Stage0Report { signed_in, listed, broadcasts, selected, check, device_errors }
+}
+
+/// Stage 0's equipment part: one read of each switcher and the encoder. Read-only.
+pub async fn stage0_devices(d: &Devices) -> Vec<String> {
+    let mut device_errors = Vec::new();
     if let Err(e) = d.stream.program().await {
         device_errors.push(format!("Stream ATEM: {e}"));
     }
@@ -124,7 +142,7 @@ pub async fn stage0(d: &Devices, c: &Config) -> Stage0Report {
     if let Err(e) = d.encoder.status().await {
         device_errors.push(format!("Encoder: {e}"));
     }
-    Stage0Report { signed_in, listed, broadcasts, selected, check, device_errors }
+    device_errors
 }
 
 fn problem(problems: &mut Vec<String>, warn: &impl Fn(String), msg: String) {
@@ -706,6 +724,47 @@ mod tests {
         let r = stage0(&d, &Config::default()).await;
         assert_eq!(r.device_errors.len(), 1);
         assert!(log.calls().is_empty());
+    }
+
+    fn bcast(id: &str, life_cycle: &str, stream: Option<&str>) -> BroadcastSummary {
+        BroadcastSummary {
+            id: id.into(),
+            title: id.into(),
+            scheduled_start: None,
+            life_cycle: life_cycle.into(),
+            bound_stream_id: stream.map(String::from),
+        }
+    }
+
+    #[test]
+    fn default_skips_stale_active_broadcast() {
+        let list = [bcast("foreign", "testing", Some("other")), bcast("ours", "ready", Some("s1"))];
+        assert_eq!(preferred_broadcast(&list, Some("s1")).as_deref(), Some("ours"));
+        // Active but unbound, or with no stream key known: still skipped.
+        let list = [bcast("stale", "live", None), bcast("next", "created", None)];
+        assert_eq!(preferred_broadcast(&list, None).as_deref(), Some("next"));
+        let list = [bcast("starting", "liveStarting", Some("other")), bcast("next", "ready", None)];
+        assert_eq!(preferred_broadcast(&list, Some("s1")).as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn default_prefers_live_bound_to_our_stream() {
+        let list = [
+            bcast("next-week", "ready", Some("s1")),
+            bcast("foreign", "live", Some("other")),
+            bcast("ours", "live", Some("s1")),
+        ];
+        assert_eq!(preferred_broadcast(&list, Some("s1")).as_deref(), Some("ours"));
+        let list = [bcast("next-week", "ready", None), bcast("ours", "testing", Some("s1"))];
+        assert_eq!(preferred_broadcast(&list, Some("s1")).as_deref(), Some("ours"));
+    }
+
+    #[test]
+    fn default_none_when_only_foreign_active() {
+        let list = [bcast("a", "testing", Some("other")), bcast("b", "live", None)];
+        assert_eq!(preferred_broadcast(&list, Some("s1")), None);
+        assert_eq!(preferred_broadcast(&list, None), None);
+        assert_eq!(preferred_broadcast(&[], Some("s1")), None);
     }
 
     #[tokio::test(start_paused = true)]
