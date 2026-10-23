@@ -1,0 +1,13 @@
+[package]
+name = "streamit-atem"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+streamit-core = { path = "../streamit-core" }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["net", "time", "sync", "rt", "macros"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "time", "sync", "rt", "rt-multi-thread", "macros", "test-util"] }

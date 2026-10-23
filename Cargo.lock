@@ -162,6 +162,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "streamit-atem"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "streamit-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "streamit-blockproto"
 version = "0.1.0"
 dependencies = [
