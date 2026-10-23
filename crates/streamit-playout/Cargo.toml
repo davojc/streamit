@@ -1,0 +1,27 @@
+[package]
+name = "streamit-playout"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+streamit-core = { path = "../streamit-core" }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt"] }
+tracing = { workspace = true }
+gstreamer = { version = "0.25", optional = true }
+gstreamer-pbutils = { version = "0.25", optional = true }
+
+[features]
+# GStreamer (with the decklink and ndi plugins) is linked only with this feature (R5). The
+# pipeline builders, gain conversion and counter text compile and test without it.
+gst = ["dep:gstreamer", "dep:gstreamer-pbutils"]
+
+# Not "probe": other crates in the workspace already have examples named probe, and
+# same-named examples overwrite each other in target/debug/examples on Windows (R17).
+[[example]]
+name = "playout-probe"
+path = "examples/probe.rs"
+required-features = ["gst"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }

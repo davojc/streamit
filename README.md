@@ -26,6 +26,32 @@ cargo build --release --features gst
 
 Without `--features gst` the app wires a stand-in player and counter that report as down.
 
+### Building with GStreamer (playout PC)
+
+1. Install GStreamer 1.24+ **MSVC 64-bit**, both the **runtime** and the **development** installers, choosing **Complete** in each (the default "Typical" leaves out the `decklink` and `ndi` plugins).
+2. Install the **NDI 6 Runtime** (the `ndi` plugin loads it at run time) and **Blackmagic Desktop Video** (the DeckLink driver). Check in Desktop Video Setup that the DeckLink SDI 4K output is set to 1080p29.97.
+3. In the shell you build from, with the default install path:
+
+   ```
+   set PATH=C:\Program Files\gstreamer\1.0\msvc_x86_64\bin;%PATH%
+   set PKG_CONFIG_PATH=C:\Program Files\gstreamer\1.0\msvc_x86_64\lib\pkgconfig
+   ```
+
+   The build needs a `pkg-config.exe` on `PATH` (GStreamer's `bin` has one in recent installers; otherwise `choco install pkgconfiglite`). The GStreamer `bin` folder must also be on `PATH` when the app runs.
+4. Check the plugins are there:
+
+   ```
+   gst-inspect-1.0 decklinkvideosink
+   gst-inspect-1.0 ndisink
+   ```
+
+5. Build and run the playout tests (they make a 2 s clip with `x264enc`, play it into a fake sink and check it ends):
+
+   ```
+   cargo test -p streamit-playout --features gst
+   cargo build --release --features gst
+   ```
+
 ## Probe your devices
 
 _More entries are added by later tasks (device discovery and the other probes)._
@@ -98,6 +124,29 @@ cargo run -p streamit-atem --example atem-probe -- 192.168.4.98 auto
 `preview 8` should put the DeckLink input on preview; `auto` should run the transition, print `transition done` when it finishes, and leave input 8 on program on the hall screens.
 
 If a command reports `timeout`, the switcher never confirmed it; if `state` reports `disconnected`, the probe never got the switcher's state (check the address, and that it answers in ATEM Software Control).
+
+### Playout (DeckLink) and the NDI counter
+
+Needs the GStreamer build above. The probe uses the default config: DeckLink device 0 in mode `1080p2997`, and NDI source `StreamIt Countdown`. Make sure nothing live depends on input 8 first (the VideoHub routes the DeckLink to input 8 of both ATEMs).
+
+```
+cargo run -p streamit-playout --features gst --example playout-probe -- play <file.mp4> -3
+```
+
+The probe loads the file and holds it paused for 5 s, plays it at −3 dB, prints the position every second, then stops and outputs black for 5 s. Check on the ATEM multiview that:
+
+- the first frame of the clip holds while it is loaded (before "playing");
+- the clip plays smoothly at 29.97 (no stutter or dropped frames);
+- the audio arrives on Fairlight input 8 of the Stream ATEM, on input 8 of the Screens ATEM, and on the Dante desk;
+- after "stopped" the DeckLink input is black and silent.
+
+A file with no audio track plays with silence, so the DeckLink audio stays clocked.
+
+```
+cargo run -p streamit-playout --features gst --example playout-probe -- counter 125
+```
+
+In ProPresenter, add the NDI source `StreamIt Countdown`: it should show a large yellow `2:05`, centred on black, for 10 s, then count down once a second to `0:00`, then clear to plain black.
 
 ### YouTube
 
