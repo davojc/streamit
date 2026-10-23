@@ -46,7 +46,7 @@ impl Default for StreamAtemConfig {
     fn default() -> Self {
         Self {
             address: Some("192.168.4.123".into()),
-            media_player: 0,
+            media_player: 1,
             opening_still: 0,
             closing_still: 1,
             decklink_input: 8,
@@ -158,7 +158,7 @@ pub struct NdiConfig {
 
 impl Default for NdiConfig {
     fn default() -> Self {
-        Self { source_name: "StreamIt Counter".into(), fg: [255, 214, 0], bg: [0, 0, 0] }
+        Self { source_name: "StreamIt Countdown".into(), fg: [255, 214, 0], bg: [0, 0, 0] }
     }
 }
 
@@ -214,6 +214,7 @@ mod tests {
     fn defaults_match_spec() {
         let c = Config::default();
         assert_eq!(c.stream_atem.address.as_deref(), Some("192.168.4.123"));
+        assert_eq!(c.stream_atem.media_player, 1);
         assert_eq!(c.stream_atem.decklink_input, 8);
         assert_eq!(c.stream_atem.live_inputs, vec![1, 2, 3]);
         assert_eq!(c.stream_atem.default_live_input, 1);
@@ -229,6 +230,7 @@ mod tests {
         assert_eq!(c.timings.go_public_offset, Duration::from_secs(10));
         assert_eq!(c.timings.closing_hold, Duration::from_secs(10));
         assert_eq!(c.playout.video_mode, "1080p2997");
+        assert_eq!(c.ndi.source_name, "StreamIt Countdown");
         assert_eq!(c.ndi.fg, [255, 214, 0]);
         assert_eq!(c.ndi.bg, [0, 0, 0]);
     }
