@@ -1,11 +1,18 @@
 //! StreamIt: runs the church YouTube live stream from a Stream Deck XL.
 //!
 //!   streamit                      open the window, start the engine and the deck
-//!   streamit probe <device> ...   hardware probes (see `streamit probe`)
+//!   streamit probe <device> ...   hardware probes (see `streamit probe`), run from a terminal
+//!
+//! I6: a Windows GUI app, so no console window opens with it (closing a console window
+//! would kill StreamIt mid-service, and a console paused by a click would block its
+//! logging). The window logs to files only. Probes attach to the terminal they were
+//! started from, or open a console of their own.
 //!
 //! Startup never changes a device: it builds the devices (which only connect and listen),
 //! spawns the engine (which runs its read-only Stage 0 / assessment), starts the deck and
 //! opens the window. The egui loop runs on the main thread; tokio runs on worker threads.
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+
 mod discovery;
 mod logged;
 mod logging;
@@ -26,9 +33,34 @@ use streamit_deck::DeckSurface;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
+/// Probes and the usage text write to a terminal; the window does not.
+fn terminal_mode(args: &[String]) -> bool {
+    !args.is_empty()
+}
+
+/// Send this process's output to the terminal it was started from, or, with none,
+/// to a new console. Only for the terminal modes: the window never has a console.
+#[cfg(windows)]
+fn attach_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole};
+    // SAFETY: plain Win32 calls with no pointers; failure just leaves output unseen.
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            AllocConsole();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_console() {}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let _guard = logging::init();
+    let terminal = terminal_mode(&args);
+    if terminal {
+        attach_console();
+    }
+    let _guard = logging::init(terminal);
     if args.first().map(String::as_str) == Some("probe") {
         return probe::main(&args[1..]);
     }
@@ -213,6 +245,14 @@ fn spawn_snapshot_log(mut rx: watch::Receiver<Snapshot>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_probes_and_usage_use_the_terminal() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(!terminal_mode(&args(&[])), "the window logs to files only");
+        assert!(terminal_mode(&args(&["probe", "atem", "1.2.3.4", "state"])));
+        assert!(terminal_mode(&args(&["--help"])), "the usage text goes to the terminal");
+    }
 
     #[test]
     fn bad_config_is_backed_up_before_first_write() {

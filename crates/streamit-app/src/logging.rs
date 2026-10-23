@@ -1,4 +1,6 @@
-//! Logging: daily files under `%APPDATA%\StreamIt\logs\` plus the console.
+//! Logging: daily files under `%APPDATA%\StreamIt\logs\`, plus the terminal for probes.
+//! The window never writes to stderr (I6): it has no console, and a blocked console
+//! write must never stall the service.
 //!
 //! Every Command (through the command log in main), device health change, device error
 //! and engine warning is logged at `info` or above. Tokens and the OAuth client secret
@@ -19,8 +21,9 @@ pub fn log_dir() -> PathBuf {
     }
 }
 
-/// Installs the global subscriber. Keep the guard alive until exit so the file is flushed.
-pub fn init() -> Option<WorkerGuard> {
+/// Installs the global subscriber. `console` adds a stderr layer (probes run from a
+/// terminal). Keep the guard alive until exit so the file is flushed.
+pub fn init(console: bool) -> Option<WorkerGuard> {
     // The graphics stack logs its adapter list at info; keep it out of the service log.
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,wgpu_hal=warn,wgpu_core=warn,egui_wgpu=warn,naga=warn"));
@@ -34,7 +37,7 @@ pub fn init() -> Option<WorkerGuard> {
             .build(&dir)
             .ok()
     });
-    let console = fmt::layer().with_writer(std::io::stderr);
+    let console = console.then(|| fmt::layer().with_writer(std::io::stderr));
     match appender {
         Some(appender) => {
             let (writer, guard) = tracing_appender::non_blocking(appender);
@@ -48,7 +51,7 @@ pub fn init() -> Option<WorkerGuard> {
         }
         None => {
             tracing_subscriber::registry().with(filter).with(console).init();
-            tracing::warn!(dir = %dir.display(), "could not open the log folder; logging to the console only");
+            tracing::warn!(dir = %dir.display(), "could not open the log folder; logging to the terminal only");
             None
         }
     }

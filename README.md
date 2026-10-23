@@ -40,7 +40,7 @@ Startup never changes a device: StreamIt connects to each device and listens, re
 - **Run tab**: the broadcast dropdown with its checks (bound to our stream key, Auto Start off, Auto Stop on, monitor stream on) and a **Fix** button for each failed check; the device status row (hover for the reason); the stage, the latest warning and ignored presses; every Stream Deck key as a button (a press does exactly what the deck key does, and dim keys are not offered); and the cue list (Add videos, name, destination, level, optional return input, Up / Down / Remove, at most 14). The cue list is locked while a video plays.
 - **Settings tab**: Blackmagic devices found on the network (mDNS) with a role dropdown each, plus **Add by IP**; every config field; the YouTube OAuth client id and secret, **Sign in** (opens the browser), and the stream key picker (**Load stream keys**). **Save** writes `%APPDATA%\StreamIt\config.toml`. The mics' live levels (captured by Prepare and by each video) are kept in `levels.toml` next to it, so after a restart Go Live and Recover fade the mics up to them rather than to 0 dB. Timings, inputs and audio settings apply at once. **Device addresses and roles, the YouTube client and stream key, and the playout/NDI settings apply when you restart StreamIt.**
 
-Logs are written daily to `%APPDATA%\StreamIt\logs\streamit.<date>.log` (every command, device health change, device error and engine warning; never tokens or the client secret). Set `RUST_LOG=debug` for more detail.
+The window opens no console. Logs are written daily to `%APPDATA%\StreamIt\logs\streamit.<date>.log` (every command, device health change, device error and engine warning; never tokens or the client secret). Set `RUST_LOG=debug` for more detail.
 
 ### Building with GStreamer (playout PC)
 
@@ -70,7 +70,7 @@ Logs are written daily to `%APPDATA%\StreamIt\logs\streamit.<date>.log` (every c
 
 ## Probe your devices
 
-Every probe is also built into the app, so on the playout PC you can run them without cargo:
+Every probe is also built into the app, so on the playout PC you can run them without cargo. **Run probes from a terminal** (Command Prompt or PowerShell). `streamit.exe` is a windowed app with no console of its own (so a stray click or a closed console window can never stall or kill StreamIt during a service); a probe writes its output to the terminal it was started from. The prompt may come back before the probe has finished; to keep it until the probe ends, pipe the output, e.g. `streamit probe atem 192.168.4.123 state | more` in Command Prompt or `... | Out-Host` in PowerShell. Started any other way (a shortcut), a probe opens a console window of its own.
 
 ```
 streamit probe discover [seconds]
