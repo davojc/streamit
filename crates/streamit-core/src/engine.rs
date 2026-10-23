@@ -44,6 +44,9 @@ pub enum Command {
     FixBroadcast(Fix),
     Refresh,
     DeviceHealth(DeviceKind, DeviceHealth),
+    /// Replace the cue list (after an edit in the window). Ignored with a warning
+    /// while a video plays, so the playing index keeps meaning the same cue.
+    SetCues(Vec<Cue>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -455,6 +458,19 @@ impl Engine {
                 let (kind, health) = (*kind, health.clone());
                 self.set(|s| {
                     s.device_status.insert(kind, health);
+                });
+            }
+            Command::SetCues(cues) => {
+                if self.video_running() {
+                    set_warning(&self.snap, "The cue list can't change while a video plays".into());
+                    return self.ignore(&cmd, "a video is playing");
+                }
+                self.cues = rebuild_cues(&self.cues, cues.clone());
+                let rows = cue_rows(&self.cues);
+                info!(count = rows.len(), "cue list replaced");
+                self.set(|s| {
+                    s.cues = rows;
+                    s.flash = None;
                 });
             }
         }
@@ -912,6 +928,21 @@ fn cue_rows(l: &CueList) -> Vec<(Cue, CueState)> {
         .enumerate()
         .map(|(i, c)| (c.clone(), l.state.get(i).cloned().unwrap_or(CueState::Cued)))
         .collect()
+}
+
+/// A new list of `cues`, all `Cued` except that a cue equal to one in `old` keeps
+/// that one's state (each old cue lends its state once).
+fn rebuild_cues(old: &CueList, cues: Vec<Cue>) -> CueList {
+    let mut used = vec![false; old.len()];
+    let mut list = CueList::from_cues(cues);
+    for i in 0..list.len() {
+        let found = (0..old.len()).find(|&j| !used[j] && old.get(j) == list.get(i));
+        if let Some(j) = found {
+            used[j] = true;
+            list.state[i] = old.state.get(j).cloned().unwrap_or(CueState::Cued);
+        }
+    }
+    list
 }
 
 fn add(offers: &mut Vec<Offer>, o: Offer) {
@@ -1666,5 +1697,38 @@ mod tests {
         let s = until(&mut e, "cue error", |s| matches!(s.cues[0].1, CueState::Error(_))).await;
         assert!(s.mics_ducked);
         assert!(s.offers.contains(&Offer::Recover));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn set_cues_replaces_list_when_no_video_plays() {
+        let (d, log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![cue("a", Destination::HallOnly)]));
+        send(&e, Command::PlayCue(0)).await;
+        until_call(&log, Call::PlayerPlay).await;
+        h.player.emit(PlayerEvent::Ended);
+        until(&mut e, "played", |s| s.cues[0].1 == CueState::Played).await;
+        let new = vec![cue("b", Destination::OnlineOnly), cue("a", Destination::HallOnly)];
+        send(&e, Command::SetCues(new.clone())).await;
+        let s = until(&mut e, "new cues", |s| s.cues.len() == 2).await;
+        assert_eq!(s.cues[0], (new[0].clone(), CueState::Cued));
+        // An unchanged cue keeps its state when the list is rebuilt.
+        assert_eq!(s.cues[1], (new[1].clone(), CueState::Played));
+        assert_eq!(s.last_warning, None);
+        // The new list is what PlayCue now plays.
+        send(&e, Command::PlayCue(0)).await;
+        until_call(&log, Call::PlayerLoad(PathBuf::from("b.mp4"), 0.0)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn set_cues_ignored_while_video_plays() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![cue("a", Destination::HallOnly)]));
+        send(&e, Command::PlayCue(0)).await;
+        until_call(&log, Call::PlayerPlay).await;
+        send(&e, Command::SetCues(vec![])).await;
+        let s = until(&mut e, "warning", |s| s.last_warning.is_some()).await;
+        assert!(s.last_warning.as_deref().unwrap().contains("video"), "{:?}", s.last_warning);
+        assert_eq!(s.cues.len(), 1);
+        assert_eq!(s.playing, Some(0));
     }
 }
