@@ -120,6 +120,28 @@ impl SimWorld {
         }
     }
 
+    /// Applies every delayed effect whose deadline has passed. Task 5's encoder,
+    /// YouTube and player deadlines hook in here too.
+    pub fn settle(&mut self) {
+        self.stream.settle();
+        self.screens.settle();
+        let now = Instant::now();
+        let due: Vec<u16> =
+            self.pending_routes.iter().filter(|(_, p)| now >= p.done_at).map(|(o, _)| *o).collect();
+        for o in due {
+            if let Some(p) = self.pending_routes.remove(&o) {
+                self.routes.insert(o, p.input);
+            }
+        }
+    }
+
+    pub fn switcher_mut(&mut self, which: Which) -> &mut SwitcherState {
+        match which {
+            Which::Stream => &mut self.stream,
+            Which::Screens => &mut self.screens,
+        }
+    }
+
     pub fn has_fault(&self, f: Fault) -> bool {
         self.faults.contains(&f)
     }
@@ -146,8 +168,11 @@ impl SimHandle {
         Self { world: Arc::new(Mutex::new(SimWorld::seeded(cfg))), clock: SimClock::new(speed) }
     }
 
+    /// Locks the world with every due delayed effect already applied.
     pub fn lock(&self) -> MutexGuard<'_, SimWorld> {
-        self.world.lock().unwrap_or_else(|e| e.into_inner())
+        let mut w = self.world.lock().unwrap_or_else(|e| e.into_inner());
+        w.settle();
+        w
     }
 
     pub fn set_fault(&self, f: Fault, on: bool) {
