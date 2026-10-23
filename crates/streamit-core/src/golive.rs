@@ -447,7 +447,8 @@ impl std::fmt::Display for T0Error {
 
 impl std::error::Error for T0Error {}
 
-/// T-0: stream to live action, mics up, hall to `t0_input`, counter off.
+/// T-0: stream to live action, then mics up and hall to `t0_input` together (the hall
+/// does not wait out the 1 s mic fade, as for roll-ins), then counter off.
 /// Mics come up only if the stream cut succeeded. Every step is attempted.
 pub async fn t0(d: &Devices, c: &Config, levels: &LiveLevels) -> std::result::Result<(), T0Error> {
     let sa = &c.stream_atem;
@@ -460,17 +461,21 @@ pub async fn t0(d: &Devices, c: &Config, levels: &LiveLevels) -> std::result::Re
     }
     .await;
     let mut failures = Vec::new();
-    let mut mics_failed = false;
-    match &stream_cut {
-        Ok(()) => {
-            if let Err(e) = fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
-                mics_failed = true;
-                failures.push(format!("Could not fade the mics up: {e}"));
-            }
+    let mics_up = async {
+        match &stream_cut {
+            Ok(()) => Some(fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await),
+            Err(_) => None,
         }
-        Err(e) => failures.push(format!("Could not cut the stream to live action: {e}")),
+    };
+    let (faded, hall) = tokio::join!(mics_up, cut(&*d.screens, c.screens_atem.t0_input));
+    if let Err(e) = &stream_cut {
+        failures.push(format!("Could not cut the stream to live action: {e}"));
     }
-    if let Err(e) = cut(&*d.screens, c.screens_atem.t0_input).await {
+    let mics_failed = matches!(faded, Some(Err(_)));
+    if let Some(Err(e)) = faded {
+        failures.push(format!("Could not fade the mics up: {e}"));
+    }
+    if let Err(e) = hall {
         failures.push(format!("Could not switch the hall screens: {e}"));
     }
     if let Err(e) = d.counter.clear().await {
@@ -512,6 +517,14 @@ mod tests {
         for w in want {
             assert!(it.any(|c| c == w), "{w:?} missing or out of order in {calls:?}");
         }
+    }
+
+    /// T-0's tail: the stream cut, then the hall switch (alongside the mic fade), then
+    /// the counter cleared last.
+    fn assert_t0_tail(calls: &[Call]) {
+        let auto = calls.iter().rposition(|c| *c == Call::StreamAuto).expect("stream cut");
+        assert_in_order(&calls[auto..], &[Call::ScreensSetPreview(6), Call::ScreensAuto]);
+        assert_eq!(calls.last(), Some(&Call::CounterClear), "{calls:?}");
     }
 
     fn live_transitions(log: &CallLog) -> usize {
@@ -694,7 +707,7 @@ mod tests {
         h.player.emit(PlayerEvent::Ended);
         assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: true, mics_failed: false });
         assert_eq!(run.stages.lock().unwrap().last(), Some(&Stage::Live));
-        assert!(log.calls().ends_with(&[Call::ScreensSetPreview(6), Call::ScreensAuto, Call::CounterClear]));
+        assert_t0_tail(&log.calls());
         assert!(run.warns.lock().unwrap().is_empty(), "{:?}", run.warns.lock().unwrap());
     }
 
@@ -785,11 +798,16 @@ mod tests {
         let levels = LiveLevels([(MIC, -3.0)].into_iter().collect());
         t0(&d, &Config::default(), &levels).await.unwrap();
         let calls = log.calls();
-        let fades = calls.iter().filter(|c| matches!(c, Call::StreamSetAudioLevel(..))).count();
-        assert_eq!(fades, 20);
+        let fades: Vec<usize> =
+            (0..calls.len()).filter(|&i| matches!(calls[i], Call::StreamSetAudioLevel(..))).collect();
+        assert_eq!(fades.len(), 20);
         assert_eq!(calls[0], Call::StreamAuto);
-        assert_eq!(calls[20], Call::StreamSetAudioLevel(MIC, -3.0));
-        assert_eq!(calls[21..], [Call::ScreensSetPreview(6), Call::ScreensAuto, Call::CounterClear]);
+        assert_eq!(calls[*fades.last().unwrap()], Call::StreamSetAudioLevel(MIC, -3.0));
+        // The hall switches alongside the 1 s mic fade, not after it.
+        let hall = pos(&calls, &Call::ScreensAuto);
+        assert!(pos(&calls, &Call::ScreensSetPreview(6)) < hall);
+        assert!(hall < fades[1], "the hall waited for the mic fade: {calls:?}");
+        assert_eq!(calls.last(), Some(&Call::CounterClear));
         assert_eq!(d.screens.program().await.unwrap(), 6);
     }
 
@@ -899,7 +917,7 @@ mod tests {
         // t0 includes the 1 s mic fade; LIVE must follow it, not wait for YouTube.
         sleep(MS(1_500)).await;
         assert_eq!(run.stages.lock().unwrap().last(), Some(&Stage::Live));
-        assert!(log.calls().ends_with(&[Call::ScreensSetPreview(6), Call::ScreensAuto, Call::CounterClear]));
+        assert_t0_tail(&log.calls());
         // The hung go-public is given a bounded wait, then reported.
         let start = Instant::now();
         assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: false, mics_failed: false });
