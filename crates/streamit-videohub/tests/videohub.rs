@@ -16,7 +16,7 @@ fn fast() -> Timings {
         backoff: vec![Duration::from_millis(20), Duration::from_millis(40)],
         ping_interval: Duration::from_secs(60),
         ping_timeout: Duration::from_millis(200),
-        route_timeout: Duration::from_millis(300),
+        command_timeout: Duration::from_millis(300),
         connect_timeout: Duration::from_millis(500),
     }
 }
