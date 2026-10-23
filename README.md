@@ -61,7 +61,7 @@ _More entries are added by later tasks (device discovery and the other probes)._
 Prints the raw dump the VideoHub sends on connect, then its routes (numbered from 1, as on the front panel):
 
 ```
-cargo run -p streamit-videohub --example probe -- 192.168.4.100 dump
+cargo run -p streamit-videohub --example videohub-probe -- 192.168.4.100 dump
 ```
 
 Save the raw dump over `crates/streamit-videohub/tests/fixtures/videohub_dump.txt` so the tests parse a real capture.
@@ -69,7 +69,7 @@ Save the raw dump over `crates/streamit-videohub/tests/fixtures/videohub_dump.tx
 To test a route (this really switches the router, so only do it when nothing live depends on that output):
 
 ```
-cargo run -p streamit-videohub --example probe -- 192.168.4.100 route <output> <input>
+cargo run -p streamit-videohub --example videohub-probe -- 192.168.4.100 route <output> <input>
 ```
 
 ### Web Presenter 4K
@@ -77,7 +77,7 @@ cargo run -p streamit-videohub --example probe -- 192.168.4.100 route <output> <
 Prints the raw state the Web Presenter sends on connect (control port 9977), then the stream status it parsed:
 
 ```
-cargo run -p streamit-webpresenter --example probe -- 192.168.4.93 dump
+cargo run -p streamit-webpresenter --example webpresenter-probe -- 192.168.4.93 dump
 ```
 
 Save the raw dump over `crates/streamit-webpresenter/tests/fixtures/webpresenter_dump.txt` so the tests parse a real capture. If the block names differ from the ones the client expects (`STREAM STATE:` with `Status:` / `Action:` lines), fix the parser and the tests to match the capture.
@@ -85,9 +85,9 @@ Save the raw dump over `crates/streamit-webpresenter/tests/fixtures/webpresenter
 To read the status, then start and stop streaming (this really starts the encoder, so set the YouTube key first and keep the broadcast non-public):
 
 ```
-cargo run -p streamit-webpresenter --example probe -- 192.168.4.93 status
-cargo run -p streamit-webpresenter --example probe -- 192.168.4.93 start
-cargo run -p streamit-webpresenter --example probe -- 192.168.4.93 stop
+cargo run -p streamit-webpresenter --example webpresenter-probe -- 192.168.4.93 status
+cargo run -p streamit-webpresenter --example webpresenter-probe -- 192.168.4.93 start
+cargo run -p streamit-webpresenter --example webpresenter-probe -- 192.168.4.93 stop
 ```
 
 ### ATEM switchers

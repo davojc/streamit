@@ -1,5 +1,6 @@
 //! YouTube Data API v3 client implementing `Broadcasts`, plus OAuth sign-in.
 mod auth;
+pub mod probe;
 
 pub use auth::{Auth, KeyringStore, MemoryStore, TokenStore};
 

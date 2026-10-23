@@ -7,6 +7,7 @@
 //! `key` 0..32 runs row-major from the top-left, matching `layout`'s `row * 8 + col`.
 //! The async wrapper uses `block_in_place`, so it needs a tokio multi-thread runtime.
 pub mod layout;
+pub mod probe;
 pub mod render;
 
 use elgato_streamdeck::info::Kind;

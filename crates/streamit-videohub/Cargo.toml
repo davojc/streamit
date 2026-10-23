@@ -4,8 +4,14 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
 streamit-core = { path = "../streamit-core" }
 streamit-blockproto = { path = "../streamit-blockproto" }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
 tracing = { workspace = true }
+
+# Not "probe": same-named examples across the workspace collide when linking on Windows (R17).
+[[example]]
+name = "videohub-probe"
+path = "examples/probe.rs"

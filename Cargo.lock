@@ -1785,6 +1785,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 name = "streamit-atem"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "streamit-core",
  "tokio",
@@ -1820,6 +1821,7 @@ name = "streamit-deck"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "anyhow",
  "elgato-streamdeck",
  "image",
  "streamit-core",
@@ -1831,6 +1833,7 @@ dependencies = [
 name = "streamit-playout"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "gstreamer",
  "gstreamer-pbutils",
@@ -1843,6 +1846,7 @@ dependencies = [
 name = "streamit-videohub"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "streamit-blockproto",
  "streamit-core",
@@ -1854,6 +1858,7 @@ dependencies = [
 name = "streamit-webpresenter"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "streamit-blockproto",
  "streamit-core",
@@ -1864,6 +1869,7 @@ dependencies = [
 name = "streamit-youtube"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "keyring",
  "oauth2",

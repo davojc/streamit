@@ -3,6 +3,8 @@
 //! The protocol is 0-based; this crate's public API (and the `Router` trait and the config)
 //! is 1-based, as the device front panel and Companion number things. Conversion happens
 //! only at the protocol boundary, in `format_route` and when reading routing blocks.
+pub mod probe;
+
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::net::SocketAddr;

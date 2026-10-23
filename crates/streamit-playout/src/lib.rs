@@ -12,6 +12,8 @@ mod bus;
 mod counter;
 #[cfg(feature = "gst")]
 mod player;
+#[cfg(feature = "gst")]
+pub mod probe;
 
 pub use pipeline::{SinkKind, counter_text, gain_db_to_linear};
 

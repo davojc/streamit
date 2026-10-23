@@ -8,6 +8,7 @@
 //! ATEM Software Control and `media_player_input`) and 0-based on the wire. Only M/E 0 is used.
 pub mod commands;
 pub mod packet;
+pub mod probe;
 pub mod state;
 
 use async_trait::async_trait;

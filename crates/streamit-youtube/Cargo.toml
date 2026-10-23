@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
 streamit-core = { path = "../streamit-core" }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }

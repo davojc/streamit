@@ -4,6 +4,8 @@
 //! from Companion's bmd-webpresenter module and must be confirmed with the probe capture:
 //! `STREAM STATE:\nAction: Start|Stop\n\n` to command, `STREAM STATE:\nStatus: <state>\n\n`
 //! to report, `ACK`/`NAK` as the reply.
+pub mod probe;
+
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

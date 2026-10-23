@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
 streamit-core = { path = "../streamit-core" }
 elgato-streamdeck = { version = "0.14", features = ["async"] }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
