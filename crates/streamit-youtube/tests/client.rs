@@ -351,8 +351,20 @@ async fn expired_token_reports_signin_required() {
             "error":"invalid_grant","error_description":"Token has been expired or revoked."})))
         .mount(&s)
         .await;
-    let c = client(&s, Some("s1"));
+    let store = Arc::new(MemoryStore::with_token("refresh"));
+    let auth = Auth::new(
+        "cid",
+        "sec",
+        Url::parse(&format!("{}/token", s.uri())).unwrap(),
+        store.clone(),
+    );
+    let c = YouTubeClient::new(
+        Url::parse(&format!("{}/youtube/v3", s.uri())).unwrap(),
+        auth,
+        Some("s1".into()),
+    );
     assert_eq!(c.signed_in().await, Ok(false));
+    assert!(streamit_youtube::TokenStore::get(&*store).is_none());
     assert_eq!(c.upcoming().await, Err(DeviceError::Refused("sign-in required".into())));
     assert_eq!(c.health().await, Err(DeviceError::Refused("sign-in required".into())));
 }

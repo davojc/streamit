@@ -217,7 +217,10 @@ impl Auth {
             return Ok(tok);
         }
         if body["error"] == "invalid_grant" {
-            inner.store.clear();
+            // Only clear if no newer sign-in replaced the token we just had rejected.
+            if inner.store.get().as_deref() == Some(refresh.as_str()) {
+                inner.store.clear();
+            }
             return Err(DeviceError::Refused(SIGN_IN_REQUIRED.into()));
         }
         if status.is_server_error() {
@@ -264,29 +267,56 @@ pub(crate) fn net_err(e: reqwest::Error) -> DeviceError {
 
 /// Accept connections until one carries the redirect with a matching `state`.
 async fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String> {
+    // Each connection is handled in its own task with a short read timeout, so a silent
+    // preconnect cannot hold up the real redirect.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<String>>();
     loop {
-        let (mut sock, _) = listener.accept().await.map_err(other)?;
-        let mut buf = vec![0u8; 8192];
-        let n = sock.read(&mut buf).await.unwrap_or(0);
-        let text = String::from_utf8_lossy(&buf[..n]);
-        let target = text.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
-        let Ok(url) = Url::parse(&format!("http://127.0.0.1{target}")) else {
-            let _ = respond(&mut sock, "Not found").await;
-            continue;
-        };
-        let param = |k: &str| url.query_pairs().find(|(n, _)| n == k).map(|(_, v)| v.into_owned());
-        if let Some(err) = param("error") {
-            let _ = respond(&mut sock, "Sign-in was cancelled. You can close this tab.").await;
-            return Err(DeviceError::Refused(format!("sign-in refused: {err}")));
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (sock, _) = accepted.map_err(other)?;
+                let tx = tx.clone();
+                let state = state.to_string();
+                tokio::spawn(async move {
+                    if let Some(r) = handle_connection(sock, &state).await {
+                        let _ = tx.send(r);
+                    }
+                });
+            }
+            Some(r) = rx.recv() => return r,
         }
-        match (param("code"), param("state")) {
-            (Some(code), Some(s)) if s == state => {
-                let _ = respond(&mut sock, "Signed in to StreamIt. You can close this tab.").await;
-                return Ok(code);
-            }
-            _ => {
-                let _ = respond(&mut sock, "Not found").await;
-            }
+    }
+}
+
+/// `Some(result)` when this request is the real redirect (right `state`), else `None`.
+async fn handle_connection(mut sock: tokio::net::TcpStream, state: &str) -> Option<Result<String>> {
+    let mut buf = vec![0u8; 8192];
+    let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+        .await
+        .ok()?
+        .unwrap_or(0);
+    let text = String::from_utf8_lossy(&buf[..n]);
+    let target = text.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
+    let Ok(url) = Url::parse(&format!("http://127.0.0.1{target}")) else {
+        let _ = respond(&mut sock, "Not found").await;
+        return None;
+    };
+    let param = |k: &str| url.query_pairs().find(|(n, _)| n == k).map(|(_, v)| v.into_owned());
+    if param("state").as_deref() != Some(state) {
+        let _ = respond(&mut sock, "Not found").await;
+        return None;
+    }
+    if let Some(err) = param("error") {
+        let _ = respond(&mut sock, "Sign-in was cancelled. You can close this tab.").await;
+        return Some(Err(DeviceError::Refused(format!("sign-in refused: {err}"))));
+    }
+    match param("code") {
+        Some(code) => {
+            let _ = respond(&mut sock, "Signed in to StreamIt. You can close this tab.").await;
+            Some(Ok(code))
+        }
+        None => {
+            let _ = respond(&mut sock, "Not found").await;
+            None
         }
     }
 }
