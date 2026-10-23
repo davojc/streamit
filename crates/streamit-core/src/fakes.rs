@@ -3,7 +3,7 @@
 use crate::config::AudioSourceId;
 use crate::devices::*;
 use async_trait::async_trait;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,19 +43,25 @@ impl CallLog {
     }
 }
 
-/// Scriptable one-shot failures keyed by trait method name.
+/// Scriptable counted failures keyed by trait method name.
 #[derive(Clone, Default)]
-struct Failures(Arc<Mutex<HashSet<String>>>);
+struct Failures(Arc<Mutex<HashMap<String, u32>>>);
 
 impl Failures {
-    fn add(&self, m: &str) {
-        self.0.lock().unwrap().insert(m.to_string());
+    fn add(&self, m: &str, n: u32) {
+        *self.0.lock().unwrap().entry(m.to_string()).or_insert(0) += n;
     }
     fn check(&self, m: &str) -> Result<()> {
-        if self.0.lock().unwrap().remove(m) {
-            Err(DeviceError::Disconnected(format!("scripted failure in {m}")))
-        } else {
-            Ok(())
+        let mut f = self.0.lock().unwrap();
+        match f.get_mut(m) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                if *n == 0 {
+                    f.remove(m);
+                }
+                Err(DeviceError::Disconnected(format!("scripted failure in {m}")))
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -89,8 +95,13 @@ impl FakeSwitcher {
             st: Arc::new(Mutex::new(SwitcherState { program: 1, preview: 2, levels: HashMap::new() })),
         }
     }
+    /// The next call to `method` fails once.
     pub fn fail_next(&self, method: &str) {
-        self.fails.add(method);
+        self.fails.add(method, 1);
+    }
+    /// The next `n` calls to `method` fail.
+    pub fn fail_times(&self, method: &str, n: u32) {
+        self.fails.add(method, n);
     }
     /// Script the program input without logging a call.
     pub fn set_program_state(&self, input: u16) {
@@ -177,8 +188,13 @@ pub struct FakeRouter {
 }
 
 impl FakeRouter {
+    /// The next call to `method` fails once.
     pub fn fail_next(&self, method: &str) {
-        self.fails.add(method);
+        self.fails.add(method, 1);
+    }
+    /// The next `n` calls to `method` fail.
+    pub fn fail_times(&self, method: &str, n: u32) {
+        self.fails.add(method, n);
     }
     pub fn set_route(&self, output: u16, input: u16) {
         self.routes.lock().unwrap().insert(output, input);
@@ -207,8 +223,13 @@ pub struct FakeEncoder {
 }
 
 impl FakeEncoder {
+    /// The next call to `method` fails once.
     pub fn fail_next(&self, method: &str) {
-        self.fails.add(method);
+        self.fails.add(method, 1);
+    }
+    /// The next `n` calls to `method` fail.
+    pub fn fail_times(&self, method: &str, n: u32) {
+        self.fails.add(method, n);
     }
     pub fn set_status(&self, s: EncoderStatus) {
         *self.status.lock().unwrap() = s;
@@ -219,11 +240,15 @@ impl FakeEncoder {
 impl Encoder for FakeEncoder {
     async fn start(&self) -> Result<()> {
         self.log.push(Call::EncoderStart);
-        self.fails.check("start")
+        self.fails.check("start")?;
+        *self.status.lock().unwrap() = EncoderStatus::Streaming;
+        Ok(())
     }
     async fn stop(&self) -> Result<()> {
         self.log.push(Call::EncoderStop);
-        self.fails.check("stop")
+        self.fails.check("stop")?;
+        *self.status.lock().unwrap() = EncoderStatus::Idle;
+        Ok(())
     }
     async fn status(&self) -> Result<EncoderStatus> {
         self.fails.check("status")?;
@@ -247,8 +272,13 @@ pub struct FakeBroadcasts {
 }
 
 impl FakeBroadcasts {
+    /// The next call to `method` fails once.
     pub fn fail_next(&self, method: &str) {
-        self.fails.add(method);
+        self.fails.add(method, 1);
+    }
+    /// The next `n` calls to `method` fail.
+    pub fn fail_times(&self, method: &str, n: u32) {
+        self.fails.add(method, n);
     }
     pub fn set_signed_in(&self, v: bool) {
         self.st.lock().unwrap().signed_in = v;
@@ -295,7 +325,14 @@ impl Broadcasts for FakeBroadcasts {
     }
     async fn transition(&self, _id: &str, to: Phase) -> Result<()> {
         self.log.push(Call::YtTransition(to));
-        self.fails.check("transition")
+        self.fails.check("transition")?;
+        self.st.lock().unwrap().life_cycle = match to {
+            Phase::Testing => "testing",
+            Phase::Live => "live",
+            Phase::Complete => "complete",
+        }
+        .to_string();
+        Ok(())
     }
 }
 
@@ -309,8 +346,13 @@ pub struct FakePlayer {
 }
 
 impl FakePlayer {
+    /// The next call to `method` fails once.
     pub fn fail_next(&self, method: &str) {
-        self.fails.add(method);
+        self.fails.add(method, 1);
+    }
+    /// The next `n` calls to `method` fail.
+    pub fn fail_times(&self, method: &str, n: u32) {
+        self.fails.add(method, n);
     }
     pub fn set_duration(&self, d: Duration) {
         *self.duration.lock().unwrap() = d;
@@ -353,8 +395,13 @@ pub struct FakeCounter {
 }
 
 impl FakeCounter {
+    /// The next call to `method` fails once.
     pub fn fail_next(&self, method: &str) {
-        self.fails.add(method);
+        self.fails.add(method, 1);
+    }
+    /// The next `n` calls to `method` fail.
+    pub fn fail_times(&self, method: &str, n: u32) {
+        self.fails.add(method, n);
     }
 }
 
@@ -446,5 +493,36 @@ mod tests {
         d.hub.route(5, 8).await.unwrap();
         assert_eq!(h.hub.route_of(5).await.unwrap(), 8);
         assert_eq!(log.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fail_times_fails_n_calls_then_succeeds() {
+        let (d, log, h) = fake_devices();
+        h.yt.fail_times("transition", 2);
+        assert!(d.yt.transition("b", Phase::Live).await.is_err());
+        assert!(d.yt.transition("b", Phase::Live).await.is_err());
+        assert_eq!(d.yt.life_cycle("b").await.unwrap(), "ready");
+        d.yt.transition("b", Phase::Live).await.unwrap();
+        assert_eq!(log.calls().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn transition_sets_life_cycle() {
+        let (d, _log, _h) = fake_devices();
+        d.yt.transition("b", Phase::Testing).await.unwrap();
+        assert_eq!(d.yt.life_cycle("b").await.unwrap(), "testing");
+        d.yt.transition("b", Phase::Live).await.unwrap();
+        assert_eq!(d.yt.life_cycle("b").await.unwrap(), "live");
+        d.yt.transition("b", Phase::Complete).await.unwrap();
+        assert_eq!(d.yt.life_cycle("b").await.unwrap(), "complete");
+    }
+
+    #[tokio::test]
+    async fn encoder_start_stop_set_status() {
+        let (d, _log, _h) = fake_devices();
+        d.encoder.start().await.unwrap();
+        assert_eq!(d.encoder.status().await.unwrap(), EncoderStatus::Streaming);
+        d.encoder.stop().await.unwrap();
+        assert_eq!(d.encoder.status().await.unwrap(), EncoderStatus::Idle);
     }
 }
