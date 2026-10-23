@@ -203,6 +203,10 @@ pub fn player_pipeline(path: &Path, gain_db: f32, sink: SinkKind, device: u32) -
 ///
 /// The decoder's pads link by caps: `dec. ! videoconvert` only accepts a video pad and
 /// `dec. ! audioconvert` only an audio pad, so each branch gets the right stream.
+///
+/// `deinterlace` (which passes progressive video through) makes interlaced files (1080i,
+/// 576i) fit the progressive caps. A `videoconvert` sits before it so any decoded format
+/// (e.g. 10-bit) reaches it in one it accepts, and the delayed link stays video-only.
 pub fn player_pipeline_full(
     uri: &str,
     gain_db: f32,
@@ -212,7 +216,8 @@ pub fn player_pipeline_full(
     audio: AudioSource,
 ) -> String {
     let video = format!(
-        "dec. ! videoconvert ! queue ! videoscale ! videorate ! {} ! {}",
+        "dec. ! videoconvert ! deinterlace ! videoconvert ! queue ! videoscale ! videorate ! \
+         {} ! {}",
         mode.video_caps(),
         video_sink(sink, device, mode)
     );
@@ -353,11 +358,16 @@ mod tests {
         );
         assert!(
             p.contains(&format!(
-                "dec. ! videoconvert ! queue ! videoscale ! videorate ! {VCAPS} ! \
-                 decklinkvideosink device-number=0 mode=1080p2997"
+                "dec. ! videoconvert ! deinterlace ! videoconvert ! queue ! videoscale ! \
+                 videorate ! {VCAPS} ! decklinkvideosink device-number=0 mode=1080p2997"
             )),
-            "{p}"
+            "interlaced input is deinterlaced before the progressive caps: {p}"
         );
+        assert!(
+            p.find("deinterlace").unwrap() < p.find(VCAPS).unwrap(),
+            "deinterlace comes before the progressive caps: {p}"
+        );
+        assert!(p.contains("dec. ! videoconvert ! deinterlace"), "{p}");
         assert!(
             p.contains(&format!(
                 "dec. ! audioconvert ! queue ! audioresample ! volume volume=0.501187 ! {ACAPS} ! \

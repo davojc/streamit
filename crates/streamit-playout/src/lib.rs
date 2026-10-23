@@ -7,6 +7,8 @@
 pub mod pipeline;
 
 #[cfg(feature = "gst")]
+mod bus;
+#[cfg(feature = "gst")]
 mod counter;
 #[cfg(feature = "gst")]
 mod player;

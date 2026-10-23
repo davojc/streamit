@@ -9,6 +9,7 @@ use gstreamer::prelude::*;
 use streamit_core::config::NdiConfig;
 use streamit_core::devices::{Counter, DeviceError, Result};
 
+use crate::bus::{BusWatch, describe};
 use crate::pipeline::{counter_pipeline, counter_text};
 
 /// How long the NDI pipeline may take to start.
@@ -22,10 +23,12 @@ fn other(e: impl std::fmt::Display) -> DeviceError {
 pub struct NdiCounter {
     pipeline: gst::Pipeline,
     overlay: gst::Element,
+    watch: BusWatch,
 }
 
 impl NdiCounter {
-    /// Starts the NDI source (`ndi.source_name`) showing an empty frame.
+    /// Starts the NDI source (`ndi.source_name`) showing an empty frame. Blocks for up to
+    /// 5 s while the pipeline starts.
     pub fn new(cfg: &NdiConfig) -> Result<Arc<NdiCounter>> {
         gst::init().map_err(|e| other(format!("GStreamer init failed: {e}")))?;
         let pipeline = gst::parse::launch(&counter_pipeline(&cfg.source_name, cfg.fg, cfg.bg))
@@ -35,26 +38,44 @@ impl NdiCounter {
         let overlay = pipeline
             .by_name("counter")
             .ok_or_else(|| other("counter overlay missing"))?;
-        let started = pipeline.set_state(gst::State::Playing).is_ok()
-            && pipeline.state(START_TIMEOUT).0.is_ok();
-        if !started {
-            let reason = pipeline
-                .bus()
-                .and_then(|bus| {
-                    bus.timed_pop_filtered(gst::ClockTime::ZERO, &[gst::MessageType::Error])
-                })
+        let bus = pipeline
+            .bus()
+            .ok_or_else(|| other("counter pipeline has no bus"))?;
+
+        let changed = pipeline.set_state(gst::State::Playing).is_ok();
+        // A timeout returns Ok(Async) with the pipeline not yet PLAYING: that is a failure.
+        let (result, current, _pending) = pipeline.state(START_TIMEOUT);
+        if !(changed && result.is_ok() && current == gst::State::Playing) {
+            let reason = bus
+                .timed_pop_filtered(gst::ClockTime::ZERO, &[gst::MessageType::Error])
                 .and_then(|msg| match msg.view() {
-                    gst::MessageView::Error(e) => Some(e.error().to_string()),
+                    gst::MessageView::Error(e) => Some(describe(e)),
                     _ => None,
                 })
-                .unwrap_or_else(|| "did not start".into());
+                .unwrap_or_else(|| format!("did not reach PLAYING (state {current:?})"));
             let _ = pipeline.set_state(gst::State::Null);
             return Err(other(format!("NDI counter: {reason}")));
         }
-        Ok(Arc::new(NdiCounter { pipeline, overlay }))
+        let watch = match BusWatch::spawn(bus, "ndi-counter") {
+            Ok(watch) => watch,
+            Err(e) => {
+                let _ = pipeline.set_state(gst::State::Null);
+                return Err(other(e));
+            }
+        };
+        Ok(Arc::new(NdiCounter {
+            pipeline,
+            overlay,
+            watch,
+        }))
     }
 
     fn set_text(&self, text: &str) -> Result<()> {
+        if self.watch.failed() {
+            return Err(DeviceError::Disconnected(
+                "NDI counter pipeline failed".into(),
+            ));
+        }
         if self.pipeline.current_state() != gst::State::Playing {
             return Err(DeviceError::Disconnected(
                 "NDI counter pipeline stopped".into(),
