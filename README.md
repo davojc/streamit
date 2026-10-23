@@ -170,3 +170,22 @@ cargo run -p streamit-youtube --example youtube-probe -- health <client_id> <cli
 ```
 
 `signin` opens your browser (or prints the address) and finishes when you approve. `upcoming` lists your upcoming broadcasts in start order with their bound stream; `check` prints whether the broadcast is bound to the given stream and its Auto Start / Auto Stop / monitor flags; `health` prints the ingest health of a stream key's stream.
+
+### Stream Deck XL
+
+**Close Bitfocus Companion first** (and the Elgato Stream Deck app): only one program can hold the deck open, and the probe will report that it cannot open the device if another has it.
+
+```
+cargo run -p streamit-deck --example deck-probe
+```
+
+The probe draws a demo snapshot on the first Stream Deck XL it finds (it keeps looking every 2 s, so you can plug it in afterwards) and prints the command each key press would send. Check that:
+
+- the layout is 8 columns by 4 rows with the first key at the top left, and the text is the right way up and not mirrored;
+- row 0 reads STREAM ATEM, SCREENS ATEM (green), VIDEO HUB (amber), WEB PRESENTER (red), YOUTUBE (green), DECKLINK and NDI (dim, unknown), then `T-0:42` in amber;
+- row 1 has GO PUBLIC and GO LIVE lit, RECOVER dim; pressing a dim key prints nothing;
+- row 2 shows the cue names word-wrapped (blue = cued, red = playing, grey = played, a red key with blinking text = error), the first cue (flashing in the demo) blinks at 2 Hz, and STOP VIDEO is lit;
+- UNMUTE MICS is lit (bottom right);
+- unplugging the deck and plugging it back in redraws the keys within a few seconds.
+
+Presses print as `PlayCue(0)`, `Prepare`, and so on. Status keys (row 0) print nothing.

@@ -1,0 +1,12 @@
+[package]
+name = "streamit-deck"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+streamit-core = { path = "../streamit-core" }
+elgato-streamdeck = { version = "0.14", features = ["async"] }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+ab_glyph = "0.2"
+tokio = { workspace = true }
+tracing = { workspace = true }
