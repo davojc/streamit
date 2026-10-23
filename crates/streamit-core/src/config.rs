@@ -20,7 +20,7 @@ mod millis {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AudioSourceId {
     pub input: u16,
     pub source: i64,
