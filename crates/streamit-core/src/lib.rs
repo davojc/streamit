@@ -3,3 +3,4 @@ pub mod devices;
 #[cfg(feature = "fakes")]
 pub mod fakes;
 pub mod audio;
+pub mod golive;
