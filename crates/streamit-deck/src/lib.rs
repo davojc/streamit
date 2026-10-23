@@ -14,7 +14,7 @@ use elgato_streamdeck::{AsyncStreamDeck, DeviceStateUpdate, StreamDeckError, lis
 use layout::{KEYS, KeyLook, appearance, command_for};
 use std::time::Duration;
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind, EngineHandle, Snapshot};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, block_in_place};
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{info, warn};
@@ -24,6 +24,7 @@ pub const RECONNECT_EVERY: Duration = Duration::from_secs(2);
 /// Blink toggle period: toggling every 250 ms is a 2 Hz blink (two on/off cycles a second).
 pub const BLINK_TOGGLE: Duration = Duration::from_millis(250);
 const BRIGHTNESS: u8 = 80;
+const READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub fn is_xl(kind: Kind) -> bool {
     matches!(kind, Kind::Xl | Kind::XlV2 | Kind::XlV2Module)
@@ -64,6 +65,9 @@ impl DeckSurface {
         tokio::spawn(async move {
             let mut reported: Option<bool> = None;
             loop {
+                if handle.tx.is_closed() {
+                    return; // the engine is gone, deck or no deck
+                }
                 let Some(dev) = connect_first() else {
                     report(&handle, &mut reported, false).await;
                     tokio::time::sleep(RECONNECT_EVERY).await;
@@ -89,6 +93,11 @@ async fn report(handle: &EngineHandle, last: &mut Option<bool>, up: bool) {
     *last = Some(up);
     let health = if up { DeviceHealth::Ok } else { DeviceHealth::Down("Stream Deck not connected".into()) };
     let _ = handle.tx.send(Command::DeviceHealth(DeviceKind::StreamDeck, health)).await;
+}
+
+/// The command for a press, decided from the latest published snapshot (not a cached copy).
+fn decide_press(key: u8, rx: &watch::Receiver<Snapshot>) -> Option<Command> {
+    command_for(key, &rx.borrow())
 }
 
 /// Redraws the keys whose look changed since `cache`, then flushes.
@@ -123,16 +132,19 @@ async fn session(dev: &AsyncStreamDeck, handle: &mut EngineHandle) -> Result<(),
     let (key_tx, mut key_rx) = mpsc::unbounded_channel::<Result<u8, StreamDeckError>>();
     let reader = dev.get_reader();
     let reader_task = tokio::spawn(async move {
-        loop {
-            match reader.read(60.0).await {
-                Ok(updates) => {
+        // A short timeout means the task notices a closed channel (session over) within 1 s
+        // and releases the HID handle, so a reconnect is never blocked by a lingering reader.
+        while !key_tx.is_closed() {
+            match tokio::time::timeout(READ_TIMEOUT, reader.read(60.0)).await {
+                Err(_elapsed) => continue,
+                Ok(Ok(updates)) => {
                     for u in updates {
                         if let DeviceStateUpdate::ButtonDown(k) = u {
                             let _ = key_tx.send(Ok(k));
                         }
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let _ = key_tx.send(Err(e));
                     return;
                 }
@@ -162,7 +174,7 @@ async fn session(dev: &AsyncStreamDeck, handle: &mut EngineHandle) -> Result<(),
                 }
                 press = key_rx.recv() => match press {
                     Some(Ok(key)) => {
-                        if let Some(cmd) = command_for(key, &snap)
+                        if let Some(cmd) = decide_press(key, &handle.rx)
                             && handle.tx.send(cmd).await.is_err()
                         {
                             return Ok(());
@@ -177,4 +189,19 @@ async fn session(dev: &AsyncStreamDeck, handle: &mut EngineHandle) -> Result<(),
     .await;
     reader_task.abort();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use streamit_core::recovery::Offer;
+
+    #[test]
+    fn press_uses_latest_snapshot() {
+        let (tx, rx) = watch::channel(Snapshot { offers: vec![Offer::GoLive], ..Snapshot::default() });
+        assert_eq!(decide_press(12, &rx), Some(Command::GoLive));
+        // The offer is withdrawn; the receiver never polled changed().
+        tx.send(Snapshot::default()).unwrap();
+        assert_eq!(decide_press(12, &rx), None);
+    }
 }
