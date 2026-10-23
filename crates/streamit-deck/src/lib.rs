@@ -24,7 +24,6 @@ pub const RECONNECT_EVERY: Duration = Duration::from_secs(2);
 /// Blink toggle period: toggling every 250 ms is a 2 Hz blink (two on/off cycles a second).
 pub const BLINK_TOGGLE: Duration = Duration::from_millis(250);
 const BRIGHTNESS: u8 = 80;
-const READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub fn is_xl(kind: Kind) -> bool {
     matches!(kind, Kind::Xl | Kind::XlV2 | Kind::XlV2Module)
@@ -132,19 +131,20 @@ async fn session(dev: &AsyncStreamDeck, handle: &mut EngineHandle) -> Result<(),
     let (key_tx, mut key_rx) = mpsc::unbounded_channel::<Result<u8, StreamDeckError>>();
     let reader = dev.get_reader();
     let reader_task = tokio::spawn(async move {
-        // A short timeout means the task notices a closed channel (session over) within 1 s
-        // and releases the HID handle, so a reconnect is never blocked by a lingering reader.
+        // The crate's async `read` polls the HID device non-blocking and sleeps 1/60 s between
+        // polls; it has no timeout and only returns on an event or an error. So the reads are
+        // never cancelled mid-event: the session ends the task with `abort()`, which lands on
+        // that sleep, and awaits it so the HID handle is released before a reconnect.
         while !key_tx.is_closed() {
-            match tokio::time::timeout(READ_TIMEOUT, reader.read(60.0)).await {
-                Err(_elapsed) => continue,
-                Ok(Ok(updates)) => {
+            match reader.read(60.0).await {
+                Ok(updates) => {
                     for u in updates {
                         if let DeviceStateUpdate::ButtonDown(k) = u {
                             let _ = key_tx.send(Ok(k));
                         }
                     }
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     let _ = key_tx.send(Err(e));
                     return;
                 }
@@ -188,6 +188,7 @@ async fn session(dev: &AsyncStreamDeck, handle: &mut EngineHandle) -> Result<(),
     }
     .await;
     reader_task.abort();
+    let _ = reader_task.await; // wait until the reader (and its HID handle) is dropped
     result
 }
 
