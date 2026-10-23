@@ -1,0 +1,5 @@
+target/
+companion/
+.worktrees/
+.superpowers/
+.remember/
