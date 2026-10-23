@@ -25,6 +25,9 @@ use tracing::{info, warn};
 
 /// How long an ignored cue key flashes.
 pub const FLASH_FOR: Duration = Duration::from_secs(1);
+/// Longest a startup check or a Refresh may take (a down YouTube otherwise holds the
+/// startup check, and every press queued behind it, for its HTTP timeouts).
+pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Warning shown when a sequence runs with no broadcast selected.
 pub const NO_BROADCAST: &str = "No broadcast selected";
 
@@ -261,8 +264,17 @@ impl Engine {
     }
 
     async fn run(mut self, mut rx: mpsc::Receiver<Command>, mut aux_rx: mpsc::UnboundedReceiver<Aux>) {
-        let r = refresh(self.d.clone(), self.config(), None, false, self.epoch, self.sel_gen).await;
-        self.apply_refresh(r);
+        let r = refresh(self.d.clone(), self.config(), None, false, self.epoch, self.sel_gen);
+        match tokio::time::timeout(REFRESH_TIMEOUT, r).await {
+            Ok(r) => self.apply_refresh(r),
+            Err(_) => set_warning(
+                &self.snap,
+                format!(
+                    "The startup check did not finish within {} s; press Refresh to try again",
+                    REFRESH_TIMEOUT.as_secs()
+                ),
+            ),
+        }
         loop {
             let wake = tokio::select! {
                 cmd = rx.recv() => match cmd {
@@ -320,6 +332,12 @@ impl Engine {
 
     fn video_running(&self) -> bool {
         matches!(self.running, Some(Running { job: Job::Video { .. }, .. }))
+    }
+
+    /// The player is meant to be on the DeckLink: a video or the countdown is running, so
+    /// an assessment must not read the DeckLink on air as a crash.
+    fn player_active(&self) -> bool {
+        matches!(self.running, Some(Running { job: Job::Video { .. } | Job::Countdown { .. }, .. }))
     }
 
     fn ignore(&self, cmd: &Command, why: &str) {
@@ -479,11 +497,20 @@ impl Engine {
                 }
             },
             Command::Refresh => {
-                let (d, c, sel, aux) = (self.d.clone(), self.config(), self.selected(), self.aux.clone());
-                let (player_active, epoch, sel_gen) = (self.video_running(), self.epoch, self.sel_gen);
+                let (d, c, sel, aux, snap) =
+                    (self.d.clone(), self.config(), self.selected(), self.aux.clone(), self.snap.clone());
+                let (player_active, epoch, sel_gen) = (self.player_active(), self.epoch, self.sel_gen);
                 tokio::spawn(async move {
-                    let r = refresh(d, c, sel, player_active, epoch, sel_gen).await;
-                    let _ = aux.send(Aux::Refreshed(Box::new(r)));
+                    let r = refresh(d, c, sel, player_active, epoch, sel_gen);
+                    match tokio::time::timeout(REFRESH_TIMEOUT, r).await {
+                        Ok(r) => {
+                            let _ = aux.send(Aux::Refreshed(Box::new(r)));
+                        }
+                        Err(_) => set_warning(
+                            &snap,
+                            format!("Refresh did not finish within {} s", REFRESH_TIMEOUT.as_secs()),
+                        ),
+                    }
                 });
             }
             Command::DeviceHealth(kind, health) => {
@@ -1912,6 +1939,41 @@ mod tests {
         until(&mut e, "Prepared", |s| s.stage == Stage::Prepared(Readiness::Ready) && s.job.is_none()).await;
         assert_eq!(LiveLevels::load(&path).unwrap().0.get(&MIC), Some(&-3.0));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- minors ----
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_during_countdown_offers_no_recover() {
+        let (d, _log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        // The hall is on the DeckLink, playing the countdown: that is not a crash.
+        h.encoder.fail_next("status");
+        send(&e, Command::Refresh).await;
+        until(&mut e, "the refresh's warning", |s| s.last_warning.is_some()).await;
+        sleep(MS(500)).await;
+        assert!(!snap(&e).offers.contains(&Offer::Recover), "{:?}", snap(&e).offers);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_youtube_does_not_hold_presses_past_the_refresh_timeout() {
+        let (d, log, h) = rig();
+        h.yt.set_delay("upcoming", Duration::from_secs(60));
+        let start = tokio::time::Instant::now();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::GoLive).await;
+        let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        assert!(start.elapsed() < Duration::from_secs(15), "Go Live waited {:?}", start.elapsed());
+        assert!(s.last_warning.as_deref().is_some_and(|w| w.contains("did not finish")), "{:?}", s.last_warning);
+        assert!(log.calls().contains(&Call::StreamAuto));
+
+        // A manual Refresh is bounded too, and says so.
+        send(&e, Command::Refresh).await;
+        sleep(Duration::from_secs(11)).await;
+        let w = snap(&e).last_warning.unwrap_or_default();
+        assert!(w.contains("Refresh did not finish"), "{w}");
     }
 
     // ---- R23 ----
