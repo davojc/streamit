@@ -370,12 +370,23 @@ async fn video_failed(
 /// Make the broadcast public: one attempt plus `GO_PUBLIC_RETRIES` retries, 2 s apart.
 /// A failed attempt counts as success if the broadcast is in fact already live.
 pub async fn go_public(d: &Devices, bid: &str) -> Result<()> {
+    transition_with_retry(d, bid, Phase::Live).await
+}
+
+/// Transition the broadcast to `to`: one attempt plus `GO_PUBLIC_RETRIES` retries, 2 s apart.
+/// A failed attempt counts as success if the broadcast is in fact already in the target state.
+pub(crate) async fn transition_with_retry(d: &Devices, bid: &str, to: Phase) -> Result<()> {
+    let target = match to {
+        Phase::Testing => "testing",
+        Phase::Live => "live",
+        Phase::Complete => "complete",
+    };
     let mut retries = 0;
     loop {
-        match d.yt.transition(bid, Phase::Live).await {
+        match d.yt.transition(bid, to).await {
             Ok(()) => return Ok(()),
             Err(e) => {
-                if matches!(d.yt.life_cycle(bid).await.as_deref(), Ok("live")) {
+                if matches!(d.yt.life_cycle(bid).await.as_deref(), Ok(lc) if lc == target) {
                     return Ok(());
                 }
                 if retries == GO_PUBLIC_RETRIES {
