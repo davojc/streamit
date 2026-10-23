@@ -24,6 +24,8 @@ pub const COUNTER_TICK: Duration = Duration::from_millis(100);
 pub const GO_PUBLIC_RETRIES: u32 = 3;
 /// Gap between `go_public` attempts.
 pub const GO_PUBLIC_RETRY_GAP: Duration = Duration::from_secs(2);
+/// Longest wait for an in-flight `go_public` once the countdown has ended or failed.
+pub const GO_PUBLIC_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Readiness {
@@ -227,7 +229,9 @@ pub async fn countdown(
     if let Err(e) = cut(&*d.screens, c.screens_atem.decklink_input).await {
         warn(format!("Could not switch the hall to the countdown: {e}"));
     }
-    d.player.play().await?;
+    if let Err(e) = d.player.play().await {
+        return video_failed(d, c, &progress, &warn, None, duration, e.to_string()).await;
+    }
 
     let mut public = false;
     let mut pub_started = false;
@@ -258,9 +262,14 @@ pub async fn countdown(
             }
             ev = events.recv() => match ev {
                 Ok(PlayerEvent::Ended) => break,
-                Ok(PlayerEvent::Error(e)) => return video_failed(d, &warn, e).await,
+                Ok(PlayerEvent::Error(e)) => {
+                    return video_failed(d, c, &progress, &warn, pub_task.take(), remaining, e).await;
+                }
                 Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Closed) => return video_failed(d, &warn, "player went away".into()).await,
+                Err(RecvError::Closed) => {
+                    let e = "the player went away".to_string();
+                    return video_failed(d, c, &progress, &warn, pub_task.take(), remaining, e).await;
+                }
             },
             res = async {
                 match pub_task.as_mut() {
@@ -297,22 +306,65 @@ pub async fn countdown(
         pub_task = Some(spawn_go_public(d, bid));
     }
     let r = t0(d, c, levels).await;
-    if let Some(t) = pub_task.take()
-        && let Err(e) = joined(t.await)
-    {
-        warn(format!("Could not make the YouTube broadcast public: {e}"));
+    if r.is_ok() {
+        // LIVE is reported as soon as the cut is done; YouTube never holds it back.
+        progress(Stage::Live);
     }
+    settle_go_public(pub_task.take(), &warn).await;
     r?;
-    progress(Stage::Live);
     Ok(CountdownOutcome::Live)
 }
 
-async fn video_failed(d: &Devices, warn: &impl Fn(String), e: String) -> Result<CountdownOutcome> {
-    warn(format!("The countdown video failed: {e}"));
+/// Waits at most `GO_PUBLIC_WAIT` for an in-flight `go_public`; on timeout it is
+/// aborted, never left detached. `Some(public)` if there was a task, else `None`.
+async fn settle_go_public(task: Option<JoinHandle<Result<()>>>, warn: &impl Fn(String)) -> Option<bool> {
+    let mut t = task?;
+    match tokio::time::timeout(GO_PUBLIC_WAIT, &mut t).await {
+        Ok(res) => match joined(res) {
+            Ok(()) => Some(true),
+            Err(e) => {
+                warn(format!("Could not make the YouTube broadcast public: {e}"));
+                Some(false)
+            }
+        },
+        Err(_) => {
+            t.abort();
+            warn(format!(
+                "Making the YouTube broadcast public did not finish within {} s; check YouTube Studio",
+                GO_PUBLIC_WAIT.as_secs()
+            ));
+            Some(false)
+        }
+    }
+}
+
+/// The countdown video failed (or would not play): return the hall exactly as Stop
+/// Countdown does, settle any in-flight go-public, and hand back to the operator.
+async fn video_failed(
+    d: &Devices,
+    c: &Config,
+    progress: &impl Fn(Stage),
+    warn: &impl Fn(String),
+    pub_task: Option<JoinHandle<Result<()>>>,
+    remaining: Duration,
+    err: String,
+) -> Result<CountdownOutcome> {
+    warn(format!(
+        "The countdown video failed ({err}). The hall screens are back on their normal input; press Go Live manually."
+    ));
+    if let Err(e) = cut(&*d.screens, c.screens_atem.t0_input).await {
+        warn(format!("Could not return the hall screens: {e}"));
+    }
     if let Err(e) = d.counter.clear().await {
         warn(format!("Could not clear the counter: {e}"));
     }
-    Err(DeviceError::Other(format!("countdown video failed: {e}")))
+    if let Err(e) = d.player.stop().await {
+        warn(format!("Could not stop the countdown video: {e}"));
+    }
+    if let Some(public) = settle_go_public(pub_task, warn).await {
+        progress(Stage::Countdown { remaining, public });
+    }
+    Err(DeviceError::Other(format!("countdown video failed: {err}")))
 }
 
 /// Make the broadcast public: one attempt plus `GO_PUBLIC_RETRIES` retries, 2 s apart.
@@ -695,5 +747,88 @@ mod tests {
         assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Stopped);
         sleep(Duration::from_secs(10)).await;
         assert_eq!(live_transitions(&log), 1);
+    }
+
+    fn after_play(calls: &[Call]) -> Vec<Call> {
+        let play = pos(calls, &Call::PlayerPlay);
+        calls[play + 1..].iter().filter(|c| !matches!(c, Call::CounterShow(_))).cloned().collect()
+    }
+
+    const RECOVER: [Call; 4] =
+        [Call::ScreensSetPreview(6), Call::ScreensAuto, Call::CounterClear, Call::PlayerStop];
+
+    #[tokio::test(start_paused = true)]
+    async fn video_error_returns_hall_to_t0() {
+        let (d, log, h) = fake_devices();
+        h.player.set_position(Some(Duration::ZERO));
+        let run = spawn_countdown(&d, &Config::default(), Readiness::Ready, LiveLevels::default());
+        sleep(MS(300)).await;
+        h.player.emit(PlayerEvent::Error("decoder died".into()));
+        assert!(run.task.await.unwrap().is_err());
+        let calls = log.calls();
+        assert_eq!(after_play(&calls), RECOVER);
+        assert!(yt_calls(&calls).is_empty());
+        assert!(!calls.contains(&Call::StreamAuto));
+        let warns = run.warns.lock().unwrap();
+        assert!(warns.iter().any(|w| w.contains("decoder died") && w.contains("Go Live")), "{warns:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn play_failure_returns_hall_to_t0() {
+        let (d, log, h) = fake_devices();
+        h.player.fail_next("play");
+        let run = spawn_countdown(&d, &Config::default(), Readiness::Ready, LiveLevels::default());
+        assert!(run.task.await.unwrap().is_err());
+        let calls = log.calls();
+        assert_eq!(calls[..4], [
+            Call::PlayerLoad(PathBuf::from("countdown.mp4"), 0.0),
+            Call::ScreensSetPreview(8),
+            Call::ScreensAuto,
+            Call::PlayerPlay,
+        ]);
+        assert_eq!(calls[4..], RECOVER);
+        assert!(run.warns.lock().unwrap().iter().any(|w| w.contains("Go Live")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn video_error_reports_pending_go_public() {
+        // go_public is mid-retry when the video dies: it is awaited and its result reported.
+        let (d, log, h) = fake_devices();
+        h.yt.fail_times("transition", 2);
+        h.player.set_duration(Duration::from_secs(5));
+        h.player.set_position(Some(Duration::ZERO));
+        let run = spawn_countdown(&d, &Config::default(), Readiness::Ready, LiveLevels::default());
+        sleep(MS(500)).await;
+        assert_eq!(live_transitions(&log), 1);
+        h.player.emit(PlayerEvent::Error("decoder died".into()));
+        let start = Instant::now();
+        assert!(run.task.await.unwrap().is_err());
+        assert!(start.elapsed() >= Duration::from_secs(3), "returned before go public finished");
+        assert_eq!(live_transitions(&log), 3);
+        assert!(matches!(run.stages.lock().unwrap().last(), Some(Stage::Countdown { public: true, .. })));
+        assert_eq!(after_play(&log.calls()).iter().filter(|c| !matches!(c, Call::YtTransition(_))).cloned().collect::<Vec<_>>(), RECOVER);
+        sleep(Duration::from_secs(10)).await;
+        assert_eq!(live_transitions(&log), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_reported_immediately_even_if_go_public_hangs() {
+        let (d, log, h) = fake_devices();
+        h.yt.set_transition_hangs(true);
+        h.player.set_position(Some(MS(50_000)));
+        let run = spawn_countdown(&d, &Config::default(), Readiness::Ready, LiveLevels::default());
+        sleep(MS(300)).await;
+        assert_eq!(live_transitions(&log), 1);
+        h.player.emit(PlayerEvent::Ended);
+        // t0 includes the 1 s mic fade; LIVE must follow it, not wait for YouTube.
+        sleep(MS(1_500)).await;
+        assert_eq!(run.stages.lock().unwrap().last(), Some(&Stage::Live));
+        assert!(log.calls().ends_with(&[Call::ScreensSetPreview(6), Call::ScreensAuto, Call::CounterClear]));
+        // The hung go-public is given a bounded wait, then reported.
+        let start = Instant::now();
+        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live);
+        assert!(start.elapsed() <= GO_PUBLIC_WAIT);
+        let warns = run.warns.lock().unwrap();
+        assert!(warns.iter().any(|w| w.contains("public")), "{warns:?}");
     }
 }

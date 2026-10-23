@@ -269,6 +269,7 @@ pub struct FakeBroadcasts {
     log: CallLog,
     fails: Failures,
     st: Arc<Mutex<YtState>>,
+    hang_transition: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FakeBroadcasts {
@@ -291,6 +292,10 @@ impl FakeBroadcasts {
     }
     pub fn set_health(&self, h: Health) {
         self.st.lock().unwrap().health = h;
+    }
+    /// While set, `transition` logs its call and then never completes.
+    pub fn set_transition_hangs(&self, v: bool) {
+        self.hang_transition.store(v, std::sync::atomic::Ordering::SeqCst);
     }
     pub fn set_life_cycle(&self, l: &str) {
         self.st.lock().unwrap().life_cycle = l.to_string();
@@ -325,6 +330,9 @@ impl Broadcasts for FakeBroadcasts {
     }
     async fn transition(&self, _id: &str, to: Phase) -> Result<()> {
         self.log.push(Call::YtTransition(to));
+        if self.hang_transition.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         self.fails.check("transition")?;
         self.st.lock().unwrap().life_cycle = match to {
             Phase::Testing => "testing",
@@ -449,6 +457,7 @@ pub fn fake_devices() -> (Devices, CallLog, FakeHandles) {
             health: Health::Good,
             life_cycle: "ready".into(),
         })),
+        hang_transition: Default::default(),
     };
     let (tx, _) = tokio::sync::broadcast::channel(16);
     let player = FakePlayer {
