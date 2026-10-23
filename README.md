@@ -166,7 +166,7 @@ If a command reports `timeout`, the switcher never confirmed it; if `state` repo
 
 ### Playout (DeckLink) and the NDI counter
 
-Needs the GStreamer build above. The probe uses the default config: DeckLink device 0 in mode `1080p2997`, and NDI source `StreamIt Countdown`. Make sure nothing live depends on input 8 first (the VideoHub routes the DeckLink to input 8 of both ATEMs).
+Needs the GStreamer build above. The probe uses the default config: DeckLink device 0 in mode `1080p2997`, and NDI source `StreamIt Countdown`. Make sure nothing live depends on input 8 first: the DeckLink feeds input 8 of both ATEMs. Only the Stream ATEM's input 8 is routed by the VideoHub (it is shared with Camera 8); the Screens ATEM's DeckLink feed is fixed, and StreamIt never routes it (spec call 4).
 
 ```
 cargo run -p streamit-playout --features gst --example playout-probe -- play <file.mp4> -3

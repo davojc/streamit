@@ -226,12 +226,12 @@ Select the private test broadcast in the Run tab. Keep it private until check 3.
    *Pass if:* nothing changes on its own after the restart. Press RECOVER. It fixes the state (the right input on air, mics correct).
 
 10. **VideoHub cable.**
-    Play a video. While it plays, pull the VideoHub's network cable.
-    *Pass if:* the VIDEO HUB key goes red and RECOVER lights. Plug the cable back in, press RECOVER, and the state is right again.
+    Play a video to the hall and online. While it plays, pull the VideoHub's network cable. Let the video end (or press STOP VIDEO).
+    *Pass if:* the VIDEO HUB key goes red while the video plays. RECOVER stays dim while the video is still playing; it lights when the video ends and its return path cannot put the VideoHub route back (the cue shows an error). Plug the cable back in, press RECOVER, and the state is right again (Camera 8 back on input 8).
 
 11. **Crash during the countdown.**
     Start the countdown. Kill the app mid-countdown. Restart StreamIt.
-    *Pass if:* GO PUBLIC and GO LIVE keys light. Nothing changes on its own.
+    *Pass if:* the stage shows READY (or LIVE, if the countdown had passed T-10s), GO LIVE is lit, and GO PUBLIC is lit (it always is). Nothing changes on its own.
 
 After the rehearsal: return the mic fader, Auto Start/Auto Stop and any VideoHub routes to their normal settings, and delete or end the private test broadcast.
 

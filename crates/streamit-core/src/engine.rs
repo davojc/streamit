@@ -1,11 +1,19 @@
 //! The engine: the one task that takes every button press, runs the sequencers,
 //! enforces which presses are allowed when, and publishes a `Snapshot`.
 //!
-//! Busy rules: only one of Prepare / Countdown / End Service / a roll-in runs at a
-//! time (the "job"). The job runs as its own task; the engine loop never waits on
-//! it, so Stop Countdown, Stop Video, Unmute, Go Public, Go Live, End Broadcast and
-//! Recover are always accepted (the last four also run as their own tasks).
-//! Every ignored command is logged at `info`.
+//! Job slot (R14/R15): one sequence runs at a time — Prepare, the countdown, End
+//! Service, a video, Go Live (T-0 by hand) or Recover. It runs as its own task and the
+//! engine loop never waits on it. A press that would start a second job is ignored (a
+//! cue key, GO LIVE and RECOVER flash), with these exceptions:
+//! - Go Live during the countdown stops the countdown, waits for its cancel path, then
+//!   runs T-0 (R13). Go Live is refused once Live (unless offered), Ending or Ended (R22).
+//! - Recover and End Service during a video stop it and wait for its return path
+//!   (Recover first, then End Service).
+//! - End Service pressed again during End Service skips the closing hold.
+//!
+//! Always accepted, whatever runs: Stop Countdown and Stop Video and Unmute (they act on
+//! the running job), Go Public and End Broadcast (each its own short task), Select
+//! Broadcast, Fix, Refresh and device health. Every ignored command is logged at `info`.
 use crate::audio::LiveLevels;
 use crate::config::Config;
 use crate::devices::{self, BroadcastCheck, BroadcastSummary, DeviceError, Devices, Fix, Phase};
