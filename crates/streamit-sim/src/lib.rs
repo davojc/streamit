@@ -200,15 +200,15 @@ impl SimWorld {
         if self.yt_pending.as_ref().is_some_and(|p| now >= p.done_at)
             && let Some(p) = self.yt_pending.take()
         {
-            if let Some(b) = self.broadcasts.iter_mut().find(|b| b.id == p.id) {
-                b.life_cycle = match p.to {
-                    Phase::Testing => "testing",
-                    Phase::Live => "live",
-                    Phase::Complete => "complete",
-                }
-                .into();
+            // A life cycle only ever moves forward.
+            let mut moved = false;
+            if let Some(b) = self.broadcasts.iter_mut().find(|b| b.id == p.id)
+                && life_rank(phase_name(p.to)) > life_rank(&b.life_cycle)
+            {
+                b.life_cycle = phase_name(p.to).into();
+                moved = true;
             }
-            if p.to == Phase::Live {
+            if moved && p.to == Phase::Live {
                 self.last_go_public = Some(p.done_at - p.requested);
             }
         }
@@ -251,11 +251,32 @@ impl SimWorld {
     }
 }
 
+/// The life-cycle name a transition to `p` ends in.
+pub fn phase_name(p: Phase) -> &'static str {
+    match p {
+        Phase::Testing => "testing",
+        Phase::Live => "live",
+        Phase::Complete => "complete",
+    }
+}
+
+/// Position of a life cycle on its one-way road.
+fn life_rank(lc: &str) -> u8 {
+    match lc {
+        "testing" => 1,
+        "live" => 2,
+        "complete" => 3,
+        _ => 0, // created, ready
+    }
+}
+
 /// Everything a pretend device needs: the shared world and the shared clock.
 #[derive(Clone)]
 pub struct SimHandle {
     pub world: Shared,
-    pub clock: SimClock,
+    /// Crate-private: only `SimControl::set_speed` may change the speed, because it
+    /// also re-anchors a video that is playing.
+    pub(crate) clock: SimClock,
 }
 
 impl SimHandle {
@@ -268,6 +289,10 @@ impl SimHandle {
         let mut w = self.world.lock().unwrap_or_else(|e| e.into_inner());
         w.settle();
         w
+    }
+
+    pub fn speed(&self) -> Speed {
+        self.clock.speed()
     }
 
     pub fn set_fault(&self, f: Fault, on: bool) {
@@ -587,7 +612,7 @@ mod tests {
         let t = Instant::now();
         yt.health().await.unwrap();
         assert_eq!(t.elapsed(), Duration::from_secs(20));
-        sim.clock.set_speed(Speed::X10);
+        SimControl { sim: sim.clone(), cfg: cfg() }.set_speed(Speed::X10);
         let t = Instant::now();
         yt.life_cycle("sim-test").await.unwrap();
         assert_eq!(t.elapsed(), Duration::from_secs(2));
@@ -628,7 +653,7 @@ mod tests {
         assert_eq!(ev, PlayerEvent::Ended);
         let took = t.elapsed();
         assert!(took >= Duration::from_millis(5990) && took <= Duration::from_millis(6010), "{took:?}");
-        assert_eq!(sim.lock().player, PlayerState::Loaded { duration: Duration::from_secs(60) });
+        assert_eq!(sim.lock().player, PlayerState::Empty);
     }
 
     #[tokio::test(start_paused = true)]
@@ -771,6 +796,100 @@ mod tests {
         ms(60_000).await;
         assert!(rx.try_recv().is_err());
         assert_eq!(d.player.position(), None);
+    }
+
+    #[test]
+    fn zero_timescale_header_gives_30s() {
+        let dir = clip::test_support::temp_dir("zero-timescale");
+        let f = dir.join("zero.mp4");
+        std::fs::write(&f, clip::test_support::mp4_bytes_with_timescale(5000, 0)).unwrap();
+        assert_eq!(clip_length(&f), Duration::from_secs(30));
+        // A duration that would overflow the arithmetic is no better.
+        std::fs::write(&f, clip::test_support::mp4_bytes_with_timescale(u32::MAX, 1)).unwrap();
+        let d = clip_length(&f);
+        assert!(d == Duration::from_secs(30) || d == Duration::from_secs(u32::MAX as u64), "{d:?}");
+    }
+
+    async fn live_broadcast(yt: &SimBroadcasts) {
+        yt.transition(SEED_BROADCAST, Phase::Testing).await.unwrap();
+        yt.transition(SEED_BROADCAST, Phase::Live).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn redundant_transition_is_instant_noop() {
+        let sim = SimHandle::new(&cfg(), Speed::X1);
+        let yt = sim.broadcasts();
+        live_broadcast(&yt).await;
+        let first = sim.lock().last_go_public;
+        assert!(first.is_some());
+        ms(10_000).await;
+        let t = Instant::now();
+        yt.transition(SEED_BROADCAST, Phase::Live).await.unwrap();
+        assert_eq!(t.elapsed(), Duration::ZERO);
+        assert_eq!(sim.lock().last_go_public, first);
+        assert!(sim.lock().yt_pending.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn testing_on_live_does_not_regress() {
+        let sim = SimHandle::new(&cfg(), Speed::X1);
+        let yt = sim.broadcasts();
+        live_broadcast(&yt).await;
+        assert!(yt.transition(SEED_BROADCAST, Phase::Testing).await.is_err());
+        ms(10_000).await;
+        assert_eq!(yt.life_cycle(SEED_BROADCAST).await.unwrap(), "live");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_to_live_is_refused() {
+        let sim = SimHandle::new(&cfg(), Speed::X1);
+        let yt = sim.broadcasts();
+        let r = yt.transition(SEED_BROADCAST, Phase::Live).await;
+        assert!(matches!(&r, Err(DeviceError::Refused(m)) if m.contains("invalid transition")), "{r:?}");
+        let r = yt.transition(SEED_BROADCAST, Phase::Complete).await;
+        assert!(matches!(r, Err(DeviceError::Refused(_))), "{r:?}");
+        assert_eq!(yt.life_cycle(SEED_BROADCAST).await.unwrap(), "ready");
+        assert!(sim.lock().yt_pending.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_same_target_waits() {
+        let sim = SimHandle::new(&cfg(), Speed::X1);
+        let yt = sim.broadcasts();
+        let t = Instant::now();
+        let first = {
+            let yt = yt.clone();
+            tokio::spawn(async move { yt.transition(SEED_BROADCAST, Phase::Testing).await })
+        };
+        ms(1000).await;
+        // Same target while pending: returns when it lands, at 2.5 s.
+        yt.transition(SEED_BROADCAST, Phase::Testing).await.unwrap();
+        assert_eq!(t.elapsed(), Duration::from_millis(2500));
+        assert_eq!(yt.life_cycle(SEED_BROADCAST).await.unwrap(), "testing");
+        first.await.unwrap().unwrap();
+        // A different target while one is pending is refused.
+        let second = {
+            let yt = yt.clone();
+            tokio::spawn(async move { yt.transition(SEED_BROADCAST, Phase::Live).await })
+        };
+        ms(500).await;
+        let r = yt.transition(SEED_BROADCAST, Phase::Complete).await;
+        assert!(matches!(r, Err(DeviceError::Refused(_))), "{r:?}");
+        second.await.unwrap().unwrap();
+        assert_eq!(yt.life_cycle(SEED_BROADCAST).await.unwrap(), "live");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn play_after_ended_does_not_end_again() {
+        let sim = SimHandle::new(&cfg(), Speed::X10);
+        let p = sim.player();
+        let mut rx = p.events();
+        p.load(&PathBuf::from("none.mp4"), 0.0).await.unwrap();
+        p.play().await.unwrap();
+        assert_eq!(rx.recv().await, Ok(PlayerEvent::Ended));
+        assert!(p.play().await.is_err(), "play with nothing loaded");
+        ms(10_000).await;
+        assert!(rx.try_recv().is_err(), "second Ended");
     }
 
     /// A crash (the app dying) in the middle of a video: the next start offers Recover,

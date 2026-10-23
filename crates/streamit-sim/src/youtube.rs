@@ -1,6 +1,6 @@
 //! Pretend YouTube: one seeded broadcast, a stream health that turns Good five seconds
 //! after the encoder streams, and transitions that take 2.5 s.
-use crate::{Fault, SimHandle, SimWorld, YtPending};
+use crate::{Fault, SimHandle, SimWorld, YtPending, phase_name};
 use async_trait::async_trait;
 use std::time::Duration;
 use streamit_core::devices::*;
@@ -34,6 +34,10 @@ impl SimBroadcasts {
     fn with<T>(&self, f: impl FnOnce(&mut SimWorld) -> Result<T>) -> Result<T> {
         f(&mut self.sim.lock())
     }
+}
+
+fn invalid(from: &str, to: &str, why: &str) -> DeviceError {
+    DeviceError::Refused(format!("invalid transition {from} -> {to}: {why} (simulation)"))
 }
 
 fn unknown(id: &str) -> DeviceError {
@@ -88,18 +92,33 @@ impl Broadcasts for SimBroadcasts {
     /// still sees it land, as with the real service.
     async fn transition(&self, id: &str, to: Phase) -> Result<()> {
         self.gate().await?;
-        let done_at = self.with(|w| {
+        let plan = self.with(|w| {
+            let lc = w.broadcasts.iter().find(|b| b.id == id).ok_or_else(|| unknown(id))?.life_cycle.clone();
+            let target = phase_name(to);
+            if let Some(p) = &w.yt_pending {
+                // One change at a time: the same target is waited for, any other refused.
+                return if p.id == id && p.to == to {
+                    Ok(Some(p.done_at))
+                } else {
+                    Err(invalid(&lc, target, "another change is still in progress"))
+                };
+            }
+            if lc == target {
+                return Ok(None); // already there: the real client does nothing
+            }
+            let allowed = matches!((lc.as_str(), to), ("ready" | "created", Phase::Testing) | ("testing", Phase::Live) | ("live", Phase::Complete));
+            if !allowed {
+                return Err(invalid(&lc, target, "not allowed from this state"));
+            }
             if to == Phase::Live && w.has_fault(Fault::YouTubeRefusesPublic) {
                 return Err(DeviceError::Refused("YouTube refused to go public (simulation)".into()));
-            }
-            if !w.broadcasts.iter().any(|b| b.id == id) {
-                return Err(unknown(id));
             }
             let requested = Instant::now();
             let done_at = requested + self.sim.clock.scale(TRANSITION);
             w.yt_pending = Some(YtPending { id: id.into(), to, requested, done_at });
-            Ok(done_at)
+            Ok(Some(done_at))
         })?;
+        let Some(done_at) = plan else { return Ok(()) };
         tokio::time::sleep_until(done_at).await;
         drop(self.sim.lock()); // applies the transition
         Ok(())

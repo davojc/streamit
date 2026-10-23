@@ -87,7 +87,8 @@ impl SimPlayer {
                     let position = w.player.position(sim.clock.speed().factor()).unwrap_or_default();
                     let left = duration - position;
                     if left <= END_SLACK {
-                        w.player = PlayerState::Loaded { duration };
+                        // Ended: nothing is loaded any more, so a further play() is refused.
+                        w.player = PlayerState::Empty;
                         let _ = w.player_events.send(PlayerEvent::Ended);
                         return;
                     }
@@ -102,12 +103,16 @@ impl SimPlayer {
 #[async_trait]
 impl Player for SimPlayer {
     async fn load(&self, path: &Path, _gain_db: f32) -> Result<Duration> {
-        let mut w = self.sim.lock();
-        w.check_plugged(DeviceKind::DeckLink)?;
-        if w.faults.remove(&Fault::NextVideoFails) {
-            return Err(DeviceError::Other("could not open the video (simulation)".into()));
+        {
+            let mut w = self.sim.lock();
+            w.check_plugged(DeviceKind::DeckLink)?;
+            if w.faults.remove(&Fault::NextVideoFails) {
+                return Err(DeviceError::Other("could not open the video (simulation)".into()));
+            }
         }
+        // File I/O, so not under the world lock.
         let duration = clip::clip_length(path);
+        let mut w = self.sim.lock();
         w.player_gen += 1;
         w.player = PlayerState::Loaded { duration };
         Ok(duration)

@@ -11,11 +11,24 @@ pub fn clip_length(path: &Path) -> Duration {
     read(path).filter(|d| !d.is_zero()).unwrap_or(FALLBACK)
 }
 
+/// Never panics: the `mp4` crate's own `duration()` divides by the timescale (zero in a
+/// corrupt header), so this does the arithmetic itself, and a panic while parsing a
+/// hostile file is caught too.
 fn read(path: &Path) -> Option<Duration> {
-    let file = std::fs::File::open(path).ok()?;
-    let size = file.metadata().ok()?.len();
-    let reader = mp4::Mp4Reader::read_header(std::io::BufReader::new(file), size).ok()?;
-    Some(reader.duration())
+    std::panic::catch_unwind(|| {
+        let file = std::fs::File::open(path).ok()?;
+        let size = file.metadata().ok()?.len();
+        let reader = mp4::Mp4Reader::read_header(std::io::BufReader::new(file), size).ok()?;
+        let (ticks, scale) = (reader.moov.mvhd.duration, u64::from(reader.moov.mvhd.timescale));
+        if scale == 0 {
+            return None;
+        }
+        // remainder < scale < 2^32, so the nanosecond product fits in a u64.
+        let nanos = (ticks % scale).checked_mul(1_000_000_000)? / scale;
+        Some(Duration::new(ticks / scale, nanos as u32))
+    })
+    .ok()
+    .flatten()
 }
 
 #[cfg(test)]
@@ -40,13 +53,18 @@ pub(crate) mod test_support {
     /// A minimal valid mp4: `ftyp` and a `moov` holding only a version-0 `mvhd` whose
     /// duration is `millis` (timescale 1000).
     pub fn mp4_bytes(millis: u32) -> Vec<u8> {
+        mp4_bytes_with_timescale(millis, 1000)
+    }
+
+    /// As `mp4_bytes`, with an explicit (possibly nonsensical) timescale.
+    pub fn mp4_bytes_with_timescale(duration: u32, timescale: u32) -> Vec<u8> {
         let mut ftyp = b"isom".to_vec();
         ftyp.extend_from_slice(&0u32.to_be_bytes());
         ftyp.extend_from_slice(b"isom");
         let mut mvhd = vec![0u8; 4]; // version 0, flags 0
         mvhd.extend_from_slice(&[0; 8]); // creation, modification
-        mvhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
-        mvhd.extend_from_slice(&millis.to_be_bytes());
+        mvhd.extend_from_slice(&timescale.to_be_bytes());
+        mvhd.extend_from_slice(&duration.to_be_bytes());
         mvhd.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // rate 1.0
         mvhd.extend_from_slice(&0x0100u16.to_be_bytes()); // volume 1.0
         mvhd.extend_from_slice(&[0; 10]); // reserved
