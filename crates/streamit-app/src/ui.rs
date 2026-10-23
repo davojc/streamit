@@ -982,7 +982,7 @@ impl StreamItApp {
             ui.text_edit_singleline(&mut self.live_inputs_text);
             ui.end_row();
             num(ui, "Default live input", &mut c.stream_atem.default_live_input);
-            ui.label("Duck level");
+            ui.label("Mics during a video (-100 = off)");
             ui.add(egui::DragValue::new(&mut c.stream_atem.duck_db).range(-100.0..=0.0).speed(0.5).suffix(" dB"));
             ui.end_row();
             millis(ui, "Mic fade", &mut c.stream_atem.fade);

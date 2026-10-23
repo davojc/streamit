@@ -3,7 +3,7 @@
 //! Device errors never abort `prepare`; they become warnings. In `countdown` only a
 //! failure to load or play the countdown video (or the video itself failing) ends it
 //! with `Err`; every other device error is a warning and the sequence carries on.
-use crate::audio::{LiveLevels, Target, fade};
+use crate::audio::{LiveLevels, Target, down_threshold, fade};
 use crate::config::Config;
 use crate::devices::{
     BroadcastCheck, BroadcastSummary, DeviceError, Devices, Health, Phase, PlayerEvent, Result, Switcher,
@@ -138,7 +138,7 @@ pub async fn prepare(
     let waiting = |s: &str| progress(Readiness::Waiting(s.to_string()));
 
     waiting("Capturing mic levels");
-    if let Err(e) = levels.recapture(&*d.stream, &sa.mic_sources).await {
+    if let Err(e) = levels.recapture(&*d.stream, &sa.mic_sources, down_threshold(sa.duck_db)).await {
         note(&mut problems, &warn, format!("Could not read mic levels: {e}"));
     }
 
@@ -597,6 +597,18 @@ mod tests {
         assert_eq!(calls.len(), 3 + 20 + 2);
         assert!(warns.lock().unwrap().is_empty());
         assert_eq!(progress.lock().unwrap().last(), Some(&Readiness::Ready));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prepare_fades_to_floor_whatever_duck_db() {
+        let (d, log, h) = fake_devices();
+        let mut c = Config::default();
+        c.stream_atem.duck_db = -20.0;
+        h.stream.set_audio_level_state(MIC, -3.0);
+        let mut levels = LiveLevels::default();
+        prepare(&d, &c, "b", &mut levels, |_| {}, |_| {}).await;
+        assert!(log.calls().contains(&Call::StreamSetAudioLevel(MIC, FLOOR_DB)), "{:?}", log.calls());
+        assert_eq!(levels.0[&MIC], -3.0);
     }
 
     #[tokio::test(start_paused = true)]

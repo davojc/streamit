@@ -9,23 +9,30 @@ pub const FLOOR_DB: f32 = -100.0;
 const STEPS_PER_SEC: u128 = 20;
 const STEP: Duration = Duration::from_millis(50);
 
+/// R21: a mic at or below this level counts as "down" (faded for a video or the
+/// holding still), so it is neither captured as a live level nor treated as live:
+/// 1 dB above the floor, or above the duck level when that is higher.
+pub fn down_threshold(duck_db: f32) -> f32 {
+    FLOOR_DB.max(duck_db) + 1.0
+}
+
 /// The "live" (un-faded) level of each mic, in dB.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LiveLevels(pub HashMap<AudioSourceId, f32>);
 
 impl LiveLevels {
-    /// Read current levels; floored sources are not stored.
-    pub async fn capture(sw: &dyn StreamSwitcher, srcs: &[AudioSourceId]) -> Result<LiveLevels> {
+    /// Read current levels; sources at or below `down` (see `down_threshold`) are not stored.
+    pub async fn capture(sw: &dyn StreamSwitcher, srcs: &[AudioSourceId], down: f32) -> Result<LiveLevels> {
         let mut l = LiveLevels::default();
-        l.recapture(sw, srcs).await?;
+        l.recapture(sw, srcs, down).await?;
         Ok(l)
     }
 
-    /// Refresh levels, keeping the previous value for any source at/near the floor.
-    pub async fn recapture(&mut self, sw: &dyn StreamSwitcher, srcs: &[AudioSourceId]) -> Result<()> {
+    /// Refresh levels, keeping the previous value for any source at or below `down`.
+    pub async fn recapture(&mut self, sw: &dyn StreamSwitcher, srcs: &[AudioSourceId], down: f32) -> Result<()> {
         for &s in srcs {
             let db = sw.audio_level(s).await?;
-            if db > FLOOR_DB + 1.0 {
+            if db > down {
                 self.0.insert(s, db);
             }
         }
@@ -35,13 +42,21 @@ impl LiveLevels {
 
 pub enum Target<'a> {
     Floor,
+    /// One level for every source (the duck level).
+    Level(f32),
     Live(&'a LiveLevels),
 }
 
 impl Target<'_> {
+    /// R21: where a roll-in fades the mics: `duck_db`, or the floor when that is at or below it.
+    pub fn duck(duck_db: f32) -> Target<'static> {
+        if duck_db <= FLOOR_DB { Target::Floor } else { Target::Level(duck_db) }
+    }
+
     fn for_src(&self, s: AudioSourceId) -> f32 {
         match self {
             Target::Floor => FLOOR_DB,
+            Target::Level(db) => *db,
             Target::Live(l) => l.0.get(&s).copied().unwrap_or(0.0),
         }
     }
@@ -106,7 +121,7 @@ mod tests {
     async fn fade_up_returns_to_captured_live_level() {
         let (d, log, h) = fake_devices();
         h.stream.set_audio_level_state(MIC, -3.5);
-        let live = LiveLevels::capture(&*d.stream, &[MIC]).await.unwrap();
+        let live = LiveLevels::capture(&*d.stream, &[MIC], down_threshold(FLOOR_DB)).await.unwrap();
         fade(&*d.stream, &[MIC], Target::Floor, Duration::from_secs(1)).await.unwrap();
         fade(&*d.stream, &[MIC], Target::Live(&live), Duration::from_secs(1)).await.unwrap();
         assert_eq!(*level_calls(log.calls()).last().unwrap(), -3.5);
@@ -116,10 +131,37 @@ mod tests {
     async fn capture_ignores_floored_source() {
         let (d, _log, h) = fake_devices();
         h.stream.set_audio_level_state(MIC, -6.0);
-        let mut live = LiveLevels::capture(&*d.stream, &[MIC]).await.unwrap();
+        let mut live = LiveLevels::capture(&*d.stream, &[MIC], down_threshold(FLOOR_DB)).await.unwrap();
         h.stream.set_audio_level_state(MIC, FLOOR_DB);
-        live.recapture(&*d.stream, &[MIC]).await.unwrap();
+        live.recapture(&*d.stream, &[MIC], down_threshold(FLOOR_DB)).await.unwrap();
         assert_eq!(live.0[&MIC], -6.0);
+    }
+
+    #[test]
+    fn down_threshold_is_one_db_above_floor_or_duck_level() {
+        assert_eq!(down_threshold(FLOOR_DB), FLOOR_DB + 1.0);
+        assert_eq!(down_threshold(-150.0), FLOOR_DB + 1.0);
+        assert_eq!(down_threshold(-20.0), -19.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duck_target_is_duck_db_or_floor() {
+        for (duck, lands) in [(-20.0, -20.0), (FLOOR_DB, FLOOR_DB), (-120.0, FLOOR_DB)] {
+            let (d, log, h) = fake_devices();
+            h.stream.set_audio_level_state(MIC, 0.0);
+            fade(&*d.stream, &[MIC], Target::duck(duck), Duration::from_secs(1)).await.unwrap();
+            assert_eq!(*level_calls(log.calls()).last().unwrap(), lands, "duck {duck}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capture_ignores_source_at_duck_level() {
+        let (d, _log, h) = fake_devices();
+        h.stream.set_audio_level_state(MIC, -6.0);
+        let mut live = LiveLevels::capture(&*d.stream, &[MIC], down_threshold(-20.0)).await.unwrap();
+        h.stream.set_audio_level_state(MIC, -20.0);
+        live.recapture(&*d.stream, &[MIC], down_threshold(-20.0)).await.unwrap();
+        assert_eq!(live.0[&MIC], -6.0, "a ducked mic is not its live level");
     }
 
     #[tokio::test(start_paused = true)]

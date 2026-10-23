@@ -1,6 +1,6 @@
 //! Startup assessment and recovery. `assess` only reads; it never changes a device.
 //! `recover` is the one-press fix for a crash during a video.
-use crate::audio::{FLOOR_DB, LiveLevels, Target, fade};
+use crate::audio::{LiveLevels, Target, down_threshold, fade};
 use crate::config::{AudioSourceId, Config};
 use crate::devices::{Devices, EncoderStatus, Result};
 use crate::golive::{Readiness, Stage, cut};
@@ -38,8 +38,9 @@ pub async fn assess(d: &Devices, c: &Config, bid: Option<&str>, player_active: b
 
     let mut mic_muted = false;
     if streaming && on_live_input {
+        let down = down_threshold(sa.duck_db);
         for &m in &sa.mic_sources {
-            if d.stream.audio_level(m).await.is_ok_and(|db| db <= FLOOR_DB + 1.0) {
+            if d.stream.audio_level(m).await.is_ok_and(|db| db <= down) {
                 mic_muted = true;
             }
         }
@@ -152,6 +153,7 @@ pub async fn recover(d: &Devices, c: &Config, levels: &LiveLevels) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::FLOOR_DB;
     use crate::devices::DeviceError;
     use crate::fakes::{Call, fake_devices};
 
@@ -229,6 +231,18 @@ mod tests {
         assert_eq!(assess(&d, &cfg(), None, false).await.offer, vec![Offer::Recover]);
         h.encoder.set_status(EncoderStatus::Idle);
         assert!(assess(&d, &cfg(), None, false).await.offer.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mics_down_check_uses_duck_threshold() {
+        let (d, _l, h) = rig();
+        let mut c = cfg();
+        c.stream_atem.duck_db = -20.0;
+        h.encoder.set_status(EncoderStatus::Streaming);
+        h.stream.set_audio_level_state(MIC, -20.0); // left ducked
+        assert_eq!(assess(&d, &c, None, false).await.offer, vec![Offer::Recover]);
+        h.stream.set_audio_level_state(MIC, -10.0);
+        assert!(assess(&d, &c, None, false).await.offer.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

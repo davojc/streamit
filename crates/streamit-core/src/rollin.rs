@@ -8,7 +8,7 @@
 //!
 //! Device errors once the roll-in has started never stop the return path; they are
 //! collected and the outcome becomes `Failed { recover_needed: true, .. }`.
-use crate::audio::{LiveLevels, Target, fade};
+use crate::audio::{LiveLevels, Target, down_threshold, fade};
 use crate::config::{AudioSourceId, Config};
 use crate::devices::{Devices, PlayerEvent};
 use crate::golive::cut;
@@ -282,7 +282,7 @@ pub async fn play_reporting(
             return RollinOutcome::Failed { recover_needed: true, reason: problems.join("; ") };
         }
         sleep(hub.settle).await;
-        if let Err(e) = levels.recapture(&*d.stream, &sa.mic_sources).await {
+        if let Err(e) = levels.recapture(&*d.stream, &sa.mic_sources, down_threshold(sa.duck_db)).await {
             note(&mut problems, format!("Could not read mic levels: {e}"));
         }
     }
@@ -325,7 +325,8 @@ pub async fn play_reporting(
         mics_ducked(true);
     }
     let fade_down = async {
-        if mics_down { fade(&*d.stream, &sa.mic_sources, Target::Floor, sa.fade).await } else { Ok(()) }
+        // R21: roll-ins duck to duck_db (the floor when duck_db is at or below it).
+        if mics_down { fade(&*d.stream, &sa.mic_sources, Target::duck(sa.duck_db), sa.fade).await } else { Ok(()) }
     };
     let screens_and_play = async {
         let screens = if dest.screens_picture() {
@@ -950,6 +951,19 @@ mod tests {
             assert!(screens < pos(&tail, &Call::StreamSetAudioLevel(MIC, -3.0)), "{end}: {tail:?}");
             assert_eq!(tail.last(), Some(&Call::HubRoute { output: OUT, input: CAM8 }), "{end}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rollin_fades_mics_to_duck_db() {
+        let (d, log, h) = rig();
+        let mut c = cfg();
+        c.stream_atem.duck_db = -20.0;
+        let r = play_to_end(&d, &c, cue(Destination::HallAndOnline), &log, &h).await;
+        assert_eq!(r, RollinOutcome::Finished);
+        let calls = log.calls();
+        assert!(calls.contains(&Call::StreamSetAudioLevel(MIC, -20.0)), "{calls:?}");
+        assert!(!calls.contains(&Call::StreamSetAudioLevel(MIC, FLOOR_DB)), "{calls:?}");
+        assert_eq!(h.stream.audio_level(MIC).await.unwrap(), -3.0, "back to the live level");
     }
 
     #[test]
