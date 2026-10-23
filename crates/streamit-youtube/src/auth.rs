@@ -137,7 +137,7 @@ impl Auth {
 
     /// The loopback flow: listen on 127.0.0.1:<ephemeral>, send the user to `auth_url`
     /// (through `open`), take the code from the redirect, exchange it with PKCE.
-    pub async fn run_sign_in(&self, auth_url: Url, open: &dyn Fn(&Url)) -> Result<()> {
+    pub async fn run_sign_in(&self, auth_url: Url, open: &(dyn Fn(&Url) + Sync)) -> Result<()> {
         let inner = &self.0;
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(other)?;
         let port = listener.local_addr().map_err(other)?.port();

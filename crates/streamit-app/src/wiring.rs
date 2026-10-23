@@ -1,0 +1,664 @@
+//! Builds the real devices from the config, with stand-ins for any that cannot be built,
+//! and polls each device's health every 2 s (R19).
+//!
+//! Startup never changes a device: the network clients only connect and listen (they
+//! reconnect by themselves), and the playout objects only initialise.
+use async_trait::async_trait;
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+use streamit_core::config::{AudioSourceId, Config};
+use streamit_core::devices::{
+    self, BroadcastCheck, BroadcastSummary, Broadcasts, Counter, DeviceError, Devices, Encoder,
+    EncoderStatus, Fix, Health, Phase, Player, PlayerEvent, Router, StreamSwitcher, Switcher,
+};
+use streamit_core::engine::{Command, DeviceHealth, DeviceKind};
+use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
+
+/// How often every device is polled.
+pub const POLL_EVERY: Duration = Duration::from_secs(2);
+/// A poll with no answer in this time is a warning.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often a failed player/counter build is retried.
+#[cfg_attr(not(feature = "gst"), allow(dead_code))]
+const PLAYOUT_RETRY: Duration = Duration::from_secs(10);
+
+pub const ATEM_PORT: u16 = 9910;
+pub const VIDEOHUB_PORT: u16 = 9990;
+pub const WEBPRESENTER_PORT: u16 = 9977;
+
+#[cfg(not(feature = "gst"))]
+const NO_GST: &str = "built without GStreamer (rebuild with --features gst)";
+
+/// One poll result per health: Ok is Ok, Disconnected is Down, anything else a Warning.
+pub fn health_of<T>(r: &devices::Result<T>) -> DeviceHealth {
+    match r {
+        Ok(_) => DeviceHealth::Ok,
+        Err(e @ DeviceError::Disconnected(_)) => DeviceHealth::Down(e.to_string()),
+        Err(e) => DeviceHealth::Warning(e.to_string()),
+    }
+}
+
+/// Remembers the last health per device and reports only changes.
+#[derive(Default)]
+pub struct HealthTracker {
+    last: BTreeMap<DeviceKind, DeviceHealth>,
+}
+
+impl HealthTracker {
+    /// The entries of `now` that differ from what was last seen (all of them the first time).
+    pub fn changes(&mut self, now: &[(DeviceKind, DeviceHealth)]) -> Vec<(DeviceKind, DeviceHealth)> {
+        let mut changed = Vec::new();
+        for (k, h) in now {
+            if self.last.get(k) != Some(h) {
+                self.last.insert(*k, h.clone());
+                changed.push((*k, h.clone()));
+            }
+        }
+        changed
+    }
+}
+
+// ---- stand-ins ----
+
+/// Stands in for a device that could not be built: every call is `Disconnected(reason)`,
+/// so it shows as Down and the sequences report it like an unplugged device.
+pub struct Absent {
+    reason: String,
+    events: broadcast::Sender<PlayerEvent>,
+}
+
+impl Absent {
+    pub fn new(reason: impl Into<String>) -> Arc<Absent> {
+        let (events, _) = broadcast::channel(4);
+        Arc::new(Absent { reason: reason.into(), events })
+    }
+
+    fn err<T>(&self) -> devices::Result<T> {
+        Err(DeviceError::Disconnected(self.reason.clone()))
+    }
+}
+
+#[async_trait]
+impl Switcher for Absent {
+    async fn program(&self) -> devices::Result<u16> {
+        self.err()
+    }
+    async fn preview(&self) -> devices::Result<u16> {
+        self.err()
+    }
+    async fn set_preview(&self, _: u16) -> devices::Result<()> {
+        self.err()
+    }
+    async fn set_program(&self, _: u16) -> devices::Result<()> {
+        self.err()
+    }
+    async fn auto(&self) -> devices::Result<()> {
+        self.err()
+    }
+    async fn wait_transition_done(&self, _: Duration) -> devices::Result<()> {
+        self.err()
+    }
+}
+
+#[async_trait]
+impl StreamSwitcher for Absent {
+    async fn set_media_player_still(&self, _: u8, _: u16) -> devices::Result<()> {
+        self.err()
+    }
+    fn media_player_input(&self, player: u8) -> u16 {
+        3000 + 10 * u16::from(player)
+    }
+    async fn audio_level(&self, _: AudioSourceId) -> devices::Result<f32> {
+        self.err()
+    }
+    async fn set_audio_level(&self, _: AudioSourceId, _: f32) -> devices::Result<()> {
+        self.err()
+    }
+    async fn set_audio_on(&self, _: AudioSourceId, _: bool) -> devices::Result<()> {
+        self.err()
+    }
+}
+
+#[async_trait]
+impl Router for Absent {
+    async fn route_of(&self, _: u16) -> devices::Result<u16> {
+        self.err()
+    }
+    async fn route(&self, _: u16, _: u16) -> devices::Result<()> {
+        self.err()
+    }
+}
+
+#[async_trait]
+impl Encoder for Absent {
+    async fn start(&self) -> devices::Result<()> {
+        self.err()
+    }
+    async fn stop(&self) -> devices::Result<()> {
+        self.err()
+    }
+    async fn status(&self) -> devices::Result<EncoderStatus> {
+        self.err()
+    }
+}
+
+#[async_trait]
+impl Broadcasts for Absent {
+    async fn signed_in(&self) -> devices::Result<bool> {
+        self.err()
+    }
+    async fn upcoming(&self) -> devices::Result<Vec<BroadcastSummary>> {
+        self.err()
+    }
+    async fn check(&self, _: &str) -> devices::Result<BroadcastCheck> {
+        self.err()
+    }
+    async fn fix(&self, _: &str, _: Fix) -> devices::Result<()> {
+        self.err()
+    }
+    async fn health(&self) -> devices::Result<Health> {
+        self.err()
+    }
+    async fn life_cycle(&self, _: &str) -> devices::Result<String> {
+        self.err()
+    }
+    async fn transition(&self, _: &str, _: Phase) -> devices::Result<()> {
+        self.err()
+    }
+}
+
+#[async_trait]
+impl Player for Absent {
+    async fn load(&self, _: &Path, _: f32) -> devices::Result<Duration> {
+        self.err()
+    }
+    async fn play(&self) -> devices::Result<()> {
+        self.err()
+    }
+    async fn stop(&self) -> devices::Result<()> {
+        self.err()
+    }
+    fn position(&self) -> Option<Duration> {
+        None
+    }
+    fn events(&self) -> broadcast::Receiver<PlayerEvent> {
+        self.events.subscribe()
+    }
+}
+
+#[async_trait]
+impl Counter for Absent {
+    async fn show(&self, _: Duration) -> devices::Result<()> {
+        self.err()
+    }
+    async fn clear(&self) -> devices::Result<()> {
+        self.err()
+    }
+}
+
+// ---- player / counter built later ----
+
+/// A player or counter that may not exist yet: calls go to it once it is installed and
+/// fail as `Disconnected` (with the last build error) until then.
+pub struct Late<T: ?Sized> {
+    inner: RwLock<Option<Arc<T>>>,
+    error: Mutex<String>,
+    stand_in: Arc<Absent>,
+}
+
+impl<T: ?Sized> Late<T> {
+    pub fn new(why: impl Into<String>) -> Arc<Late<T>> {
+        let why = why.into();
+        Arc::new(Late { inner: RwLock::new(None), stand_in: Absent::new(why.clone()), error: Mutex::new(why) })
+    }
+
+    pub fn get(&self) -> Option<Arc<T>> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn install(&self, v: Arc<T>) {
+        *self.inner.write().unwrap_or_else(|e| e.into_inner()) = Some(v);
+    }
+
+    pub fn fail(&self, why: impl Into<String>) {
+        *self.error.lock().unwrap_or_else(|e| e.into_inner()) = why.into();
+    }
+
+    pub fn health(&self) -> DeviceHealth {
+        match self.get() {
+            Some(_) => DeviceHealth::Ok,
+            None => DeviceHealth::Down(self.error.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+        }
+    }
+
+    fn missing<R>(&self) -> devices::Result<R> {
+        Err(DeviceError::Disconnected(self.error.lock().unwrap_or_else(|e| e.into_inner()).clone()))
+    }
+}
+
+#[async_trait]
+impl Player for Late<dyn Player> {
+    async fn load(&self, path: &Path, gain_db: f32) -> devices::Result<Duration> {
+        match self.get() {
+            Some(p) => p.load(path, gain_db).await,
+            None => self.missing(),
+        }
+    }
+    async fn play(&self) -> devices::Result<()> {
+        match self.get() {
+            Some(p) => p.play().await,
+            None => self.missing(),
+        }
+    }
+    async fn stop(&self) -> devices::Result<()> {
+        match self.get() {
+            Some(p) => p.stop().await,
+            None => self.missing(),
+        }
+    }
+    fn position(&self) -> Option<Duration> {
+        self.get().and_then(|p| p.position())
+    }
+    fn events(&self) -> broadcast::Receiver<PlayerEvent> {
+        match self.get() {
+            Some(p) => p.events(),
+            None => Player::events(&*self.stand_in),
+        }
+    }
+}
+
+#[async_trait]
+impl Counter for Late<dyn Counter> {
+    async fn show(&self, remaining: Duration) -> devices::Result<()> {
+        match self.get() {
+            Some(c) => c.show(remaining).await,
+            None => self.missing(),
+        }
+    }
+    async fn clear(&self) -> devices::Result<()> {
+        match self.get() {
+            Some(c) => c.clear().await,
+            None => self.missing(),
+        }
+    }
+}
+
+/// Builds the device off the async threads (GStreamer init and the NDI sink block), and
+/// keeps retrying every `PLAYOUT_RETRY` while it fails. Returns after the first attempt.
+#[cfg_attr(not(feature = "gst"), allow(dead_code))]
+async fn keep_building<T, F>(slot: Arc<Late<T>>, what: &'static str, build: F)
+where
+    T: ?Sized + Send + Sync + 'static,
+    F: Fn() -> devices::Result<Arc<T>> + Send + Sync + 'static,
+{
+    let build = Arc::new(build);
+    let attempt = {
+        let (slot, build) = (slot.clone(), build.clone());
+        move || {
+            let (slot, build) = (slot.clone(), build.clone());
+            async move {
+                match tokio::task::spawn_blocking(move || build()).await {
+                    Ok(Ok(v)) => {
+                        info!("{what} ready");
+                        slot.install(v);
+                        true
+                    }
+                    Ok(Err(e)) => {
+                        warn!("{what} could not start: {e}");
+                        slot.fail(e.to_string());
+                        false
+                    }
+                    Err(e) => {
+                        warn!("{what} start panicked: {e}");
+                        slot.fail(format!("{what} start failed"));
+                        false
+                    }
+                }
+            }
+        }
+    };
+    if attempt().await {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(PLAYOUT_RETRY).await;
+            if attempt().await {
+                return;
+            }
+        }
+    });
+}
+
+// ---- building ----
+
+/// `address` as a socket address on `port`, or why it cannot be used.
+pub fn socket_addr(address: &Option<String>, port: u16) -> Result<SocketAddr, String> {
+    let a = address.as_deref().map(str::trim).unwrap_or("");
+    if a.is_empty() {
+        return Err("no address set (assign one in Settings)".into());
+    }
+    if let Ok(sa) = a.parse::<SocketAddr>() {
+        return Ok(sa);
+    }
+    a.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, port)).map_err(|_| format!("bad address {a:?}"))
+}
+
+/// What the health poll looks at.
+pub struct Probes {
+    devices: Devices,
+    player: Arc<Late<dyn Player>>,
+    counter: Arc<Late<dyn Counter>>,
+}
+
+pub struct Wired {
+    pub devices: Devices,
+    /// The first poll, so the window and deck show health straight away.
+    pub health: Vec<(DeviceKind, DeviceHealth)>,
+    pub probes: Probes,
+}
+
+/// Builds every device from `c`. Never fails: a device that cannot be built is a Down
+/// stand-in, and the network clients keep reconnecting by themselves.
+pub async fn build(c: &Config) -> Wired {
+    let stream: Arc<dyn StreamSwitcher> = match socket_addr(&c.stream_atem.address, ATEM_PORT) {
+        Ok(a) => match streamit_atem::AtemClient::connect(a).await {
+            Ok(x) => x,
+            Err(e) => absent("Stream ATEM", e.to_string()),
+        },
+        Err(e) => absent("Stream ATEM", e),
+    };
+    let screens: Arc<dyn Switcher> = match socket_addr(&c.screens_atem.address, ATEM_PORT) {
+        Ok(a) => match streamit_atem::AtemClient::connect(a).await {
+            Ok(x) => x,
+            Err(e) => absent("Screens ATEM", e.to_string()),
+        },
+        Err(e) => absent("Screens ATEM", e),
+    };
+    let hub: Arc<dyn Router> = match socket_addr(&c.videohub.address, VIDEOHUB_PORT) {
+        Ok(a) => match streamit_videohub::VideoHub::connect(a).await {
+            Ok(x) => x,
+            Err(e) => absent("VideoHub", e.to_string()),
+        },
+        Err(e) => absent("VideoHub", e),
+    };
+    let encoder: Arc<dyn Encoder> = match socket_addr(&c.web_presenter.address, WEBPRESENTER_PORT) {
+        Ok(a) => match streamit_webpresenter::WebPresenter::connect(a).await {
+            Ok(x) => x,
+            Err(e) => absent("Web Presenter", e.to_string()),
+        },
+        Err(e) => absent("Web Presenter", e),
+    };
+    let yt: Arc<dyn Broadcasts> = youtube(c);
+    let (player, counter) = playout(c).await;
+    let devices = Devices {
+        stream,
+        screens,
+        hub,
+        encoder,
+        yt,
+        player: player.clone(),
+        counter: counter.clone(),
+    };
+    let probes = Probes { devices: devices.clone(), player, counter };
+    let health = probes.poll(c.videohub.input8_output).await;
+    for (k, h) in &health {
+        log_health(*k, h);
+    }
+    Wired { devices, health, probes }
+}
+
+fn absent(what: &str, why: String) -> Arc<Absent> {
+    warn!("{what}: {why}; using a stand-in");
+    Absent::new(why)
+}
+
+fn youtube(c: &Config) -> Arc<dyn Broadcasts> {
+    let y = &c.youtube;
+    if y.client_id.trim().is_empty() || y.client_secret.trim().is_empty() {
+        return absent("YouTube", "YouTube client id and secret not set (Settings)".into());
+    }
+    match streamit_youtube::Auth::load(&y.client_id, &y.client_secret) {
+        Ok(auth) => {
+            let base = url::Url::parse(streamit_youtube::API_BASE).expect("api base");
+            Arc::new(streamit_youtube::YouTubeClient::new(base, auth, y.stream_id.clone()))
+        }
+        Err(e) => absent("YouTube", e.to_string()),
+    }
+}
+
+#[cfg(feature = "gst")]
+async fn playout(c: &Config) -> (Arc<Late<dyn Player>>, Arc<Late<dyn Counter>>) {
+    let player: Arc<Late<dyn Player>> = Late::new("DeckLink player starting");
+    let counter: Arc<Late<dyn Counter>> = Late::new("NDI counter starting");
+    let pc = c.playout.clone();
+    let p = keep_building(player.clone(), "DeckLink player", move || {
+        streamit_playout::GstPlayer::new(&pc, streamit_playout::SinkKind::DeckLink)
+            .map(|p| p as Arc<dyn Player>)
+    });
+    let nc = c.ndi.clone();
+    let n = keep_building(counter.clone(), "NDI counter", move || {
+        streamit_playout::NdiCounter::new(&nc).map(|n| n as Arc<dyn Counter>)
+    });
+    tokio::join!(p, n);
+    (player, counter)
+}
+
+#[cfg(not(feature = "gst"))]
+async fn playout(_c: &Config) -> (Arc<Late<dyn Player>>, Arc<Late<dyn Counter>>) {
+    warn!("DeckLink player and NDI counter: {NO_GST}");
+    (Late::new(NO_GST), Late::new(NO_GST))
+}
+
+// ---- health ----
+
+async fn probe<T>(f: impl Future<Output = devices::Result<T>>) -> DeviceHealth {
+    match tokio::time::timeout(PROBE_TIMEOUT, f).await {
+        Ok(r) => health_of(&r),
+        Err(_) => DeviceHealth::Warning(format!("no reply in {} s", PROBE_TIMEOUT.as_secs())),
+    }
+}
+
+impl Probes {
+    #[cfg(test)]
+    fn new(devices: Devices, player: Arc<Late<dyn Player>>, counter: Arc<Late<dyn Counter>>) -> Probes {
+        Probes { devices, player, counter }
+    }
+
+    /// One read per device: program() for the ATEMs, route_of(input-8 output, or 1) for
+    /// the VideoHub, status() for the Web Presenter, signed_in() for YouTube.
+    pub async fn poll(&self, hub_output: u16) -> Vec<(DeviceKind, DeviceHealth)> {
+        let d = &self.devices;
+        let out = if hub_output == 0 { 1 } else { hub_output };
+        let (stream, screens, hub, encoder, yt) = tokio::join!(
+            probe(d.stream.program()),
+            probe(d.screens.program()),
+            probe(d.hub.route_of(out)),
+            probe(d.encoder.status()),
+            async {
+                match tokio::time::timeout(PROBE_TIMEOUT, d.yt.signed_in()).await {
+                    Ok(Ok(false)) => DeviceHealth::Warning("not signed in to YouTube".into()),
+                    Ok(r) => health_of(&r),
+                    Err(_) => DeviceHealth::Warning("no reply from YouTube".into()),
+                }
+            },
+        );
+        vec![
+            (DeviceKind::StreamAtem, stream),
+            (DeviceKind::ScreensAtem, screens),
+            (DeviceKind::VideoHub, hub),
+            (DeviceKind::WebPresenter, encoder),
+            (DeviceKind::YouTube, yt),
+            (DeviceKind::DeckLink, self.player.health()),
+            (DeviceKind::Ndi, self.counter.health()),
+        ]
+    }
+}
+
+fn log_health(kind: DeviceKind, h: &DeviceHealth) {
+    match h {
+        DeviceHealth::Ok => info!(device = ?kind, "device ok"),
+        DeviceHealth::Warning(w) => warn!(device = ?kind, warning = %w, "device warning"),
+        DeviceHealth::Down(e) => warn!(device = ?kind, error = %e, "device down"),
+    }
+}
+
+/// Polls every `POLL_EVERY` and sends `Command::DeviceHealth` for each change. `seed` is
+/// the health already sent. Stops when the engine is gone.
+pub fn spawn_health_poll(
+    probes: Probes,
+    config: Arc<RwLock<Config>>,
+    tx: mpsc::Sender<Command>,
+    seed: &[(DeviceKind, DeviceHealth)],
+) -> JoinHandle<()> {
+    let mut tracker = HealthTracker::default();
+    tracker.changes(seed);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(POLL_EVERY).await;
+            let out = config.read().unwrap_or_else(|e| e.into_inner()).videohub.input8_output;
+            for (kind, h) in tracker.changes(&probes.poll(out).await) {
+                log_health(kind, &h);
+                if tx.send(Command::DeviceHealth(kind, h)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use streamit_core::fakes::fake_devices;
+
+    #[test]
+    fn health_maps_ok_disconnected_and_others() {
+        assert_eq!(health_of(&Ok::<_, DeviceError>(3u16)), DeviceHealth::Ok);
+        assert_eq!(
+            health_of::<()>(&Err(DeviceError::Disconnected("gone".into()))),
+            DeviceHealth::Down("disconnected: gone".into())
+        );
+        for e in [
+            DeviceError::Refused("no".into()),
+            DeviceError::Timeout("slow".into()),
+            DeviceError::Other("odd".into()),
+        ] {
+            let text = e.to_string();
+            assert_eq!(health_of::<()>(&Err(e)), DeviceHealth::Warning(text));
+        }
+    }
+
+    #[test]
+    fn tracker_reports_only_changes() {
+        let mut t = HealthTracker::default();
+        let a = vec![(DeviceKind::VideoHub, DeviceHealth::Ok), (DeviceKind::YouTube, DeviceHealth::Ok)];
+        assert_eq!(t.changes(&a), a);
+        assert_eq!(t.changes(&a), vec![]);
+        let b = vec![
+            (DeviceKind::VideoHub, DeviceHealth::Down("x".into())),
+            (DeviceKind::YouTube, DeviceHealth::Ok),
+        ];
+        assert_eq!(t.changes(&b), vec![(DeviceKind::VideoHub, DeviceHealth::Down("x".into()))]);
+        let c = vec![
+            (DeviceKind::VideoHub, DeviceHealth::Down("y".into())),
+            (DeviceKind::YouTube, DeviceHealth::Ok),
+        ];
+        assert_eq!(t.changes(&c), vec![(DeviceKind::VideoHub, DeviceHealth::Down("y".into()))]);
+    }
+
+    fn kinds_down(h: &[(DeviceKind, DeviceHealth)], kinds: &[DeviceKind]) {
+        for k in kinds {
+            let got = h.iter().find(|(x, _)| x == k).map(|(_, h)| h.clone());
+            assert!(matches!(got, Some(DeviceHealth::Down(_))), "{k:?}: {got:?} in {h:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_with_unreachable_devices_still_returns_all_kinds_down() {
+        let mut c = Config::default();
+        c.stream_atem.address = Some("127.0.0.1:9".into());
+        c.screens_atem.address = Some("127.0.0.1:9".into());
+        c.videohub.address = Some("127.0.0.1:9".into());
+        c.web_presenter.address = Some("127.0.0.1:9".into());
+        c.youtube.client_id = String::new();
+        let w = build(&c).await;
+        assert_eq!(w.health.len(), 7, "{:?}", w.health);
+        kinds_down(
+            &w.health,
+            &[
+                DeviceKind::StreamAtem,
+                DeviceKind::ScreensAtem,
+                DeviceKind::VideoHub,
+                DeviceKind::WebPresenter,
+                DeviceKind::YouTube,
+            ],
+        );
+        #[cfg(not(feature = "gst"))]
+        kinds_down(&w.health, &[DeviceKind::DeckLink, DeviceKind::Ndi]);
+        // The stand-ins answer like unplugged devices.
+        assert!(matches!(w.devices.yt.signed_in().await, Err(DeviceError::Disconnected(_))));
+        assert_eq!(w.devices.stream.media_player_input(1), 3010);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_or_bad_addresses_are_down_stand_ins() {
+        let mut c = Config::default();
+        c.stream_atem.address = None;
+        c.screens_atem.address = Some("not an ip".into());
+        c.videohub.address = Some("  ".into());
+        c.web_presenter.address = Some("127.0.0.1:9".into());
+        let w = build(&c).await;
+        kinds_down(&w.health, &[DeviceKind::StreamAtem, DeviceKind::ScreensAtem, DeviceKind::VideoHub]);
+        assert!(matches!(
+            w.health.iter().find(|(k, _)| *k == DeviceKind::StreamAtem),
+            Some((_, DeviceHealth::Down(m))) if m.contains("no address")
+        ));
+    }
+
+    #[tokio::test]
+    async fn poll_reads_each_device() {
+        let (d, _log, h) = fake_devices();
+        let player: Arc<Late<dyn Player>> = Late::new("not yet");
+        let counter: Arc<Late<dyn Counter>> = Late::new("not yet");
+        player.install(d.player.clone());
+        let p = Probes::new(d, player, counter);
+        let got: BTreeMap<_, _> = p.poll(0).await.into_iter().collect();
+        for k in [
+            DeviceKind::StreamAtem,
+            DeviceKind::ScreensAtem,
+            DeviceKind::VideoHub,
+            DeviceKind::WebPresenter,
+            DeviceKind::YouTube,
+            DeviceKind::DeckLink,
+        ] {
+            assert_eq!(got[&k], DeviceHealth::Ok, "{k:?}");
+        }
+        assert_eq!(got[&DeviceKind::Ndi], DeviceHealth::Down("not yet".into()));
+
+        h.yt.set_signed_in(false);
+        h.hub.fail_next("route_of");
+        let got: BTreeMap<_, _> = p.poll(0).await.into_iter().collect();
+        assert!(matches!(got[&DeviceKind::YouTube], DeviceHealth::Warning(_)));
+        assert!(matches!(got[&DeviceKind::VideoHub], DeviceHealth::Down(_)));
+    }
+
+    #[tokio::test]
+    async fn late_player_forwards_once_installed() {
+        let (d, log, _h) = fake_devices();
+        let late: Arc<Late<dyn Player>> = Late::new("no player");
+        assert_eq!(late.play().await, Err(DeviceError::Disconnected("no player".into())));
+        late.fail("gst init failed");
+        assert_eq!(late.health(), DeviceHealth::Down("gst init failed".into()));
+        late.install(d.player.clone());
+        late.play().await.unwrap();
+        assert!(log.calls().contains(&streamit_core::fakes::Call::PlayerPlay));
+        assert_eq!(late.health(), DeviceHealth::Ok);
+    }
+}

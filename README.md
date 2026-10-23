@@ -21,10 +21,26 @@ cargo test --workspace
 The default build and tests need none of the external runtimes. The real playout build, which links GStreamer, uses `--features gst`:
 
 ```
-cargo build --release --features gst
+cargo build -p streamit-app --release --features gst
 ```
 
 Without `--features gst` the app wires a stand-in player and counter that report as down.
+
+## Run StreamIt
+
+```
+cargo run -p streamit-app --release                  # any PC (DeckLink and NDI show as down)
+cargo run -p streamit-app --release --features gst   # the playout PC
+```
+
+The binary is `target\release\streamit.exe`; with no arguments it opens the window. **Close Bitfocus Companion first** (it holds the Stream Deck open).
+
+Startup never changes a device: StreamIt connects to each device and listens, reads the state, checks the YouTube broadcast, then opens the window and lights the Stream Deck. A device that is unreachable shows red and is retried in the background; every device's health is polled every 2 s.
+
+- **Run tab**: the broadcast dropdown with its checks (bound to our stream key, Auto Start off, Auto Stop on, monitor stream on) and a **Fix** button for each failed check; the device status row (hover for the reason); the stage, the latest warning and ignored presses; every Stream Deck key as a button (a press does exactly what the deck key does, and dim keys are not offered); and the cue list (Add videos, name, destination, level, optional return input, Up / Down / Remove, at most 14). The cue list is locked while a video plays.
+- **Settings tab**: Blackmagic devices found on the network (mDNS) with a role dropdown each, plus **Add by IP**; every config field; the YouTube OAuth client id and secret, **Sign in** (opens the browser), and the stream key picker (**Load stream keys**). **Save** writes `%APPDATA%\StreamIt\config.toml`. Timings, inputs and audio settings apply at once. **Device addresses and roles, the YouTube client and stream key, and the playout/NDI settings apply when you restart StreamIt.**
+
+Logs are written daily to `%APPDATA%\StreamIt\logs\streamit.<date>.log` (every command, device health change, device error and engine warning; never tokens or the client secret). Set `RUST_LOG=debug` for more detail.
 
 ### Building with GStreamer (playout PC)
 
@@ -49,12 +65,35 @@ Without `--features gst` the app wires a stand-in player and counter that report
 
    ```
    cargo test -p streamit-playout --features gst
-   cargo build --release --features gst
+   cargo build -p streamit-app --release --features gst
    ```
 
 ## Probe your devices
 
-_More entries are added by later tasks (device discovery and the other probes)._
+Every probe is also built into the app, so on the playout PC you can run them without cargo:
+
+```
+streamit probe discover [seconds]
+streamit probe videohub <ip> dump | route <output> <input>
+streamit probe webpresenter <ip> dump | status | start | stop
+streamit probe atem <ip> state | preview <in> | program <in> | auto | still <player> <index> | level <in> <source> <db>
+streamit probe youtube signin | upcoming | streams <client_id> <client_secret>
+streamit probe youtube check <client_id> <client_secret> <broadcast_id> [stream_id]
+streamit probe youtube health <client_id> <client_secret> <stream_id>
+streamit probe player <file.mp4> <gain_db>     (gst build only)
+streamit probe counter <seconds>               (gst build only)
+streamit probe deck
+```
+
+The `cargo run ... --example` commands below run the same code.
+
+### Discovery
+
+```
+streamit probe discover 5
+```
+
+Lists every `_blackmagic._tcp` device that answers within 5 s, with its address and every TXT record, and the kind StreamIt reads from TXT `class`. Check that the Stream ATEM, Screens ATEM, VideoHub and Web Presenter all appear and each shows a kind. `class=AtemSwitcher` and `class=Videohub` come from the Companion modules; the Web Presenter's class (`WebPresenter` or `Streaming` is assumed) and the model key (`model`, else `name`) are unconfirmed, so note what the Web Presenter actually reports. If it shows `kind None`, assign its role by hand (or with Add by IP) and report the TXT lines.
 
 ### VideoHub
 
@@ -165,11 +204,12 @@ Probe (read-only, there is deliberately no way to change a broadcast from it). U
 ```
 cargo run -p streamit-youtube --example youtube-probe -- signin <client_id> <client_secret>
 cargo run -p streamit-youtube --example youtube-probe -- upcoming <client_id> <client_secret>
+cargo run -p streamit-youtube --example youtube-probe -- streams <client_id> <client_secret>
 cargo run -p streamit-youtube --example youtube-probe -- check <client_id> <client_secret> <broadcast_id> <stream_id>
 cargo run -p streamit-youtube --example youtube-probe -- health <client_id> <client_secret> <stream_id>
 ```
 
-`signin` opens your browser (or prints the address) and finishes when you approve. `upcoming` lists your upcoming broadcasts in start order with their bound stream; `check` prints whether the broadcast is bound to the given stream and its Auto Start / Auto Stop / monitor flags; `health` prints the ingest health of a stream key's stream.
+`signin` opens your browser (or prints the address) and finishes when you approve. `upcoming` lists your upcoming broadcasts in start order with their bound stream; `streams` lists your stream keys (id, name, last four characters of the key; pick the one the Web Presenter uses); `check` prints whether the broadcast is bound to the given stream and its Auto Start / Auto Stop / monitor flags; `health` prints the ingest health of a stream key's stream.
 
 ### Stream Deck XL
 
