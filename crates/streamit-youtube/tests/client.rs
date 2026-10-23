@@ -383,3 +383,50 @@ async fn no_stored_token_is_signed_out_and_working_token_is_signed_in() {
     assert_eq!(c.signed_in().await, Ok(false));
     assert_eq!(client(&s, None).signed_in().await, Ok(true));
 }
+
+#[tokio::test]
+async fn list_streams_reads_mine_with_masked_key_names() {
+    let s = MockServer::start().await;
+    token_ok(&s).await;
+    Mock::given(method("GET"))
+        .and(path("/youtube/v3/liveStreams"))
+        .and(query_param("part", "id,snippet,cdn"))
+        .and(query_param("mine", "true"))
+        .and(header("authorization", "Bearer at"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[
+            {"id":"s1","snippet":{"title":"Default stream key"},
+             "cdn":{"ingestionInfo":{"streamName":"abcd-efgh-ijkl-mnop-wxyz"}}},
+            {"id":"s2","snippet":{"title":"Church 1080p"},"cdn":{}},
+            {"snippet":{"title":"no id, skipped"}}]})))
+        .mount(&s)
+        .await;
+    let list = client(&s, None).list_streams().await.unwrap();
+    assert_eq!(
+        list,
+        vec![
+            streamit_youtube::StreamSummary {
+                id: "s1".into(),
+                title: "Default stream key".into(),
+                key_name: "…wxyz".into(),
+            },
+            streamit_youtube::StreamSummary {
+                id: "s2".into(),
+                title: "Church 1080p".into(),
+                key_name: String::new(),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn list_streams_without_sign_in_is_refused() {
+    let s = MockServer::start().await;
+    let auth = Auth::new(
+        "c",
+        "s",
+        Url::parse(&format!("{}/token", s.uri())).unwrap(),
+        Arc::new(MemoryStore::default()),
+    );
+    let c = YouTubeClient::new(Url::parse(&s.uri()).unwrap(), auth, None);
+    assert_eq!(c.list_streams().await, Err(DeviceError::Refused("sign-in required".into())));
+}

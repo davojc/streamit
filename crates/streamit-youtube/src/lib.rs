@@ -14,6 +14,27 @@ use url::Url;
 
 pub const API_BASE: &str = "https://www.googleapis.com/youtube/v3";
 
+/// One of the channel's live streams (a stream key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamSummary {
+    pub id: String,
+    /// The name YouTube Studio shows for the key.
+    pub title: String,
+    /// The last four characters of the stream key ("…wxyz"), for telling keys apart.
+    /// The key itself lets anyone stream to the channel, so it is never kept or shown.
+    pub key_name: String,
+}
+
+/// "…" plus the last four characters of `key`, or "" when there is no key.
+fn mask_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+    let tail: String = chars[chars.len().saturating_sub(4)..].iter().collect();
+    format!("…{tail}")
+}
+
 pub struct YouTubeClient {
     base: Url,
     auth: Auth,
@@ -68,6 +89,32 @@ impl YouTubeClient {
             return Err(map_error(status, &json));
         }
         Err(DeviceError::Refused("sign-in required".into()))
+    }
+
+    /// The channel's live streams (stream keys), for the Settings stream picker.
+    /// Not part of `Broadcasts`: only the window uses it.
+    pub async fn list_streams(&self) -> Result<Vec<StreamSummary>> {
+        let v = self
+            .call(
+                Method::GET,
+                "liveStreams",
+                &[("part", "id,snippet,cdn"), ("mine", "true"), ("maxResults", "50")],
+                None,
+            )
+            .await?;
+        Ok(v["items"]
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|s| {
+                Some(StreamSummary {
+                    id: s["id"].as_str()?.to_string(),
+                    title: s["snippet"]["title"].as_str().unwrap_or("").to_string(),
+                    key_name: mask_key(s["cdn"]["ingestionInfo"]["streamName"].as_str().unwrap_or("")),
+                })
+            })
+            .collect())
     }
 
     async fn broadcast(&self, id: &str, part: &str) -> Result<Value> {
