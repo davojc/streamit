@@ -14,6 +14,7 @@ use crate::golive::{self, CountdownOutcome, Readiness, Stage, Stage0Report, T0Er
 use crate::recovery::{self, Assessment, Offer};
 use crate::rollin::{self, Cue, CueList, CueState, RollinOutcome};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -195,6 +196,8 @@ pub struct Engine {
     /// The mics' live levels. Each sequence works on a copy and writes it back,
     /// so the lock is never held across a device call.
     levels: Arc<Mutex<LiveLevels>>,
+    /// Where the levels are saved whenever they change (I5), so a restart keeps them.
+    levels_file: Option<Arc<PathBuf>>,
     cues: CueList,
     broadcasts: Vec<BroadcastSummary>,
     running: Option<Running>,
@@ -219,6 +222,17 @@ impl Engine {
     /// Start the engine. It first runs `stage0` and `assess` and publishes the
     /// result; commands sent meanwhile wait in the channel.
     pub fn spawn(d: Devices, c: Arc<RwLock<Config>>) -> EngineHandle {
+        Self::spawn_with(d, c, LiveLevels::default(), None)
+    }
+
+    /// `spawn`, starting from `levels` (loaded from disk) and saving them to `levels_file`
+    /// whenever a sequence changes them.
+    pub fn spawn_with(
+        d: Devices,
+        c: Arc<RwLock<Config>>,
+        levels: LiveLevels,
+        levels_file: Option<PathBuf>,
+    ) -> EngineHandle {
         let (tx, rx) = mpsc::channel(32);
         let (aux, aux_rx) = mpsc::unbounded_channel();
         let cues = CueList::from_cues(read(&c).cues);
@@ -228,7 +242,8 @@ impl Engine {
             d,
             config: c,
             snap: Arc::new(stx),
-            levels: Arc::default(),
+            levels: Arc::new(Mutex::new(levels)),
+            levels_file: levels_file.map(Arc::new),
             cues,
             broadcasts: Vec::new(),
             running: None,
@@ -519,6 +534,7 @@ impl Engine {
 
     fn start_prepare(&mut self) {
         let (d, c, snap, levels, bid) = (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone(), self.bid());
+        let file = self.levels_file.clone();
         let handle = tokio::spawn(async move {
             let mut l = lock(&levels).clone();
             let (p, w) = (snap.clone(), snap);
@@ -531,7 +547,7 @@ impl Engine {
                 move |m| set_warning(&w, m),
             )
             .await;
-            *lock(&levels) = l;
+            store_levels(&levels, l, file.as_deref());
             Done::Prepared(r)
         });
         self.begin(Job::Prepare, handle);
@@ -591,11 +607,12 @@ impl Engine {
         let (stop, unmute) = (CancellationToken::new(), Arc::new(Notify::new()));
         let (d, c, snap, levels, st, um) =
             (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone(), stop.clone(), unmute.clone());
+        let file = self.levels_file.clone();
         let handle = tokio::spawn(async move {
             let mut l = lock(&levels).clone();
             let mics = move |down: bool| snap.send_modify(|s| s.mics_ducked = down);
             let outcome = rollin::play_reporting(&d, &c, &cue, &mut l, st, um, mics).await;
-            *lock(&levels) = l;
+            store_levels(&levels, l, file.as_deref());
             Done::Video { index, outcome }
         });
         self.begin(Job::Video { index, stop, unmute }, handle);
@@ -966,6 +983,23 @@ fn read(c: &RwLock<Config>) -> Config {
 
 fn lock(m: &Mutex<LiveLevels>) -> std::sync::MutexGuard<'_, LiveLevels> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Write a sequence's levels back and, if they changed, save them (I5). A failed save
+/// is logged; the levels in memory are still used.
+fn store_levels(levels: &Mutex<LiveLevels>, l: LiveLevels, file: Option<&PathBuf>) {
+    let changed = {
+        let mut cur = lock(levels);
+        let changed = *cur != l;
+        *cur = l.clone();
+        changed
+    };
+    if changed && let Some(path) = file {
+        match l.save(path) {
+            Ok(()) => info!(path = %path.display(), "mic levels saved"),
+            Err(e) => warn!(error = %format!("{e:#}"), "could not save the mic levels"),
+        }
+    }
 }
 
 fn set_warning(snap: &Shared, msg: String) {
@@ -1848,6 +1882,36 @@ mod tests {
         let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
         assert!(s.mics_ducked, "the mics did not come up");
         assert!(s.offers.contains(&Offer::Recover), "{:?}", s.offers);
+    }
+
+    // ---- I5 ----
+
+    #[tokio::test(start_paused = true)]
+    async fn engine_starts_with_loaded_levels() {
+        let (d, log, h) = rig();
+        h.stream.set_audio_level_state(MIC, crate::audio::FLOOR_DB); // restarted with the mics down
+        let loaded = LiveLevels([(MIC, -7.0)].into_iter().collect());
+        let mut e = Engine::spawn_with(d, cfg(vec![]), loaded, None);
+        send(&e, Command::GoLive).await;
+        until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        let last_mic = log.calls().iter().rev().find_map(|c| match c {
+            Call::StreamSetAudioLevel(m, db) if *m == MIC => Some(*db),
+            _ => None,
+        });
+        assert_eq!(last_mic, Some(-7.0), "{:?}", log.calls());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn engine_saves_levels_when_they_change() {
+        let dir = std::env::temp_dir().join("streamit-engine-levels");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("levels.toml");
+        let (d, _log, _h) = rig(); // mics at -3 dB
+        let mut e = Engine::spawn_with(d, cfg(vec![]), LiveLevels::default(), Some(path.clone()));
+        send(&e, Command::Prepare).await;
+        until(&mut e, "Prepared", |s| s.stage == Stage::Prepared(Readiness::Ready) && s.job.is_none()).await;
+        assert_eq!(LiveLevels::load(&path).unwrap().0.get(&MIC), Some(&-3.0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- R23 ----

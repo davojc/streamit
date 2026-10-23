@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use streamit_core::config::{Config, config_path};
+use streamit_core::audio::LiveLevels;
+use streamit_core::config::{Config, config_path, levels_path};
 use streamit_core::engine::{Command, Engine, EngineHandle, Snapshot};
 use streamit_core::golive::Stage;
 use streamit_deck::DeckSurface;
@@ -50,6 +51,14 @@ fn run_app() -> anyhow::Result<()> {
     let Loaded { config, notice: load_error, writable } = load_config(&path);
     info!(path = %path.display(), writable, "config loaded");
     let shared = Arc::new(RwLock::new(config.clone()));
+    // The mics' live levels from the last run, so Go Live and Recover after a restart
+    // fade up to them rather than to 0 dB.
+    let levels_file = levels_path(&path);
+    let levels = LiveLevels::load(&levels_file).unwrap_or_else(|e| {
+        warn!("{e:#}; starting without saved mic levels");
+        LiveLevels::default()
+    });
+    info!(path = %levels_file.display(), mics = levels.0.len(), "mic levels loaded");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -57,7 +66,7 @@ fn run_app() -> anyhow::Result<()> {
         .build()?;
     let started = rt.block_on(async {
         let wired = wiring::build(&config).await;
-        let engine = Engine::spawn(wired.devices.clone(), shared.clone());
+        let engine = Engine::spawn_with(wired.devices.clone(), shared.clone(), levels, Some(levels_file));
         let tx = spawn_command_log(engine.tx.clone());
         for (kind, health) in &wired.health {
             let _ = tx.send(Command::DeviceHealth(*kind, health.clone())).await;

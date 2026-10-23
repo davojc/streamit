@@ -1,6 +1,9 @@
-use crate::config::AudioSourceId;
+use crate::config::{AudioSourceId, write_atomic};
 use crate::devices::{Result, StreamSwitcher};
+use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Duration;
 
 /// Fairlight floor (-infinity).
@@ -20,7 +23,43 @@ pub fn down_threshold(duck_db: f32) -> f32 {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LiveLevels(pub HashMap<AudioSourceId, f32>);
 
+/// On-disk form of `LiveLevels`: one `[[mic]]` table per source.
+#[derive(Serialize, Deserialize, Default)]
+struct LevelsFile {
+    #[serde(default)]
+    mic: Vec<MicLevel>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MicLevel {
+    input: u16,
+    source: i64,
+    db: f32,
+}
+
 impl LiveLevels {
+    /// I5: load the levels saved by `save`. A missing file is no levels.
+    pub fn load(path: &Path) -> anyhow::Result<LiveLevels> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(LiveLevels::default()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let f: LevelsFile = toml::from_str(&text).with_context(|| format!("reading {}", path.display()))?;
+        Ok(LiveLevels(
+            f.mic.into_iter().map(|m| (AudioSourceId { input: m.input, source: m.source }, m.db)).collect(),
+        ))
+    }
+
+    /// Save atomically (temp file, then rename), sorted so the file is stable.
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let mut mic: Vec<MicLevel> =
+            self.0.iter().map(|(s, db)| MicLevel { input: s.input, source: s.source, db: *db }).collect();
+        mic.sort_by_key(|m| (m.input, m.source));
+        let text = toml::to_string_pretty(&LevelsFile { mic }).context("serializing mic levels")?;
+        write_atomic(path, &text)
+    }
+
     /// Read current levels; sources at or below `down` (see `down_threshold`) are not stored.
     pub async fn capture(sw: &dyn StreamSwitcher, srcs: &[AudioSourceId], down: f32) -> Result<LiveLevels> {
         let mut l = LiveLevels::default();
@@ -176,6 +215,23 @@ mod tests {
         h.stream.set_audio_level_state(MIC, -20.0);
         live.recapture(&*d.stream, &[MIC], down_threshold(-20.0)).await.unwrap();
         assert_eq!(live.0[&MIC], -6.0, "a ducked mic is not its live level");
+    }
+
+    #[test]
+    fn live_levels_save_load_roundtrip() {
+        let dir = std::env::temp_dir().join("streamit-levels-roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("levels.toml");
+        // No file yet: no levels.
+        assert_eq!(LiveLevels::load(&path).unwrap(), LiveLevels::default());
+        let other = AudioSourceId { input: 1002, source: -256 };
+        let l = LiveLevels([(MIC, -3.5), (other, -12.25)].into_iter().collect());
+        l.save(&path).unwrap();
+        assert_eq!(LiveLevels::load(&path).unwrap(), l);
+        assert!(!crate::config::temp_path(&path).exists(), "saved through a temp file");
+        std::fs::write(&path, "not [ toml").unwrap();
+        assert!(LiveLevels::load(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(start_paused = true)]

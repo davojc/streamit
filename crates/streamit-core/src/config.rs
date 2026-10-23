@@ -199,30 +199,33 @@ impl Config {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
         let text = toml::to_string_pretty(self).context("serializing config")?;
-        // Write a temp file next to it, then rename over it, so a failed or interrupted
-        // save never leaves a half-written config.
-        let tmp = temp_path(path);
-        let write = || -> std::io::Result<()> {
-            let mut f = std::fs::File::create(&tmp)?;
-            std::io::Write::write_all(&mut f, text.as_bytes())?;
-            f.sync_all()
-        };
-        if let Err(e) = write() {
-            if tmp.is_file() {
-                let _ = std::fs::remove_file(&tmp);
-            }
-            return Err(e).with_context(|| format!("writing config {}", tmp.display()));
-        }
-        std::fs::rename(&tmp, path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            anyhow::Error::new(e).context(format!("replacing config {}", path.display()))
-        })
+        write_atomic(path, &text)
     }
+}
+
+/// Write `text` to `path` through a temp file next to it, then rename it over `path`, so
+/// a failed or interrupted save never leaves a half-written file.
+pub fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let tmp = temp_path(path);
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut f, text.as_bytes())?;
+        f.sync_all()
+    };
+    if let Err(e) = write() {
+        if tmp.is_file() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        return Err(e).with_context(|| format!("writing {}", tmp.display()));
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::Error::new(e).context(format!("replacing {}", path.display()))
+    })
 }
 
 /// The temp file a save writes before renaming it over `path`: same directory.
@@ -275,6 +278,11 @@ fn redact(msg: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// Where the mics' captured live levels are kept: `levels.toml` next to the config.
+pub fn levels_path(config: &Path) -> PathBuf {
+    config.with_file_name("levels.toml")
 }
 
 /// Default config location: `%APPDATA%\StreamIt\config.toml`, falling back to a
