@@ -120,9 +120,15 @@ pub async fn recover(d: &Devices, c: &Config, levels: &LiveLevels) -> Result<()>
         Err(e) => fail("Could not read the hall screens program", e),
     }
 
-    // 3. Mics back to their live level (Target::Live falls back to 0 dB).
-    if let Err(e) = fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
-        fail("Could not fade the mics up", e);
+    // 3. Mics back to their live level (Target::Live falls back to 0 dB), unless the
+    // stream is on the holding still, where the mics stay down (R24).
+    match d.stream.program().await {
+        Ok(p) if p == d.stream.media_player_input(sa.media_player) => {}
+        _ => {
+            if let Err(e) = fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
+                fail("Could not fade the mics up", e);
+            }
+        }
     }
 
     // 4. Input 8 audio off.
@@ -320,6 +326,27 @@ mod tests {
         let last_fade = calls.iter().rposition(|c| matches!(c, Call::StreamSetAudioLevel(..))).expect("mics faded");
         assert!(last_fade < route, "mic fade must precede the route restore");
         assert_eq!(route, calls.len() - 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recover_on_holding_still_leaves_mics_down() {
+        let is_mic = |c: &Call| matches!(c, Call::StreamSetAudioLevel(m, _) if *m == MIC);
+        // On the holding still already.
+        let (d, log, h) = rig();
+        h.stream.set_program_state(d.stream.media_player_input(1));
+        h.stream.set_audio_level_state(MIC, FLOOR_DB);
+        recover(&d, &cfg(), &LiveLevels::default()).await.unwrap();
+        assert!(!log.calls().iter().any(is_mic), "{:?}", log.calls());
+        assert_eq!(d.stream.audio_level(MIC).await.unwrap(), FLOOR_DB);
+
+        // Stuck on a video played over the holding still: Recover returns to the still.
+        let (d, log, h) = rig();
+        h.stream.set_program_state(8);
+        h.stream.set_preview_state(d.stream.media_player_input(1));
+        h.stream.set_audio_level_state(MIC, FLOOR_DB);
+        recover(&d, &cfg(), &LiveLevels::default()).await.unwrap();
+        assert_eq!(d.stream.program().await.unwrap(), d.stream.media_player_input(1));
+        assert!(!log.calls().iter().any(is_mic), "{:?}", log.calls());
     }
 
     #[tokio::test(start_paused = true)]

@@ -40,6 +40,20 @@ impl LiveLevels {
     }
 }
 
+/// True when every source reads at or below `down` (and there is at least one). A failed
+/// read counts as "not down".
+pub async fn all_down(sw: &dyn StreamSwitcher, srcs: &[AudioSourceId], down: f32) -> bool {
+    if srcs.is_empty() {
+        return false;
+    }
+    for &s in srcs {
+        if !sw.audio_level(s).await.is_ok_and(|db| db <= down) {
+            return false;
+        }
+    }
+    true
+}
+
 pub enum Target<'a> {
     Floor,
     /// One level for every source (the duck level).

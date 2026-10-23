@@ -8,7 +8,7 @@
 //!
 //! Device errors once the roll-in has started never stop the return path; they are
 //! collected and the outcome becomes `Failed { recover_needed: true, .. }`.
-use crate::audio::{LiveLevels, Target, down_threshold, fade};
+use crate::audio::{LiveLevels, Target, all_down, down_threshold, fade};
 use crate::config::{AudioSourceId, Config};
 use crate::devices::{Devices, PlayerEvent};
 use crate::golive::cut;
@@ -258,6 +258,8 @@ pub async fn play_reporting(
     // 2. Route input 8 to the DeckLink while it is off program.
     let mut problems = Vec::new();
     let mut prev = None;
+    // R24: the mics were already down (the holding still) before the video.
+    let mut held_down = false;
     if dest.uses_stream() {
         if hub.input8_output == 0 || hub.decklink_input == 0 {
             return refuse(d, "VideoHub not configured").await;
@@ -282,9 +284,11 @@ pub async fn play_reporting(
             return RollinOutcome::Failed { recover_needed: true, reason: problems.join("; ") };
         }
         sleep(hub.settle).await;
-        if let Err(e) = levels.recapture(&*d.stream, &sa.mic_sources, down_threshold(sa.duck_db)).await {
+        let down = down_threshold(sa.duck_db);
+        if let Err(e) = levels.recapture(&*d.stream, &sa.mic_sources, down).await {
             note(&mut problems, format!("Could not read mic levels: {e}"));
         }
+        held_down = all_down(&*d.stream, &sa.mic_sources, down).await;
     }
 
     // Stop pressed during load or settle: nothing has gone on air, so change no
@@ -311,8 +315,11 @@ pub async fn play_reporting(
             Err(e) => note(&mut problems, format!("Could not switch the stream to the video: {e}")),
         }
     }
-    let mics_down = dest.uses_stream();
-    if mics_down {
+    // The video's sound goes to the stream; the mics are ducked under it, unless they
+    // were already down (R24: then they are left exactly as they were, before and after).
+    let video_audio = dest.uses_stream();
+    let mics_down = video_audio && !held_down;
+    if video_audio {
         if let Err(e) = d.stream.set_audio_on(in8, true).await {
             note(&mut problems, format!("Could not turn on input 8 audio: {e}"));
         }
@@ -379,7 +386,7 @@ pub async fn play_reporting(
     // 6. Return path. Every step runs whatever failed before it.
     // R10: when the video was cut short, its sound goes first so it never lingers online.
     let cut_short = !matches!(end, End::Ended);
-    let audio_off_first = mics_down && cut_short;
+    let audio_off_first = video_audio && cut_short;
     if audio_off_first && let Err(e) = d.stream.set_audio_on(in8, false).await {
         note(&mut problems, format!("Could not turn off input 8 audio: {e}"));
     }
@@ -421,16 +428,14 @@ pub async fn play_reporting(
             }
         }
     }
-    if mics_down {
-        if !unmuted {
-            match fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
-                Ok(()) => mics_ducked(false),
-                Err(e) => note(&mut problems, format!("Could not fade the mics up: {e}")),
-            }
+    if mics_down && !unmuted {
+        match fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
+            Ok(()) => mics_ducked(false),
+            Err(e) => note(&mut problems, format!("Could not fade the mics up: {e}")),
         }
-        if !audio_off_first && let Err(e) = d.stream.set_audio_on(in8, false).await {
-            note(&mut problems, format!("Could not turn off input 8 audio: {e}"));
-        }
+    }
+    if video_audio && !audio_off_first && let Err(e) = d.stream.set_audio_on(in8, false).await {
+        note(&mut problems, format!("Could not turn off input 8 audio: {e}"));
     }
     if cut_short
         && let Err(e) = d.player.stop().await
@@ -964,6 +969,24 @@ mod tests {
         assert!(calls.contains(&Call::StreamSetAudioLevel(MIC, -20.0)), "{calls:?}");
         assert!(!calls.contains(&Call::StreamSetAudioLevel(MIC, FLOOR_DB)), "{calls:?}");
         assert_eq!(h.stream.audio_level(MIC).await.unwrap(), -3.0, "back to the live level");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn video_during_holding_leaves_mics_down() {
+        let is_mic = |c: &Call| matches!(c, Call::StreamSetAudioLevel(m, _) if *m == MIC);
+        for duck in [FLOOR_DB, -20.0] {
+            let (d, log, h) = rig();
+            h.stream.set_audio_level_state(MIC, FLOOR_DB); // Prepare's holding still: mics down
+            let mut c = cfg();
+            c.stream_atem.duck_db = duck;
+            let r = play_to_end(&d, &c, cue(Destination::HallAndOnline), &log, &h).await;
+            assert_eq!(r, RollinOutcome::Finished);
+            let calls = log.calls();
+            assert!(!calls.iter().any(is_mic), "duck {duck}: the mics were touched: {calls:?}");
+            assert_eq!(h.stream.audio_level(MIC).await.unwrap(), FLOOR_DB, "duck {duck}");
+            // The video's own sound still comes and goes.
+            assert_in_order(&calls, &[Call::StreamSetAudioOn(IN8, true), Call::StreamSetAudioOn(IN8, false)]);
+        }
     }
 
     #[test]
