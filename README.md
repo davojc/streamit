@@ -98,3 +98,26 @@ cargo run -p streamit-atem --example atem-probe -- 192.168.4.98 auto
 `preview 8` should put the DeckLink input on preview; `auto` should run the transition, print `transition done` when it finishes, and leave input 8 on program on the hall screens.
 
 If a command reports `timeout`, the switcher never confirmed it; if `state` reports `disconnected`, the probe never got the switcher's state (check the address, and that it answers in ATEM Software Control).
+
+### YouTube
+
+StreamIt signs in to YouTube with OAuth and keeps the refresh token in the Windows Credential Manager (service `StreamIt`, entry `youtube`). You need your own OAuth client, created once:
+
+1. Go to <https://console.cloud.google.com/> and create a project (for example "StreamIt").
+2. APIs & Services > Library: enable **YouTube Data API v3**.
+3. APIs & Services > OAuth consent screen: choose **External**, fill in the app name and your email, and add the scope `https://www.googleapis.com/auth/youtube`.
+4. **Publish the consent screen** (set "Publishing status" to "In production"). While it is in "Testing", Google expires the refresh token after 7 days and you would have to sign in again every week. Publishing an unverified app only shows a "Google hasn't verified this app" warning at sign-in (Advanced > Go to StreamIt); that is fine for a personal client.
+5. APIs & Services > Credentials > Create credentials > OAuth client ID, application type **Desktop app**. Copy the client id and client secret. (Google documents a Desktop client's secret as not confidential, so it is stored in the app config.) Enter both in Settings, or in `youtube.client_id` / `youtube.client_secret` in the config file.
+
+Quota: the default 10,000 units/day is plenty for a weekly service.
+
+Probe (read-only, there is deliberately no way to change a broadcast from it). Use a private test broadcast:
+
+```
+cargo run -p streamit-youtube --example youtube-probe -- signin <client_id> <client_secret>
+cargo run -p streamit-youtube --example youtube-probe -- upcoming <client_id> <client_secret>
+cargo run -p streamit-youtube --example youtube-probe -- check <client_id> <client_secret> <broadcast_id> <stream_id>
+cargo run -p streamit-youtube --example youtube-probe -- health <client_id> <client_secret> <stream_id>
+```
+
+`signin` opens your browser (or prints the address) and finishes when you approve. `upcoming` lists your upcoming broadcasts in start order with their bound stream; `check` prints whether the broadcast is bound to the given stream and its Auto Start / Auto Stop / monitor flags; `health` prints the ingest health of a stream key's stream.

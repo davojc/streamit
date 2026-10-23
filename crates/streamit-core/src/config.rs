@@ -115,6 +115,12 @@ impl Default for WebPresenterConfig {
 #[serde(default)]
 pub struct YouTubeConfig {
     pub stream_id: Option<String>,
+    /// OAuth "Desktop app" client id. Not confidential, per Google.
+    #[serde(default)]
+    pub client_id: String,
+    /// OAuth "Desktop app" client secret. Google documents this as not confidential.
+    #[serde(default)]
+    pub client_secret: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

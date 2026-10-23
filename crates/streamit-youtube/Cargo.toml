@@ -1,0 +1,26 @@
+[package]
+name = "streamit-youtube"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+streamit-core = { path = "../streamit-core" }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
+tracing = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+oauth2 = { version = "5", default-features = false, features = ["reqwest"] }
+serde = { workspace = true }
+serde_json = "1"
+url = "2"
+keyring = { version = "3", features = ["windows-native"] }
+webbrowser = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros", "rt"] }
+wiremock = "0.6"
+serde_json = "1"
+
+[[example]]
+name = "youtube-probe"
+path = "examples/probe.rs"
