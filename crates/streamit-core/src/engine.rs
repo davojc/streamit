@@ -7,6 +7,8 @@
 //! cue key, GO LIVE and RECOVER flash), with these exceptions:
 //! - Go Live during the countdown stops the countdown, waits for its cancel path, then
 //!   runs T-0 (R13). Go Live is refused once Live (unless offered), Ending or Ended (R22).
+//!   Go Live is Start service now: T-0 with, unless already public, the go-public run
+//!   alongside it in the same job (never before the cut).
 //! - Recover and End Service during a video stop it and wait for its return path
 //!   (Recover first, then End Service).
 //! - End Service pressed again during End Service skips the closing hold.
@@ -175,8 +177,9 @@ enum Job {
     Countdown { cancel: CancellationToken },
     End { skip: Arc<Notify> },
     Video { index: usize, stop: CancellationToken, unmute: Arc<Notify> },
-    /// T-0 by hand. `preempt_public` is set when it pre-empted a countdown:
-    /// whether that countdown had made the broadcast public.
+    /// Start service now by hand: T-0, going public alongside it unless already public.
+    /// `preempt_public` is set when it pre-empted a countdown: whether that countdown
+    /// had made the broadcast public.
     GoLive { preempt_public: Option<bool> },
     Recover,
 }
@@ -205,7 +208,14 @@ enum Done {
     Countdown { result: devices::Result<CountdownOutcome>, public: bool, before: Stage },
     Ended(EndOutcome),
     Video { index: usize, outcome: RollinOutcome },
-    WentLive { result: Result<(), T0Error>, preempt_public: Option<bool> },
+    /// `public` is the go-public's result (`None` if none ran); `already_public` says
+    /// the broadcast was known to be public before.
+    WentLive {
+        result: Result<(), T0Error>,
+        preempt_public: Option<bool>,
+        public: Option<devices::Result<()>>,
+        already_public: bool,
+    },
     Recovered { ok: bool, assessment: Assessment },
 }
 
@@ -709,12 +719,38 @@ impl Engine {
         self.begin(Job::Video { index, stop, unmute }, handle);
     }
 
+    /// Start service now (the GO LIVE key, or a pre-empted countdown): the T-0 cut and,
+    /// in parallel, going public. The broadcast is known public when the pre-empted
+    /// countdown made it so, or when already Live (Go Live offered on the holding
+    /// still: YouTube is live). With no broadcast selected only the cut runs, and Go
+    /// Public is offered. The job slot is held until the go-public settles (at most
+    /// `GO_PUBLIC_WAIT`), so a second press can never start a second cut; LIVE is
+    /// shown as soon as the cut is done.
     fn start_golive(&mut self, preempt_public: Option<bool>) {
+        let already_public = preempt_public == Some(true) || self.stage() == Stage::Live;
+        let bid = self.selected();
         let (d, c, levels, snap) = (self.d.clone(), self.config(), self.levels.clone(), self.snap.clone());
         let handle = tokio::spawn(async move {
             let l = lock(&levels).clone();
-            let result = golive::t0_reporting(&d, &c, &l, |m| snap.send_modify(|s| log(s, m))).await;
-            Done::WentLive { result, preempt_public }
+            let live = snap.clone();
+            let out = golive::start_service_reporting(
+                &d,
+                &c,
+                bid.as_deref().unwrap_or_default(),
+                already_public || bid.is_none(),
+                &l,
+                |m| snap.send_modify(|s| log(s, m)),
+                |r| {
+                    if r.as_ref().map_or_else(|e| e.on_air, |()| true) {
+                        live.send_modify(|s| {
+                            set_stage(s, Stage::Live);
+                            remove(&mut s.offers, Offer::GoLive);
+                        });
+                    }
+                },
+            )
+            .await;
+            Done::WentLive { result: out.t0, preempt_public, public: out.public, already_public }
         });
         self.begin(Job::GoLive { preempt_public }, handle);
     }
@@ -752,7 +788,9 @@ impl Engine {
             Ok(Done::Countdown { result, public, before }) => self.finish_countdown(result, public, before),
             Ok(Done::Ended(out)) => self.finish_end(out),
             Ok(Done::Video { index, outcome }) => self.finish_video(index, outcome),
-            Ok(Done::WentLive { result, preempt_public }) => self.finish_golive(result, preempt_public),
+            Ok(Done::WentLive { result, preempt_public, public, already_public }) => {
+                self.finish_golive(result, preempt_public, public, already_public)
+            }
             Ok(Done::Recovered { ok, assessment }) => {
                 if ok {
                     self.set(|s| {
@@ -775,7 +813,8 @@ impl Engine {
                     }
                     // Unknown whether the stream cut happened: treated as not on air.
                     Job::GoLive { preempt_public } => {
-                        self.finish_golive(Err(T0Error { on_air: false, mics_failed: false, failures: vec![reason] }), preempt_public)
+                        let e = T0Error { on_air: false, mics_failed: false, failures: vec![reason] };
+                        self.finish_golive(Err(e), preempt_public, None, preempt_public == Some(true))
                     }
                     _ => set_warning(&self.snap, reason),
                 }
@@ -845,14 +884,27 @@ impl Engine {
     }
 
     /// Live whenever the stream cut succeeded, even if later steps failed (then
-    /// with a warning). After a pre-empt that did not go public, Go Public is offered.
-    fn finish_golive(&mut self, result: Result<(), T0Error>, preempt_public: Option<bool>) {
+    /// with a warning). Whenever the broadcast did not go public (the go-public failed,
+    /// or there was no broadcast to make public), Go Public is offered: the window's
+    /// "Retry going public".
+    fn finish_golive(
+        &mut self,
+        result: Result<(), T0Error>,
+        preempt_public: Option<bool>,
+        public: Option<devices::Result<()>>,
+        already_public: bool,
+    ) {
         let mics_failed = result.as_ref().err().is_some_and(|e| e.mics_failed);
         let (on_air, warning) = match &result {
             Ok(()) => (true, None),
             Err(e) if e.on_air => (true, Some(format!("Live, but some T-0 steps failed: {e}"))),
             Err(e) => (false, Some(format!("Go Live did not complete: {e}"))),
         };
+        let public_warning = match &public {
+            Some(Err(e)) => Some(format!("Could not make the YouTube broadcast public: {e}")),
+            _ => None,
+        };
+        let now_public = already_public || matches!(public, Some(Ok(())));
         self.set(|s| {
             if on_air {
                 set_stage(s, Stage::Live);
@@ -860,17 +912,20 @@ impl Engine {
                 if mics_failed {
                     mics_left_down(s);
                 }
-                match preempt_public {
-                    Some(false) => add(&mut s.offers, Offer::GoPublic),
-                    Some(true) => remove(&mut s.offers, Offer::GoPublic),
-                    None => {}
-                }
-            } else if let Some(public) = preempt_public {
+            } else if preempt_public.is_some() {
                 set_stage(s, Stage::Prepared(Readiness::Warning(warning.clone().unwrap_or_default())));
                 add(&mut s.offers, Offer::GoLive);
-                if !public {
+            }
+            if on_air || preempt_public.is_some() || public.is_some() {
+                if now_public {
+                    remove(&mut s.offers, Offer::GoPublic);
+                } else {
                     add(&mut s.offers, Offer::GoPublic);
                 }
+            }
+            // The T-0 warning goes last: it is the one left showing.
+            if let Some(w) = public_warning {
+                warn_in(s, w);
             }
             if let Some(w) = warning {
                 warn_in(s, w);
@@ -1789,12 +1844,25 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn preempt_unpublic_offers_go_public() {
-        let (d, _log, _h) = rig();
+        // v1.1: the pre-empt goes public alongside the cut.
+        let (d, log, _h) = rig();
         let mut e = Engine::spawn(d, cfg(vec![]));
         send(&e, Command::Countdown).await;
         until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { public: false, .. })).await;
         send(&e, Command::GoLive).await;
-        let s = until(&mut e, "Live", |s| s.stage == Stage::Live).await;
+        let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        assert!(!s.offers.contains(&Offer::GoPublic), "{:?}", s.offers);
+        assert!(!s.offers.contains(&Offer::GoLive), "{:?}", s.offers);
+        assert_eq!(count(&log, |c| *c == Call::YtTransition(Phase::Live)), 1, "{:?}", log.calls());
+
+        // If that go-public fails, Go Public stays offered.
+        let (d, _log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { public: false, .. })).await;
+        h.yt.fail_times("transition", 4);
+        send(&e, Command::GoLive).await;
+        let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
         assert!(s.offers.contains(&Offer::GoPublic), "{:?}", s.offers);
         assert!(!s.offers.contains(&Offer::GoLive), "{:?}", s.offers);
     }
@@ -1809,7 +1877,8 @@ mod tests {
         send(&e, Command::GoLive).await;
         let s = until(&mut e, "Prepared(Warning)", |s| matches!(s.stage, Stage::Prepared(Readiness::Warning(_)))).await;
         assert!(s.offers.contains(&Offer::GoLive), "{:?}", s.offers);
-        assert!(s.offers.contains(&Offer::GoPublic), "{:?}", s.offers);
+        // v1.1: going public ran alongside the failed cut, and worked.
+        assert!(!s.offers.contains(&Offer::GoPublic), "{:?}", s.offers);
         sleep(Duration::from_secs(5)).await;
         assert!(matches!(snap(&e).stage, Stage::Prepared(Readiness::Warning(_))), "{:?}", snap(&e).stage);
         // Go Live may be pressed again.
@@ -2299,6 +2368,105 @@ mod tests {
         let s = snap(&e);
         assert_eq!(s.activity.len(), ACTIVITY_MAX);
         assert!(s.activity.iter().all(|a| a.text == NO_BROADCAST), "{:?}", texts(&s));
+    }
+
+    // ---- v1.1: Start service now ----
+
+    fn live_transitions(log: &CallLog) -> usize {
+        count(log, |c| *c == Call::YtTransition(Phase::Live))
+    }
+
+    /// Run Prepare to the end; YouTube is then in testing (not public).
+    async fn prepared(e: &mut EngineHandle) {
+        send(e, Command::Prepare).await;
+        until(e, "Prepared", |s| s.stage == Stage::Prepared(Readiness::Ready) && s.job.is_none()).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_service_now_from_prepared_goes_public_and_cuts() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        prepared(&mut e).await;
+        let autos = stream_autos(&log);
+        send(&e, Command::GoLive).await;
+        let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        assert_eq!(live_transitions(&log), 1, "{:?}", log.calls());
+        assert_eq!(stream_autos(&log), autos + 1, "{:?}", log.calls());
+        assert!(!s.offers.contains(&Offer::GoPublic), "{:?}", s.offers);
+        assert!(s.activity.iter().any(|a| a.text.starts_with("YouTube public (took ")), "{:?}", texts(&s));
+        assert!(s.activity.iter().any(|a| a.text.starts_with("Live · Cam ")), "{:?}", texts(&s));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_service_now_does_not_wait_for_youtube() {
+        let (d, log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        prepared(&mut e).await;
+        let autos = stream_autos(&log);
+        h.yt.set_transition_hangs(true);
+        let start = tokio::time::Instant::now();
+        send(&e, Command::GoLive).await;
+        until(&mut e, "Live", |s| s.stage == Stage::Live).await;
+        assert!(start.elapsed() < Duration::from_secs(2), "LIVE waited for YouTube: {:?}", start.elapsed());
+        assert_eq!(stream_autos(&log), autos + 1, "{:?}", log.calls());
+        let s = until(&mut e, "Go Public offered", |s| s.offers.contains(&Offer::GoPublic) && s.job.is_none()).await;
+        assert_eq!(s.stage, Stage::Live);
+        assert!(s.last_warning.as_deref().is_some_and(|w| w.contains("public")), "{:?}", s.last_warning);
+        assert!(start.elapsed() <= golive::GO_PUBLIC_WAIT + Duration::from_secs(1), "{:?}", start.elapsed());
+        assert_eq!(live_transitions(&log), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_service_now_twice_one_cut() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        prepared(&mut e).await;
+        let autos = stream_autos(&log);
+        send(&e, Command::GoLive).await;
+        send(&e, Command::GoLive).await;
+        until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        send(&e, Command::GoLive).await;
+        sleep(Duration::from_secs(5)).await;
+        assert_eq!(stream_autos(&log), autos + 1, "{:?}", log.calls());
+        assert_eq!(live_transitions(&log), 1, "{:?}", log.calls());
+        assert_eq!(snap(&e).stage, Stage::Live);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn go_public_failure_offers_retry() {
+        let (d, log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        until(&mut e, "startup done", |s| s.broadcast.is_some()).await;
+        h.yt.fail_times("transition", 4);
+        send(&e, Command::GoLive).await;
+        let s = until(&mut e, "Go Public offered", |s| s.offers.contains(&Offer::GoPublic) && s.job.is_none()).await;
+        assert_eq!(s.stage, Stage::Live);
+        assert!(!s.offers.contains(&Offer::GoLive), "{:?}", s.offers);
+        assert!(s.last_warning.as_deref().is_some_and(|w| w.contains("public")), "{:?}", s.last_warning);
+        assert_eq!(live_transitions(&log), 4);
+        // Retry going public: it works now, and the offer goes.
+        send(&e, Command::GoPublic).await;
+        let s = until(&mut e, "Go Public cleared", |s| !s.offers.contains(&Offer::GoPublic)).await;
+        assert!(s.activity.iter().any(|a| a.text.starts_with("YouTube public (took ")), "{:?}", texts(&s));
+        assert_eq!(s.stage, Stage::Live);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn countdown_t0_retries_public_if_it_failed_at_t10() {
+        let (d, log, h) = rig();
+        h.player.set_duration(Duration::from_secs(60));
+        h.player.set_position(Some(MS(50_000)));
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        prepared(&mut e).await;
+        h.yt.fail_times("transition", 4);
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        sleep(Duration::from_secs(7)).await;
+        assert_eq!(live_transitions(&log), 4, "the go-public at T-10 has failed");
+        h.player.emit(PlayerEvent::Ended);
+        let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        assert_eq!(live_transitions(&log), 5, "{:?}", log.calls());
+        assert!(!s.offers.contains(&Offer::GoPublic), "{:?}", s.offers);
     }
 
     #[tokio::test(start_paused = true)]

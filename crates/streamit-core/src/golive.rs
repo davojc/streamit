@@ -351,32 +351,46 @@ pub async fn countdown(
         }
     }
 
+    // Start service now at T-0. Public already: only the cut. Go-public still in flight:
+    // the cut, with that attempt settled after it (never a second one). Never started,
+    // or failed: a fresh go-public alongside the cut.
     if !pub_started {
         warn("The countdown ended before the broadcast went public; going public now".into());
-        pub_task = Some(spawn_go_public(d, bid));
     }
-    let r = t0_reporting(d, c, levels, |m| report(CountdownReport::Note(m))).await;
-    let mics_failed = r.as_ref().err().is_some_and(|e| e.mics_failed);
-    let on_air = match &r {
-        Ok(()) => true,
-        Err(e) => {
-            if e.on_air {
-                warn(format!("Live, but some T-0 steps failed: {e}"));
+    let in_flight = pub_task.take();
+    let already_public = public || in_flight.is_some();
+    let note = |m: String| report(CountdownReport::Note(m));
+    let out = start_service_reporting(d, c, bid, already_public, levels, note, |r| {
+        let on_air = match r {
+            Ok(()) => true,
+            Err(e) => {
+                if e.on_air {
+                    warn(format!("Live, but some T-0 steps failed: {e}"));
+                }
+                e.on_air
             }
-            e.on_air
+        };
+        if on_air {
+            // LIVE is reported as soon as the cut is done; YouTube never holds it back.
+            progress(Stage::Live);
         }
+    })
+    .await;
+    let public = match out.public {
+        Some(Ok(())) => true,
+        Some(Err(e)) => {
+            warn(format!("Could not make the YouTube broadcast public: {e}"));
+            false
+        }
+        None => settle_go_public(in_flight, &warn, &report).await.unwrap_or(public),
     };
-    if on_air {
-        // LIVE is reported as soon as the cut is done; YouTube never holds it back.
-        progress(Stage::Live);
-    }
-    let settled = settle_go_public(pub_task.take(), &warn, &report).await;
-    if let Err(e) = r
+    let mics_failed = out.t0.as_ref().err().is_some_and(|e| e.mics_failed);
+    if let Err(e) = out.t0
         && !e.on_air
     {
         return Err(DeviceError::Other(e.to_string()));
     }
-    Ok(CountdownOutcome::Live { public: settled.unwrap_or(public), mics_failed })
+    Ok(CountdownOutcome::Live { public, mics_failed })
 }
 
 /// Waits at most `GO_PUBLIC_WAIT` for an in-flight `go_public`; on timeout it is
@@ -470,6 +484,59 @@ pub(crate) async fn transition_with_retry(d: &Devices, bid: &str, to: Phase) -> 
             }
         }
     }
+}
+
+/// What Start service now did: T-0's result, and the go-public's (`None` when the
+/// broadcast was already public, so none ran).
+#[derive(Debug)]
+pub struct StartOutcome {
+    pub t0: std::result::Result<(), T0Error>,
+    pub public: Option<Result<()>>,
+}
+
+/// Start service now: T-0 and, unless the broadcast is already public, `go_public`
+/// alongside it. The cut never waits for YouTube; the go-public gets at most
+/// `GO_PUBLIC_WAIT` (then it is dropped, never left detached, and counts as failed).
+pub async fn start_service(d: &Devices, c: &Config, bid: &str, already_public: bool, levels: &LiveLevels) -> StartOutcome {
+    start_service_reporting(d, c, bid, already_public, levels, |_| {}, |_| {}).await
+}
+
+/// `start_service`, also giving `note` T-0's line and "YouTube public (took X s)",
+/// and calling `cut_done` with T-0's result as soon as T-0 is done, before any
+/// go-public still running has settled (so LIVE is never held back by YouTube).
+pub async fn start_service_reporting(
+    d: &Devices,
+    c: &Config,
+    bid: &str,
+    already_public: bool,
+    levels: &LiveLevels,
+    note: impl Fn(String),
+    cut_done: impl FnOnce(&std::result::Result<(), T0Error>),
+) -> StartOutcome {
+    let cut = async {
+        let r = t0_reporting(d, c, levels, &note).await;
+        cut_done(&r);
+        r
+    };
+    let public = async {
+        if already_public {
+            return None;
+        }
+        let start = Instant::now();
+        let r = match tokio::time::timeout(GO_PUBLIC_WAIT, go_public(d, bid)).await {
+            Ok(r) => r,
+            Err(_) => Err(DeviceError::Other(format!(
+                "it did not finish within {} s; check YouTube Studio",
+                GO_PUBLIC_WAIT.as_secs()
+            ))),
+        };
+        if r.is_ok() {
+            note(public_note(start.elapsed()));
+        }
+        Some(r)
+    };
+    let (t0, public) = tokio::join!(cut, public);
+    StartOutcome { t0, public }
 }
 
 /// Some T-0 steps failed. `on_air` says whether the stream cut to live action
@@ -776,6 +843,8 @@ mod tests {
         assert_eq!(run.stages.lock().unwrap().last(), Some(&Stage::Live));
         assert_t0_tail(&log.calls());
         assert!(run.warns.lock().unwrap().is_empty(), "{:?}", run.warns.lock().unwrap());
+        // Already public at T-10: T-0 only cuts.
+        assert_eq!(live_transitions(&log), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -833,9 +902,11 @@ mod tests {
             Some(Stage::Countdown { public: false, .. })
         ));
         assert!(!run.stages.lock().unwrap().iter().any(|s| matches!(s, Stage::Countdown { public: true, .. })));
+        // T-0 retries going public alongside the cut (v1.1); that fails too.
+        h.yt.fail_times("transition", 4);
         h.player.emit(PlayerEvent::Ended);
         assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: false, mics_failed: false });
-        assert_eq!(live_transitions(&log), 8);
+        assert_eq!(live_transitions(&log), 12);
     }
 
     #[tokio::test(start_paused = true)]
@@ -991,6 +1062,8 @@ mod tests {
         assert!(start.elapsed() <= GO_PUBLIC_WAIT);
         let warns = run.warns.lock().unwrap();
         assert!(warns.iter().any(|w| w.contains("public")), "{warns:?}");
+        // The in-flight attempt was not duplicated at T-0.
+        assert_eq!(live_transitions(&log), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1012,6 +1085,91 @@ mod tests {
         // Mics stay down; the hall and the counter are still handled.
         assert!(!log.calls().iter().any(|c| matches!(c, Call::StreamSetAudioLevel(..))));
         assert!(log.calls().contains(&Call::CounterClear));
+    }
+
+    // ---- v1.1: Start service now ----
+
+    #[tokio::test(start_paused = true)]
+    async fn start_service_goes_public_alongside_the_cut() {
+        let (d, log, _h) = fake_devices();
+        let (notes, n) = sink();
+        let out = start_service_reporting(&d, &Config::default(), "b", false, &LiveLevels::default(), n, |_| {}).await;
+        assert_eq!(out.t0, Ok(()));
+        assert!(matches!(out.public, Some(Ok(()))), "{:?}", out.public);
+        let calls = log.calls();
+        assert_eq!(live_transitions(&log), 1);
+        // Going public started before T-0 had finished (the counter is cleared last).
+        assert!(pos(&calls, &Call::YtTransition(Phase::Live)) < pos(&calls, &Call::CounterClear), "{calls:?}");
+        assert_t0_tail(&calls);
+        let notes = notes.lock().unwrap();
+        assert!(notes.iter().any(|m| m.starts_with("YouTube public (took ")), "{notes:?}");
+        assert!(notes.iter().any(|m| m.starts_with("Live · Cam ")), "{notes:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_service_when_already_public_only_cuts() {
+        let (d, log, _h) = fake_devices();
+        let out = start_service(&d, &Config::default(), "b", true, &LiveLevels::default()).await;
+        assert_eq!(out.t0, Ok(()));
+        assert!(out.public.is_none(), "{:?}", out.public);
+        assert_eq!(live_transitions(&log), 0);
+        assert_t0_tail(&log.calls());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_service_cut_never_waits_for_youtube() {
+        let (d, log, h) = fake_devices();
+        h.yt.set_transition_hangs(true);
+        let start = Instant::now();
+        let cut_at: Rec<Duration> = Arc::default();
+        let c2 = cut_at.clone();
+        let out = start_service_reporting(&d, &Config::default(), "b", false, &LiveLevels::default(), |_| {}, |r| {
+            assert_eq!(*r, Ok(()));
+            c2.lock().unwrap().push(start.elapsed());
+        })
+        .await;
+        let cut = cut_at.lock().unwrap()[0];
+        assert!(cut < Duration::from_secs(2), "T-0 waited for YouTube: {cut:?}");
+        assert_eq!(out.t0, Ok(()));
+        // The hung go-public is bounded by GO_PUBLIC_WAIT and reported as a failure.
+        assert!(matches!(out.public, Some(Err(_))), "{:?}", out.public);
+        assert!(start.elapsed() >= GO_PUBLIC_WAIT && start.elapsed() < GO_PUBLIC_WAIT + MS(500), "{:?}", start.elapsed());
+        assert_eq!(live_transitions(&log), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn countdown_t0_retries_public_if_it_failed_at_t10() {
+        let (d, log, h) = fake_devices();
+        h.yt.fail_times("transition", 4);
+        h.player.set_duration(Duration::from_secs(60));
+        h.player.set_position(Some(MS(50_000)));
+        let run = spawn_countdown(&d, &Config::default(), Readiness::Ready, LiveLevels::default());
+        sleep(Duration::from_secs(7)).await;
+        assert_eq!(live_transitions(&log), 4, "the go-public at T-10 has failed");
+        h.player.emit(PlayerEvent::Ended);
+        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: true, mics_failed: false });
+        assert_eq!(live_transitions(&log), 5, "{:?}", log.calls());
+        // The retry ran alongside T-0: it started before T-0 finished.
+        let calls = log.calls();
+        let retry = calls.iter().rposition(|c| *c == Call::YtTransition(Phase::Live)).unwrap();
+        assert_t0_tail(&calls);
+        assert!(retry < calls.len() - 1, "the retry waited for T-0: {calls:?}");
+        assert_eq!(run.stages.lock().unwrap().last(), Some(&Stage::Live));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn countdown_t0_does_not_duplicate_an_in_flight_go_public() {
+        let (d, log, h) = fake_devices();
+        h.yt.fail_times("transition", 2); // mid-retry at T-0
+        h.player.set_duration(Duration::from_secs(60));
+        h.player.set_position(Some(MS(50_000)));
+        let run = spawn_countdown(&d, &Config::default(), Readiness::Ready, LiveLevels::default());
+        sleep(MS(500)).await;
+        assert_eq!(live_transitions(&log), 1);
+        h.player.emit(PlayerEvent::Ended);
+        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: true, mics_failed: false });
+        // The in-flight attempt's own retries only: 3 transitions, no fresh go-public.
+        assert_eq!(live_transitions(&log), 3, "{:?}", log.calls());
     }
 
     #[tokio::test(start_paused = true)]
