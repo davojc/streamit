@@ -9,5 +9,12 @@ async-trait = { workspace = true }
 tokio = { workspace = true, features = ["net", "time", "sync", "rt", "macros"] }
 tracing = { workspace = true }
 
+# Not "probe": the VideoHub and Web Presenter crates already have examples named probe, and
+# same-named examples in one workspace overwrite each other in target/debug/examples (on
+# Windows the parallel links then fail with LNK1104).
+[[example]]
+name = "atem-probe"
+path = "examples/probe.rs"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "time", "sync", "rt", "rt-multi-thread", "macros", "test-util"] }
