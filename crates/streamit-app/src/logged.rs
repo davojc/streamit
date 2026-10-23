@@ -1,7 +1,8 @@
 //! Logging decorators for the device traits. Every action call is logged at `info` with
 //! its arguments and result (`warn` when it fails); read getters (program, route_of,
 //! status, signed_in, upcoming, check, health, life_cycle, audio_level, position) are
-//! not logged, because the health poll calls them every 2 s. Arguments are numbers,
+//! not logged, because the health poll calls them every 2 s. The countdown counter's
+//! `show`, called ten times a second, is logged at `debug` (a failure still at `warn`). Arguments are numbers,
 //! file paths and broadcast ids only: no tokens or secrets pass through these traits.
 use async_trait::async_trait;
 use std::fmt::Debug;
@@ -14,7 +15,7 @@ use streamit_core::devices::{
     Player, PlayerEvent, Result, Router, StreamSwitcher, Switcher,
 };
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub struct Logged<T: ?Sized> {
     device: &'static str,
@@ -25,6 +26,15 @@ impl<T: ?Sized> Logged<T> {
     pub fn wrap(device: &'static str, inner: Arc<T>) -> Arc<Logged<T>> {
         Arc::new(Logged { device, inner })
     }
+}
+
+/// `done` for a call made many times a second: success at `debug`, failure at `warn`.
+fn done_quiet<R: Debug>(device: &str, call: String, r: Result<R>) -> Result<R> {
+    match &r {
+        Ok(v) => debug!(device, call = %call, result = ?v, "device call"),
+        Err(e) => warn!(device, call = %call, error = %e, "device call failed"),
+    }
+    r
 }
 
 fn done<R: Debug>(device: &str, call: String, r: Result<R>) -> Result<R> {
@@ -158,7 +168,7 @@ impl<T: Player + ?Sized> Player for Logged<T> {
 #[async_trait]
 impl<T: Counter + ?Sized> Counter for Logged<T> {
     async fn show(&self, remaining: Duration) -> Result<()> {
-        done(self.device, format!("show({}s)", remaining.as_secs()), self.inner.show(remaining).await)
+        done_quiet(self.device, format!("show({}s)", remaining.as_secs()), self.inner.show(remaining).await)
     }
     async fn clear(&self) -> Result<()> {
         done(self.device, "clear()".into(), self.inner.clear().await)
@@ -222,5 +232,28 @@ mod tests {
         assert!(line("route(4, 6)").contains("WARN"), "{text}");
         assert!(line("transition(b1, Live)").contains("INFO"), "{text}");
         assert!(!text.contains("route_of"), "reads are not logged: {text}");
+    }
+
+    #[tokio::test]
+    async fn counter_ticks_log_at_debug_and_failures_at_warn() {
+        let cap = Capture::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(cap.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _g = tracing::subscriber::set_default(sub);
+        let (d, _log, h) = fake_devices();
+        let counter = Logged::wrap("NDI", d.counter.clone());
+        counter.show(Duration::from_millis(41_900)).await.unwrap();
+        h.counter.fail_next("show");
+        assert!(counter.show(Duration::from_secs(40)).await.is_err());
+        counter.clear().await.unwrap();
+
+        let text = cap.text();
+        let line = |needle: &str| text.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle} in {text}"));
+        assert!(line("show(41s)").contains("DEBUG"), "{text}");
+        assert!(line("show(40s)").contains("WARN"), "{text}");
+        assert!(line("clear()").contains("INFO"), "{text}");
     }
 }
