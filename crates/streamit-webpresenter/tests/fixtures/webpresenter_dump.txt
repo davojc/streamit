@@ -1,0 +1,20 @@
+PROTOCOL PREAMBLE:
+Version: 1.0
+
+IDENTITY:
+Model: Blackmagic Web Presenter 4K
+Label: Web Presenter 4K
+Unique ID: 0000000000000000
+
+VERSION:
+Product: 6.0
+Software: 6.0
+
+STREAM SETTINGS:
+Service: YouTube
+Server: rtmp://a.rtmp.youtube.com/live2
+Key: xxxx-xxxx-xxxx-xxxx-xxxx
+
+STREAM STATE:
+Status: Idle
+
