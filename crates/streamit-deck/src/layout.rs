@@ -69,6 +69,13 @@ fn offered(snap: &Snapshot, o: Offer) -> bool {
     snap.offers.contains(&o)
 }
 
+/// R22: GO LIVE can be pressed before and during the countdown (the engine pre-empts a
+/// running countdown), and whenever it is offered (e.g. live on the holding still after a
+/// restart). Once live, ending or ended it is inert; the engine also ignores it there.
+fn go_live_pressable(snap: &Snapshot) -> bool {
+    matches!(snap.stage, Stage::Idle | Stage::Prepared(_) | Stage::Countdown { .. }) || offered(snap, Offer::GoLive)
+}
+
 /// The engine command a press of `key` should send, if any.
 pub fn command_for(key: u8, snap: &Snapshot) -> Option<Command> {
     if let Some(i) = cue_slot(key) {
@@ -78,8 +85,9 @@ pub fn command_for(key: u8, snap: &Snapshot) -> Option<Command> {
         PREPARE => Some(Command::Prepare),
         COUNTDOWN => Some(Command::Countdown),
         STOP_COUNTDOWN => Some(Command::StopCountdown),
-        GO_PUBLIC => offered(snap, Offer::GoPublic).then_some(Command::GoPublic),
-        GO_LIVE => offered(snap, Offer::GoLive).then_some(Command::GoLive),
+        // Always available (spec): a redundant transition is harmless.
+        GO_PUBLIC => Some(Command::GoPublic),
+        GO_LIVE => go_live_pressable(snap).then_some(Command::GoLive),
         END_SERVICE => Some(Command::EndService),
         END_BROADCAST => Some(Command::EndBroadcast),
         RECOVER => offered(snap, Offer::Recover).then_some(Command::Recover),
@@ -215,7 +223,12 @@ pub fn appearance(key: u8, snap: &Snapshot, blink_phase: bool) -> KeyLook {
                 GO_LIVE => (Offer::GoLive, "GO\nLIVE", RED, WHITE, Some(FlashKey::GoLive)),
                 _ => (Offer::Recover, "RECOVER", AMBER, BLACK, Some(FlashKey::Recover)),
             };
-            let mut l = if offered(snap, o) { look(label, bg, fg) } else { dim(label) };
+            let lit = match key {
+                GO_PUBLIC => true,
+                GO_LIVE => go_live_pressable(snap),
+                _ => offered(snap, o),
+            };
+            let mut l = if lit { look(label, bg, fg) } else { dim(label) };
             if fk.is_some() && snap.flash_key == fk {
                 l.blink = true;
                 if !blink_phase {
@@ -291,6 +304,47 @@ mod tests {
         let l = appearance(18, &s, true);
         assert_eq!((l.text.as_str(), l.bg), ("", BLACK));
         assert_eq!(command_for(32, &s), None);
+    }
+
+    #[test]
+    fn go_live_pressable_in_prepared_and_countdown() {
+        let stages = [
+            Stage::Idle,
+            Stage::Prepared(Readiness::Ready),
+            Stage::Prepared(Readiness::Warning("w".into())),
+            Stage::Countdown { remaining: Duration::from_secs(30), public: false },
+            Stage::Countdown { remaining: Duration::from_secs(5), public: true },
+        ];
+        for stage in stages {
+            let s = Snapshot { stage: stage.clone(), ..Snapshot::default() };
+            assert_eq!(command_for(12, &s), Some(Command::GoLive), "{stage:?}");
+            assert_eq!(appearance(12, &s, true).bg, RED, "{stage:?}");
+        }
+        for stage in [Stage::Live, Stage::Ending { remaining: Duration::from_secs(3) }, Stage::Ended] {
+            let s = Snapshot { stage: stage.clone(), ..Snapshot::default() };
+            assert_eq!(command_for(12, &s), None, "{stage:?}");
+            assert_eq!(appearance(12, &s, true).bg, DIM_BG, "{stage:?}");
+        }
+        // Live on the holding still (assessed after a restart): Go Live is offered.
+        let s = Snapshot { stage: Stage::Live, offers: vec![Offer::GoLive], ..Snapshot::default() };
+        assert_eq!(command_for(12, &s), Some(Command::GoLive));
+    }
+
+    #[test]
+    fn go_public_always_pressable() {
+        let stages = [
+            Stage::Idle,
+            Stage::Prepared(Readiness::Ready),
+            Stage::Countdown { remaining: Duration::from_secs(30), public: false },
+            Stage::Live,
+            Stage::Ending { remaining: Duration::from_secs(3) },
+            Stage::Ended,
+        ];
+        for stage in stages {
+            let s = Snapshot { stage: stage.clone(), ..Snapshot::default() };
+            assert_eq!(command_for(11, &s), Some(Command::GoPublic), "{stage:?}");
+            assert_ne!(appearance(11, &s, true).bg, DIM_BG, "{stage:?}");
+        }
     }
 
     #[test]

@@ -200,10 +200,10 @@ mod tests {
 
     #[test]
     fn press_uses_latest_snapshot() {
-        let (tx, rx) = watch::channel(Snapshot { offers: vec![Offer::GoLive], ..Snapshot::default() });
-        assert_eq!(decide_press(12, &rx), Some(Command::GoLive));
+        let (tx, rx) = watch::channel(Snapshot { offers: vec![Offer::Recover], ..Snapshot::default() });
+        assert_eq!(decide_press(15, &rx), Some(Command::Recover));
         // The offer is withdrawn; the receiver never polled changed().
         tx.send(Snapshot::default()).unwrap();
-        assert_eq!(decide_press(12, &rx), None);
+        assert_eq!(decide_press(15, &rx), None);
     }
 }

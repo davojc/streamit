@@ -397,9 +397,17 @@ impl Engine {
             Command::GoPublic => self.spawn_go_public(),
             Command::EndBroadcast => self.spawn_end_broadcast(),
             Command::GoLive => {
-                if matches!(self.stage(), Stage::Ending { .. } | Stage::Ended) {
+                // R22: the deck lets Go Live be pressed in Idle/Prepared/Countdown; the
+                // engine decides. Live is refused unless Go Live is offered (live on the
+                // holding still, as assessed after a restart).
+                let stage = self.stage();
+                if matches!(stage, Stage::Ending { .. } | Stage::Ended) {
                     self.flash_key(FlashKey::GoLive);
                     return self.ignore(&cmd, "the service has ended");
+                }
+                if stage == Stage::Live && !self.snap.borrow().offers.contains(&Offer::GoLive) {
+                    self.flash_key(FlashKey::GoLive);
+                    return self.ignore(&cmd, "the service is already live");
                 }
                 match &self.running {
                     None => self.start_golive(None),
@@ -687,7 +695,14 @@ impl Engine {
                 self.set(|s| s.stage = Stage::Prepared(Readiness::Waiting("Going live".into())));
                 self.start_golive(Some(public));
             }
-            Ok(CountdownOutcome::Stopped) => self.set(|s| s.stage = before),
+            // R22: Go Live (and Go Public, if the countdown had not gone public) stay offered.
+            Ok(CountdownOutcome::Stopped) => self.set(|s| {
+                s.stage = before;
+                add(&mut s.offers, Offer::GoLive);
+                if !public {
+                    add(&mut s.offers, Offer::GoPublic);
+                }
+            }),
             Err(e) => {
                 let msg = format!("The countdown failed ({e}); press Go Live manually");
                 self.set(|s| {
@@ -1196,7 +1211,7 @@ mod tests {
         until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
         send(&e, Command::StopCountdown).await;
         let s = until(&mut e, "Prepared again", |s| s.stage == Stage::Prepared(Readiness::Ready)).await;
-        assert!(s.offers.is_empty(), "{:?}", s.offers);
+        assert!(!s.offers.contains(&Offer::Recover), "{:?}", s.offers);
         assert!(log.calls().contains(&Call::PlayerStop));
         // Not busy any more: a new countdown starts.
         send(&e, Command::Countdown).await;
@@ -1754,6 +1769,35 @@ mod tests {
         assert_eq!(snap(&e).job, Some("a video"));
         h.player.emit(PlayerEvent::Ended);
         until(&mut e, "no job", |s| s.job.is_none() && s.playing.is_none()).await;
+    }
+
+    // ---- R22 ----
+
+    #[tokio::test(start_paused = true)]
+    async fn go_live_ignored_and_flashed_when_live() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::GoLive).await;
+        until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        let before = log.calls().len();
+        send(&e, Command::GoLive).await;
+        until(&mut e, "Go Live flash", |s| s.flash_key == Some(FlashKey::GoLive)).await;
+        sleep(Duration::from_secs(3)).await;
+        assert_eq!(log.calls().len(), before, "{:?}", log.calls());
+        assert_eq!(stream_autos(&log), 1);
+        assert_eq!(snap(&e).stage, Stage::Live);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_countdown_offers_go_live() {
+        let (d, _log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { public: false, .. })).await;
+        send(&e, Command::StopCountdown).await;
+        let s = until(&mut e, "stopped", |s| s.job.is_none() && !matches!(s.stage, Stage::Countdown { .. })).await;
+        assert!(s.offers.contains(&Offer::GoLive), "{:?}", s.offers);
+        assert!(s.offers.contains(&Offer::GoPublic), "the countdown had not gone public: {:?}", s.offers);
     }
 
     #[tokio::test(start_paused = true)]
