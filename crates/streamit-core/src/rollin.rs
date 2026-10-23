@@ -273,6 +273,22 @@ pub async fn play(
         }
     }
 
+    // Stop pressed during load or settle: nothing has gone on air, so change no
+    // picture or audio; just un-preroll the player and put the route back.
+    if stop.is_cancelled() {
+        if let Err(e) = d.player.stop().await {
+            note(&mut problems, format!("Could not stop the video: {e}"));
+        }
+        if let Some(p) = prev {
+            restore_route(d, c, p, &mut problems).await;
+        }
+        return if problems.is_empty() {
+            RollinOutcome::Stopped
+        } else {
+            RollinOutcome::Failed { recover_needed: true, reason: problems.join("; ") }
+        };
+    }
+
     // 3. Pictures and audio.
     let mut stream_cut = false;
     if dest.stream_picture() {
@@ -328,9 +344,11 @@ pub async fn play(
                     Err(RecvError::Closed) => break End::VideoFailed("the player went away".into()),
                 },
                 _ = unmute.notified(), if mics_down && !unmuted => {
-                    unmuted = true;
-                    if let Err(e) = fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
-                        note(&mut problems, format!("Could not fade the mics up: {e}"));
+                    // Only a fade that worked counts: otherwise Unmute stays armed
+                    // and the return path still fades the mics up.
+                    match fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
+                        Ok(()) => unmuted = true,
+                        Err(e) => note(&mut problems, format!("Could not fade the mics up: {e}")),
                     }
                 }
             }
@@ -338,6 +356,26 @@ pub async fn play(
     };
 
     // 6. Return path. Every step runs whatever failed before it.
+    // R10: when the video was cut short, its sound goes first so it never lingers online.
+    let cut_short = !matches!(end, End::Ended);
+    let audio_off_first = mics_down && cut_short;
+    if audio_off_first && let Err(e) = d.stream.set_audio_on(in8, false).await {
+        note(&mut problems, format!("Could not turn off input 8 audio: {e}"));
+    }
+    // R11: the hall leaves the DeckLink first, before the stream's return transition.
+    if dest.screens_picture() {
+        let on_video = match d.screens.program().await {
+            Ok(p) => p == c.screens_atem.decklink_input,
+            Err(e) => {
+                note(&mut problems, format!("Could not read the hall screens program: {e}"));
+                screens_cut
+            }
+        };
+        // After the cut to the video, Preview holds what was on before; one Auto returns to it.
+        if on_video && let Err(e) = d.screens.auto().await {
+            note(&mut problems, format!("Could not switch the hall screens off the video: {e}"));
+        }
+    }
     if dest.stream_picture() {
         let on8 = match d.stream.program().await {
             Ok(p) => p == sa.decklink_input,
@@ -366,24 +404,11 @@ pub async fn play(
         if !unmuted && let Err(e) = fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
             note(&mut problems, format!("Could not fade the mics up: {e}"));
         }
-        if let Err(e) = d.stream.set_audio_on(in8, false).await {
+        if !audio_off_first && let Err(e) = d.stream.set_audio_on(in8, false).await {
             note(&mut problems, format!("Could not turn off input 8 audio: {e}"));
         }
     }
-    if dest.screens_picture() {
-        let on_video = match d.screens.program().await {
-            Ok(p) => p == c.screens_atem.decklink_input,
-            Err(e) => {
-                note(&mut problems, format!("Could not read the hall screens program: {e}"));
-                screens_cut
-            }
-        };
-        // After the cut to the video, Preview holds what was on before; one Auto returns to it.
-        if on_video && let Err(e) = d.screens.auto().await {
-            note(&mut problems, format!("Could not switch the hall screens off the video: {e}"));
-        }
-    }
-    if !matches!(end, End::Ended)
+    if cut_short
         && let Err(e) = d.player.stop().await
     {
         note(&mut problems, format!("Could not stop the video: {e}"));
@@ -414,7 +439,7 @@ mod tests {
     use super::*;
     use crate::audio::FLOOR_DB;
     use crate::config::AudioSourceId;
-    use crate::devices::{PlayerEvent, Router, Switcher};
+    use crate::devices::{PlayerEvent, Router, StreamSwitcher, Switcher};
     use crate::fakes::{Call, CallLog, FakeHandles, fake_devices};
     use std::time::Duration;
     use tokio::task::JoinHandle;
@@ -545,10 +570,10 @@ mod tests {
         assert_in_order(
             &tail,
             &[
+                Call::ScreensAuto,
                 Call::StreamAuto,
                 Call::StreamSetAudioLevel(MIC, -3.0),
                 Call::StreamSetAudioOn(IN8, false),
-                Call::ScreensAuto,
                 Call::HubRoute { output: OUT, input: CAM8 },
             ],
         );
@@ -694,10 +719,10 @@ mod tests {
         assert_in_order(
             &after_play(&calls),
             &[
-                Call::StreamAuto,
-                Call::StreamSetAudioLevel(MIC, -3.0),
                 Call::StreamSetAudioOn(IN8, false),
                 Call::ScreensAuto,
+                Call::StreamAuto,
+                Call::StreamSetAudioLevel(MIC, -3.0),
                 Call::PlayerStop,
                 Call::HubRoute { output: OUT, input: CAM8 },
             ],
@@ -792,7 +817,7 @@ mod tests {
         let (r, _) = run.task.await.unwrap();
         assert!(matches!(&r, RollinOutcome::Failed { recover_needed: false, reason } if reason.contains("decode")), "{r:?}");
         let calls = log.calls();
-        assert_in_order(&after_play(&calls), &[Call::StreamAuto, Call::ScreensAuto, Call::PlayerStop]);
+        assert_in_order(&after_play(&calls), &[Call::StreamSetAudioOn(IN8, false), Call::ScreensAuto, Call::StreamAuto, Call::PlayerStop]);
         assert_eq!(calls.last(), Some(&Call::HubRoute { output: OUT, input: CAM8 }));
         assert_eq!(h.stream.program().await.unwrap(), 1);
     }
@@ -816,6 +841,92 @@ mod tests {
         let (r, _) = spawn_play(&d, &cfg(), cue(Destination::OnlineOnly)).task.await.unwrap();
         assert!(matches!(r, RollinOutcome::Refused(_)), "{r:?}");
         assert_eq!(log.calls(), vec![Call::PlayerLoad(PathBuf::from("hymn.mp4"), -2.0), Call::PlayerStop]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_before_play_switches_nothing() {
+        let (d, log, h) = rig();
+        let run = spawn_play(&d, &cfg(), cue(Destination::HallAndOnline));
+        until(&log, Call::HubRoute { output: OUT, input: DK }).await; // now settling
+        run.stop.cancel();
+        let (r, _) = run.task.await.unwrap();
+        assert_eq!(r, RollinOutcome::Stopped);
+        let calls = log.calls();
+        for c in [Call::StreamSetPreview(8), Call::StreamAuto, Call::ScreensAuto, Call::PlayerPlay] {
+            assert!(!calls.contains(&c), "{c:?} in {calls:?}");
+        }
+        assert!(!calls.iter().any(|c| matches!(c, Call::StreamSetAudioLevel(..) | Call::StreamSetAudioOn(..))), "{calls:?}");
+        assert!(calls.contains(&Call::PlayerStop), "{calls:?}");
+        assert_eq!(calls.last(), Some(&Call::HubRoute { output: OUT, input: CAM8 }));
+        assert_eq!(h.hub.route_of(OUT).await.unwrap(), CAM8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_kills_video_audio_first() {
+        let (d, log, _h) = rig();
+        let run = spawn_play(&d, &cfg(), cue(Destination::HallAndOnline));
+        until(&log, Call::PlayerPlay).await;
+        until(&log, Call::StreamSetAudioLevel(MIC, FLOOR_DB)).await;
+        run.stop.cancel();
+        assert_eq!(run.task.await.unwrap().0, RollinOutcome::Stopped);
+        let tail = after_play(&log.calls());
+        let off = pos(&tail, &Call::StreamSetAudioOn(IN8, false));
+        assert!(off < pos(&tail, &Call::StreamAuto), "{tail:?}");
+        assert!(off < pos(&tail, &Call::StreamSetAudioLevel(MIC, -3.0)), "{tail:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_unmute_can_be_retried_and_return_still_fades_up() {
+        let up = Call::StreamSetAudioLevel(MIC, -3.0);
+        // A failed Unmute leaves Unmute armed: a second press fades the mics up.
+        let (d, log, h) = rig();
+        let run = spawn_play(&d, &cfg(), cue(Destination::HallAndOnline));
+        until(&log, Call::StreamSetAudioLevel(MIC, FLOOR_DB)).await;
+        h.stream.fail_next("set_audio_level");
+        run.unmute.notify_one();
+        sleep(Duration::from_secs(2)).await;
+        assert!(!log.calls().contains(&up), "{:?}", log.calls());
+        run.unmute.notify_one();
+        until(&log, up.clone()).await;
+        assert!(!log.calls().contains(&Call::PlayerStop));
+        h.player.emit(PlayerEvent::Ended);
+        let (r, _) = run.task.await.unwrap();
+        assert!(matches!(r, RollinOutcome::Failed { recover_needed: true, .. }), "{r:?}");
+        assert_eq!(log.calls().iter().filter(|c| **c == up).count(), 1);
+
+        // A failed Unmute with no retry: the return path still fades the mics up.
+        let (d, log, h) = rig();
+        let run = spawn_play(&d, &cfg(), cue(Destination::HallAndOnline));
+        until(&log, Call::StreamSetAudioLevel(MIC, FLOOR_DB)).await;
+        h.stream.fail_next("set_audio_level");
+        run.unmute.notify_one();
+        sleep(Duration::from_secs(2)).await;
+        h.player.emit(PlayerEvent::Ended);
+        run.task.await.unwrap();
+        let tail = after_play(&log.calls());
+        assert_in_order(&tail, &[Call::StreamAuto, up, Call::StreamSetAudioOn(IN8, false)]);
+        assert_eq!(h.stream.audio_level(MIC).await.unwrap(), -3.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn screens_returns_before_stream_return_path() {
+        for end in ["ended", "stop"] {
+            let (d, log, h) = rig();
+            let run = spawn_play(&d, &cfg(), cue(Destination::HallAndOnline));
+            until(&log, Call::PlayerPlay).await;
+            until(&log, Call::StreamSetAudioLevel(MIC, FLOOR_DB)).await;
+            if end == "ended" {
+                h.player.emit(PlayerEvent::Ended);
+            } else {
+                run.stop.cancel();
+            }
+            run.task.await.unwrap();
+            let tail = after_play(&log.calls());
+            let screens = pos(&tail, &Call::ScreensAuto);
+            assert!(screens < pos(&tail, &Call::StreamAuto), "{end}: {tail:?}");
+            assert!(screens < pos(&tail, &Call::StreamSetAudioLevel(MIC, -3.0)), "{end}: {tail:?}");
+            assert_eq!(tail.last(), Some(&Call::HubRoute { output: OUT, input: CAM8 }), "{end}");
+        }
     }
 
     #[test]
