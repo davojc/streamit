@@ -4,3 +4,4 @@ pub mod devices;
 pub mod fakes;
 pub mod audio;
 pub mod golive;
+pub mod rollin;

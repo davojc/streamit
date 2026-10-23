@@ -186,7 +186,7 @@ pub async fn prepare(
 
 /// Preview then Auto. Auto is skipped when the preview could not be set, so a
 /// failed preview never puts an unknown input on program.
-async fn cut(sw: &dyn Switcher, input: u16) -> Result<()> {
+pub(crate) async fn cut(sw: &dyn Switcher, input: u16) -> Result<()> {
     sw.set_preview(input).await?;
     sw.auto().await
 }

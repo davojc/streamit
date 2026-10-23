@@ -6,6 +6,8 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::rollin::Cue;
+
 /// Serialize a `Duration` as whole milliseconds.
 mod millis {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -173,6 +175,9 @@ pub struct Config {
     pub timings: Timings,
     pub playout: PlayoutConfig,
     pub ndi: NdiConfig,
+    /// The roll-in cue list, saved so it survives a restart.
+    #[serde(default)]
+    pub cues: Vec<Cue>,
 }
 
 impl Config {
@@ -208,6 +213,7 @@ pub fn config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rollin::Destination;
     use std::time::Duration;
 
     #[test]
@@ -249,6 +255,22 @@ mod tests {
         let mut c = Config::default();
         c.stream_atem.address = Some("10.0.0.5".into());
         c.timings.closing_hold = Duration::from_millis(12_500);
+        c.cues = vec![
+            Cue {
+                path: PathBuf::from(r"C:\Videos\notices.mp4"),
+                name: "Notices".into(),
+                destination: Destination::HallAndOnline,
+                gain_db: -2.5,
+                return_input: Some(2),
+            },
+            Cue {
+                path: PathBuf::from("hymn.mp4"),
+                name: "Hymn".into(),
+                destination: Destination::AudioOnly,
+                gain_db: 0.0,
+                return_input: None,
+            },
+        ];
         c.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), c);
         let _ = std::fs::remove_dir_all(&dir);
