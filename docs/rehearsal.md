@@ -97,7 +97,7 @@ cargo run -p streamit-atem --example atem-probe -- 192.168.4.123 state
 ```
 
 - Look for: program and preview match the multiview. Both media players are listed with their stills. There is a Fairlight line for `1001 / -65280` with a fader level. **Write that level down.**
-- Then:
+- Then (player 1 is the default):
   ```
   cargo run -p streamit-atem --example atem-probe -- 192.168.4.123 preview 3
   cargo run -p streamit-atem --example atem-probe -- 192.168.4.123 still 1 <opening>
@@ -172,9 +172,9 @@ Open StreamIt (`target\release\streamit.exe`) and go to the Settings tab.
 
 1. **Roles.** The kit found by mDNS is listed. Give each device its role: Stream ATEM, Screens ATEM, VideoHub, Web Presenter. Use **Add by IP** for any that did not appear.
 2. **YouTube.** Enter the client id and secret. Press **Sign in**. Press **Load stream keys** and pick the Web Presenter's key.
-3. **VideoHub.** Set the output that feeds input 8 (`input8_output`) and the VideoHub input that the DeckLink is on (`decklink_input`).
-4. **Stream ATEM.** Set the DeckLink input (8) and the Camera 8 input (8). Set the opening still and the closing still (media pool slots, counting from 0). They must be two different stills.
-5. **Screens ATEM.** Set the DeckLink input (8) and the T-0 input (`t0_input`): the input the hall screens go to at T-0.
+3. **VideoHub.** Set **Output feeding ATEM input 8** to the router output that goes to Stream ATEM input 8. Set **DeckLink router input** to the router input the DeckLink SDI output is plugged into. Set **Fallback normal input** to the router input Camera 8 is normally on: this is what StreamIt routes back onto input 8 after a video, and what Recover uses. 0 means "not set". With 0, Recover warns instead of restoring the route.
+4. **Stream ATEM.** Set **DeckLink input** to 8. (Input 8 is shared: Camera 8 and the DeckLink both reach it through the VideoHub, which is why step 3 matters. There is no separate "Camera 8 input" setting.) Set **Opening still** and **Closing still** (media pool slots, counting from 0). They must be two different stills.
+5. **Screens ATEM.** Set **DeckLink input** to 8. Set **Input at T-0** to the input the hall screens go to at T-0.
 6. **Playout.** Set the countdown file, the DeckLink device, and the NDI source name `StreamIt Countdown`.
 7. Press **Save**. Then **restart StreamIt**. Device addresses, roles, the YouTube client and key, and the playout and NDI settings only apply after a restart.
 8. After the restart, launch on the church network and check: the discovered kit is listed, the roles stuck, and the Stream Deck shows live status for each device. Startup must not change any device. In the log (`%APPDATA%\StreamIt\logs`) there should be no commands sent during startup.
@@ -182,14 +182,14 @@ Open StreamIt (`target\release\streamit.exe`) and go to the Settings tab.
 
 ## Part B. The rehearsal
 
-Select the private test broadcast in the Run tab. Keep it private until check 3. Use the app window or the Stream Deck. Do the checks in order.
+Select the private test broadcast in the Run tab. Keep it private until check 3. Press keys on the Stream Deck or the matching buttons on the Run tab. Both do the same thing. Do the checks in order.
 
 1. **Stage 0: the checks.**
    Look at the checks list. Turn Auto Start on in YouTube Studio for the test broadcast. Press **Fix** next to Auto Start. Auto Start must go off.
    *Pass if:* all the checks show (stream key, Auto Start off, Auto Stop on, monitor stream on). The Auto Start check fails when you turn it on, and **Fix** turns it off again. Nothing else changes by itself.
 
 2. **Prepare.**
-   Press PREPARE.
+   Press PREPARE (Stream Deck key or Run tab button).
    *Pass if:* the opening still is on air and silent. The Web Presenter is streaming. The stage reaches READY within 60 s. The broadcast is in `testing` in YouTube Studio.
 
 3. **Countdown.**
@@ -204,7 +204,7 @@ Select the private test broadcast in the Run tab. Keep it private until check 3.
    Play one video to the hall and online, and one to each other destination in your cue list. Use the video with a return input at least once.
    *Pass if:*
    - You see no black on the stream multiview during the route.
-   - Camera 8 is back on input 8 afterwards.
+   - Camera 8 is back on input 8 afterwards (the VideoHub route is back on the Fallback normal input).
    - If an operator changes the preview during the video, the change is honoured and not overridden.
    - After a video the ATEM returns to preview, unless the video has a return input.
    - A second press of a cue while one video is playing is ignored and its key flashes.
