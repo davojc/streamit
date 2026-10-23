@@ -11,14 +11,14 @@
 use crate::audio::{LiveLevels, Target, all_down, down_threshold, fade};
 use crate::config::{AudioSourceId, Config};
 use crate::devices::{Devices, PlayerEvent};
-use crate::golive::cut;
+use crate::golive::{COUNTER_TICK, cut};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::sync::broadcast::error::RecvError;
-use tokio::time::sleep;
+use tokio::time::{MissedTickBehavior, interval, sleep};
 use tokio_util::sync::CancellationToken;
 
 /// Most videos the cue list holds in v1.
@@ -166,6 +166,16 @@ pub enum RollinOutcome {
     Failed { recover_needed: bool, reason: String },
 }
 
+/// What `play_reporting` reports while a roll-in runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollinReport {
+    /// `true` as the mic fade down starts; `false` only once a fade back up has succeeded.
+    MicsDucked(bool),
+    /// The video is playing: how far in it is, out of its length. Sent as it starts
+    /// and every `COUNTER_TICK` until it ends or is stopped.
+    Position { position: Duration, duration: Duration },
+}
+
 /// Why the video stopped running.
 enum End {
     Ended,
@@ -228,8 +238,7 @@ pub async fn play(
     play_reporting(d, c, cue, levels, stop, unmute, |_| {}).await
 }
 
-/// `play`, also reporting the mics: `mics_ducked(true)` as the fade down starts,
-/// `mics_ducked(false)` only once a fade back up has succeeded.
+/// `play`, also reporting the mics and the video's position (see `RollinReport`).
 pub async fn play_reporting(
     d: &Devices,
     c: &Config,
@@ -237,8 +246,9 @@ pub async fn play_reporting(
     levels: &mut LiveLevels,
     stop: CancellationToken,
     unmute: Arc<Notify>,
-    mics_ducked: impl Fn(bool),
+    report: impl Fn(RollinReport),
 ) -> RollinOutcome {
+    let mics_ducked = |down: bool| report(RollinReport::MicsDucked(down));
     let sa = &c.stream_atem;
     let hub = &c.videohub;
     let dest = cue.destination;
@@ -248,12 +258,15 @@ pub async fn play_reporting(
     let mut events = d.player.events();
 
     // 1. Load, paused on the first frame.
-    if let Err(e) = d.player.load(&cue.path, cue.gain_db).await {
-        return RollinOutcome::Failed {
-            recover_needed: false,
-            reason: format!("Could not load {}: {e}", cue.name),
-        };
-    }
+    let duration = match d.player.load(&cue.path, cue.gain_db).await {
+        Ok(duration) => duration,
+        Err(e) => {
+            return RollinOutcome::Failed {
+                recover_needed: false,
+                reason: format!("Could not load {}: {e}", cue.name),
+            };
+        }
+    };
 
     // 2. Route input 8 to the DeckLink while it is off program.
     let mut problems = Vec::new();
@@ -358,6 +371,8 @@ pub async fn play_reporting(
         note(&mut problems, format!("Could not play {}: {e}", cue.name));
         End::NotPlayed
     } else {
+        let mut tick = interval(COUNTER_TICK);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 biased;
@@ -378,6 +393,10 @@ pub async fn play_reporting(
                         }
                         Err(e) => note(&mut problems, format!("Could not fade the mics up: {e}")),
                     }
+                }
+                _ = tick.tick() => {
+                    let position = d.player.position().unwrap_or_default().min(duration);
+                    report(RollinReport::Position { position, duration });
                 }
             }
         }

@@ -98,7 +98,7 @@ fn run_app() -> anyhow::Result<()> {
         .build()?;
     let started = rt.block_on(async {
         let wired = wiring::build(&config).await;
-        let engine = Engine::spawn_with(wired.devices.clone(), shared.clone(), levels, Some(levels_file));
+        let engine = Engine::spawn_with(wired.devices.clone(), shared.clone(), levels, Some(levels_file), false);
         let tx = spawn_command_log(engine.tx.clone());
         for (kind, health) in &wired.health {
             let _ = tx.send(Command::DeviceHealth(*kind, health.clone())).await;

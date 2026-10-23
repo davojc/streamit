@@ -55,6 +55,15 @@ pub struct Stage0Report {
     pub device_errors: Vec<String>,
 }
 
+/// What `countdown` reports along the way, besides its stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CountdownReport {
+    /// The countdown video is loaded and about to play; this is its length.
+    Started(Duration),
+    /// A plain-language step for the activity list.
+    Note(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CountdownOutcome {
     /// T-0 is done. `public` is whether the broadcast went public (go-public settled Ok);
@@ -118,13 +127,14 @@ pub async fn stage0(d: &Devices, c: &Config) -> Stage0Report {
     Stage0Report { signed_in, listed, broadcasts, selected, check, device_errors }
 }
 
-fn note(problems: &mut Vec<String>, warn: &impl Fn(String), msg: String) {
+fn problem(problems: &mut Vec<String>, warn: &impl Fn(String), msg: String) {
     warn(msg.clone());
     problems.push(msg);
 }
 
 /// Stage 1: holding still on air, mics down, encoder on, YouTube in testing.
-/// Never aborts early: each failed step becomes part of a `Warning`.
+/// Never aborts early: each failed step becomes part of a `Warning`. `note` gets a
+/// plain-language line for each milestone reached.
 pub async fn prepare(
     d: &Devices,
     c: &Config,
@@ -132,6 +142,7 @@ pub async fn prepare(
     levels: &mut LiveLevels,
     progress: impl Fn(Readiness),
     warn: impl Fn(String),
+    note: impl Fn(String),
 ) -> Readiness {
     let sa = &c.stream_atem;
     let mut problems = Vec::new();
@@ -139,26 +150,31 @@ pub async fn prepare(
 
     waiting("Capturing mic levels");
     if let Err(e) = levels.recapture(&*d.stream, &sa.mic_sources, down_threshold(sa.duck_db)).await {
-        note(&mut problems, &warn, format!("Could not read mic levels: {e}"));
+        problem(&mut problems, &warn, format!("Could not read mic levels: {e}"));
     }
 
     waiting("Putting the opening still on air");
+    let before = problems.len();
     if let Err(e) = d.stream.set_media_player_still(sa.media_player, sa.opening_still).await {
-        note(&mut problems, &warn, format!("Could not set the opening still: {e}"));
+        problem(&mut problems, &warn, format!("Could not set the opening still: {e}"));
     }
     let still_input = d.stream.media_player_input(sa.media_player);
     if let Err(e) = cut(&*d.stream, still_input).await {
-        note(&mut problems, &warn, format!("Could not cut the stream to the opening still: {e}"));
+        problem(&mut problems, &warn, format!("Could not cut the stream to the opening still: {e}"));
     }
 
     waiting("Fading the mics down");
     if let Err(e) = fade(&*d.stream, &sa.mic_sources, Target::Floor, sa.fade).await {
-        note(&mut problems, &warn, format!("Could not fade the mics down: {e}"));
+        problem(&mut problems, &warn, format!("Could not fade the mics down: {e}"));
+    }
+    if problems.len() == before {
+        note("Opening still on air · mics silent".into());
     }
 
     waiting("Starting the encoder");
-    if let Err(e) = d.encoder.start().await {
-        note(&mut problems, &warn, format!("Could not start the encoder: {e}"));
+    match d.encoder.start().await {
+        Ok(()) => note("Web Presenter streaming".into()),
+        Err(e) => problem(&mut problems, &warn, format!("Could not start the encoder: {e}")),
     }
 
     let deadline = Instant::now() + HEALTH_TIMEOUT;
@@ -170,7 +186,7 @@ pub async fn prepare(
         };
         if Instant::now() >= deadline {
             let msg = format!("YouTube is not receiving a healthy stream after 60 s ({last})");
-            note(&mut problems, &warn, msg);
+            problem(&mut problems, &warn, msg);
             break false;
         }
         progress(Readiness::Waiting(format!("Waiting for YouTube to receive the stream ({last})")));
@@ -178,10 +194,11 @@ pub async fn prepare(
     };
 
     if healthy {
+        note("YouTube receiving · private".into());
         let lc = match d.yt.life_cycle(bid).await {
             Ok(l) => Some(l),
             Err(e) => {
-                note(&mut problems, &warn, format!("Could not read the broadcast state: {e}"));
+                problem(&mut problems, &warn, format!("Could not read the broadcast state: {e}"));
                 None
             }
         };
@@ -189,7 +206,7 @@ pub async fn prepare(
         if !matches!(lc.as_deref(), Some("testing" | "live" | "testStarting" | "liveStarting")) {
             waiting("Starting the YouTube test");
             if let Err(e) = d.yt.transition(bid, Phase::Testing).await {
-                note(&mut problems, &warn, format!("Could not put the broadcast into testing: {e}"));
+                problem(&mut problems, &warn, format!("Could not put the broadcast into testing: {e}"));
             }
         }
     }
@@ -206,16 +223,29 @@ pub(crate) async fn cut(sw: &dyn Switcher, input: u16) -> Result<()> {
     sw.auto().await
 }
 
-fn joined(r: std::result::Result<Result<()>, JoinError>) -> Result<()> {
+/// An in-flight go-public; `Ok` holds how long it took.
+type GoPublicTask = JoinHandle<Result<Duration>>;
+
+fn joined(r: std::result::Result<Result<Duration>, JoinError>) -> Result<Duration> {
     r.unwrap_or_else(|e| Err(DeviceError::Other(format!("go public task failed: {e}"))))
 }
 
-fn spawn_go_public(d: &Devices, bid: &str) -> JoinHandle<Result<()>> {
+fn spawn_go_public(d: &Devices, bid: &str) -> GoPublicTask {
     let (d, bid) = (d.clone(), bid.to_string());
-    tokio::spawn(async move { go_public(&d, &bid).await })
+    tokio::spawn(async move {
+        let start = Instant::now();
+        go_public(&d, &bid).await.map(|()| start.elapsed())
+    })
+}
+
+/// The activity line for a go-public that worked after `took`.
+pub fn public_note(took: Duration) -> String {
+    format!("YouTube public (took {:.1} s)", took.as_secs_f32())
 }
 
 /// Stages 2-3: countdown video to the hall, public at the offset, T-0 on `Ended`.
+/// `progress` gets the stage every `COUNTER_TICK`; `report` gets the video's length
+/// once it plays, and a plain-language line for each milestone.
 #[allow(clippy::too_many_arguments)]
 pub async fn countdown(
     d: &Devices,
@@ -226,6 +256,7 @@ pub async fn countdown(
     cancel: CancellationToken,
     progress: impl Fn(Stage),
     warn: impl Fn(String),
+    report: impl Fn(CountdownReport),
 ) -> Result<CountdownOutcome> {
     let offset = c.timings.go_public_offset;
     if let Readiness::Warning(r) | Readiness::Waiting(r) = ready {
@@ -245,12 +276,13 @@ pub async fn countdown(
         warn(format!("Could not switch the hall to the countdown: {e}"));
     }
     if let Err(e) = d.player.play().await {
-        return video_failed(d, c, &progress, &warn, None, duration, e.to_string()).await;
+        return video_failed(d, c, &progress, &warn, &report, None, duration, e.to_string()).await;
     }
+    report(CountdownReport::Started(duration));
 
     let mut public = false;
     let mut pub_started = false;
-    let mut pub_task: Option<JoinHandle<Result<()>>> = None;
+    let mut pub_task: Option<GoPublicTask> = None;
     let mut remaining = duration;
     let mut counter_warned = false;
     let mut tick = interval(COUNTER_TICK);
@@ -278,12 +310,12 @@ pub async fn countdown(
             ev = events.recv() => match ev {
                 Ok(PlayerEvent::Ended) => break,
                 Ok(PlayerEvent::Error(e)) => {
-                    return video_failed(d, c, &progress, &warn, pub_task.take(), remaining, e).await;
+                    return video_failed(d, c, &progress, &warn, &report, pub_task.take(), remaining, e).await;
                 }
                 Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => {
                     let e = "the player went away".to_string();
-                    return video_failed(d, c, &progress, &warn, pub_task.take(), remaining, e).await;
+                    return video_failed(d, c, &progress, &warn, &report, pub_task.take(), remaining, e).await;
                 }
             },
             res = async {
@@ -294,7 +326,10 @@ pub async fn countdown(
             } => {
                 pub_task = None;
                 match joined(res) {
-                    Ok(()) => public = true,
+                    Ok(took) => {
+                        public = true;
+                        report(CountdownReport::Note(public_note(took)));
+                    }
                     Err(e) => warn(format!("Could not make the YouTube broadcast public: {e}")),
                 }
                 progress(Stage::Countdown { remaining, public });
@@ -320,7 +355,7 @@ pub async fn countdown(
         warn("The countdown ended before the broadcast went public; going public now".into());
         pub_task = Some(spawn_go_public(d, bid));
     }
-    let r = t0(d, c, levels).await;
+    let r = t0_reporting(d, c, levels, |m| report(CountdownReport::Note(m))).await;
     let mics_failed = r.as_ref().err().is_some_and(|e| e.mics_failed);
     let on_air = match &r {
         Ok(()) => true,
@@ -335,7 +370,7 @@ pub async fn countdown(
         // LIVE is reported as soon as the cut is done; YouTube never holds it back.
         progress(Stage::Live);
     }
-    let settled = settle_go_public(pub_task.take(), &warn).await;
+    let settled = settle_go_public(pub_task.take(), &warn, &report).await;
     if let Err(e) = r
         && !e.on_air
     {
@@ -346,11 +381,18 @@ pub async fn countdown(
 
 /// Waits at most `GO_PUBLIC_WAIT` for an in-flight `go_public`; on timeout it is
 /// aborted, never left detached. `Some(public)` if there was a task, else `None`.
-async fn settle_go_public(task: Option<JoinHandle<Result<()>>>, warn: &impl Fn(String)) -> Option<bool> {
+async fn settle_go_public(
+    task: Option<GoPublicTask>,
+    warn: &impl Fn(String),
+    report: &impl Fn(CountdownReport),
+) -> Option<bool> {
     let mut t = task?;
     match tokio::time::timeout(GO_PUBLIC_WAIT, &mut t).await {
         Ok(res) => match joined(res) {
-            Ok(()) => Some(true),
+            Ok(took) => {
+                report(CountdownReport::Note(public_note(took)));
+                Some(true)
+            }
             Err(e) => {
                 warn(format!("Could not make the YouTube broadcast public: {e}"));
                 Some(false)
@@ -369,12 +411,14 @@ async fn settle_go_public(task: Option<JoinHandle<Result<()>>>, warn: &impl Fn(S
 
 /// The countdown video failed (or would not play): return the hall exactly as Stop
 /// Countdown does, settle any in-flight go-public, and hand back to the operator.
+#[allow(clippy::too_many_arguments)]
 async fn video_failed(
     d: &Devices,
     c: &Config,
     progress: &impl Fn(Stage),
     warn: &impl Fn(String),
-    pub_task: Option<JoinHandle<Result<()>>>,
+    report: &impl Fn(CountdownReport),
+    pub_task: Option<GoPublicTask>,
     remaining: Duration,
     err: String,
 ) -> Result<CountdownOutcome> {
@@ -390,7 +434,7 @@ async fn video_failed(
     if let Err(e) = d.player.stop().await {
         warn(format!("Could not stop the countdown video: {e}"));
     }
-    if let Some(public) = settle_go_public(pub_task, warn).await {
+    if let Some(public) = settle_go_public(pub_task, warn, report).await {
         progress(Stage::Countdown { remaining, public });
     }
     Err(DeviceError::Other(format!("countdown video failed: {err}")))
@@ -451,19 +495,34 @@ impl std::error::Error for T0Error {}
 /// does not wait out the 1 s mic fade, as for roll-ins), then counter off.
 /// Mics come up only if the stream cut succeeded. Every step is attempted.
 pub async fn t0(d: &Devices, c: &Config, levels: &LiveLevels) -> std::result::Result<(), T0Error> {
+    t0_reporting(d, c, levels, |_| {}).await
+}
+
+/// `t0`, also giving `note` one plain line saying what went on air once the stream
+/// cut has succeeded, e.g. "Live · Cam 1 on air · mics up · hall → input 6".
+pub async fn t0_reporting(
+    d: &Devices,
+    c: &Config,
+    levels: &LiveLevels,
+    note: impl Fn(String),
+) -> std::result::Result<(), T0Error> {
     let sa = &c.stream_atem;
+    // Ok holds the live input now on program.
     let stream_cut = async {
-        let pv = d.stream.preview().await.ok();
-        if !pv.is_some_and(|p| sa.live_inputs.contains(&p)) {
-            d.stream.set_preview(sa.default_live_input).await?;
-        }
-        d.stream.auto().await
+        let input = match d.stream.preview().await.ok().filter(|p| sa.live_inputs.contains(p)) {
+            Some(p) => p,
+            None => {
+                d.stream.set_preview(sa.default_live_input).await?;
+                sa.default_live_input
+            }
+        };
+        d.stream.auto().await.map(|()| input)
     }
     .await;
     let mut failures = Vec::new();
     let mics_up = async {
         match &stream_cut {
-            Ok(()) => Some(fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await),
+            Ok(_) => Some(fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await),
             Err(_) => None,
         }
     };
@@ -472,6 +531,14 @@ pub async fn t0(d: &Devices, c: &Config, levels: &LiveLevels) -> std::result::Re
         failures.push(format!("Could not cut the stream to live action: {e}"));
     }
     let mics_failed = matches!(faded, Some(Err(_)));
+    if let Ok(input) = &stream_cut {
+        let mics = if mics_failed { "mics still down" } else { "mics up" };
+        let hall = match &hall {
+            Ok(()) => format!("hall → input {}", c.screens_atem.t0_input),
+            Err(_) => "hall not switched".into(),
+        };
+        note(format!("Live · Cam {input} on air · {mics} · {hall}"));
+    }
     if let Some(Err(e)) = faded {
         failures.push(format!("Could not fade the mics up: {e}"));
     }
@@ -547,7 +614,7 @@ mod tests {
         let (warns, w) = sink();
         let cancel = CancellationToken::new();
         let (d, c, tok) = (d.clone(), c.clone(), cancel.clone());
-        let task = tokio::spawn(async move { countdown(&d, &c, "b", &ready, &levels, tok, p, w).await });
+        let task = tokio::spawn(async move { countdown(&d, &c, "b", &ready, &levels, tok, p, w, |_| {}).await });
         Run { task, stages, warns, cancel }
     }
 
@@ -583,7 +650,7 @@ mod tests {
         let mut levels = LiveLevels::default();
         let (progress, p) = sink();
         let (warns, w) = sink();
-        let r = prepare(&d, &c, "b", &mut levels, p, w).await;
+        let r = prepare(&d, &c, "b", &mut levels, p, w, |_| {}).await;
         assert_eq!(r, Readiness::Ready);
         assert_eq!(levels.0[&MIC], -3.0);
         let calls = log.calls();
@@ -619,7 +686,7 @@ mod tests {
         c.stream_atem.duck_db = -20.0;
         h.stream.set_audio_level_state(MIC, -3.0);
         let mut levels = LiveLevels::default();
-        prepare(&d, &c, "b", &mut levels, |_| {}, |_| {}).await;
+        prepare(&d, &c, "b", &mut levels, |_| {}, |_| {}, |_| {}).await;
         assert!(log.calls().contains(&Call::StreamSetAudioLevel(MIC, FLOOR_DB)), "{:?}", log.calls());
         assert_eq!(levels.0[&MIC], -3.0);
     }
@@ -630,7 +697,7 @@ mod tests {
             let (d, log, h) = fake_devices();
             h.yt.set_life_cycle(lc);
             let mut levels = LiveLevels::default();
-            let r = prepare(&d, &Config::default(), "b", &mut levels, |_| {}, |_| {}).await;
+            let r = prepare(&d, &Config::default(), "b", &mut levels, |_| {}, |_| {}, |_| {}).await;
             assert_eq!(r, Readiness::Ready);
             assert!(yt_calls(&log.calls()).is_empty(), "{lc}");
             assert!(log.calls().contains(&Call::EncoderStart));
@@ -645,7 +712,7 @@ mod tests {
         let (progress, p) = sink();
         let (warns, w) = sink();
         let start = Instant::now();
-        let r = prepare(&d, &Config::default(), "b", &mut levels, p, w).await;
+        let r = prepare(&d, &Config::default(), "b", &mut levels, p, w, |_| {}).await;
         let took = start.elapsed();
         assert!(matches!(r, Readiness::Warning(_)), "{r:?}");
         assert!(took >= Duration::from_secs(60) && took < Duration::from_secs(62), "{took:?}");
@@ -666,7 +733,7 @@ mod tests {
         });
         let mut levels = LiveLevels::default();
         let start = Instant::now();
-        let r = prepare(&d, &Config::default(), "b", &mut levels, |_| {}, |_| {}).await;
+        let r = prepare(&d, &Config::default(), "b", &mut levels, |_| {}, |_| {}, |_| {}).await;
         assert_eq!(r, Readiness::Ready);
         assert!(start.elapsed() < Duration::from_secs(10));
         assert_eq!(yt_calls(&log.calls()), vec![Call::YtTransition(Phase::Testing)]);
