@@ -307,12 +307,25 @@ pub async fn countdown(
         pub_task = Some(spawn_go_public(d, bid));
     }
     let r = t0(d, c, levels).await;
-    if r.is_ok() {
+    let on_air = match &r {
+        Ok(()) => true,
+        Err(e) => {
+            if e.on_air {
+                warn(format!("Live, but some T-0 steps failed: {e}"));
+            }
+            e.on_air
+        }
+    };
+    if on_air {
         // LIVE is reported as soon as the cut is done; YouTube never holds it back.
         progress(Stage::Live);
     }
     let settled = settle_go_public(pub_task.take(), &warn).await;
-    r?;
+    if let Err(e) = r
+        && !e.on_air
+    {
+        return Err(DeviceError::Other(e.to_string()));
+    }
     Ok(CountdownOutcome::Live { public: settled.unwrap_or(public) })
 }
 
@@ -400,9 +413,26 @@ pub(crate) async fn transition_with_retry(d: &Devices, bid: &str, to: Phase) -> 
     }
 }
 
+/// Some T-0 steps failed. `on_air` says whether the stream cut to live action
+/// itself succeeded: if it did, the service is live and only later steps failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct T0Error {
+    pub on_air: bool,
+    /// One message per failed step, in order.
+    pub failures: Vec<String>,
+}
+
+impl std::fmt::Display for T0Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.failures.join("; "))
+    }
+}
+
+impl std::error::Error for T0Error {}
+
 /// T-0: stream to live action, mics up, hall to `t0_input`, counter off.
-/// Mics come up only if the stream cut succeeded. Returns the first error.
-pub async fn t0(d: &Devices, c: &Config, levels: &LiveLevels) -> Result<()> {
+/// Mics come up only if the stream cut succeeded. Every step is attempted.
+pub async fn t0(d: &Devices, c: &Config, levels: &LiveLevels) -> std::result::Result<(), T0Error> {
     let sa = &c.stream_atem;
     let stream_cut = async {
         let pv = d.stream.preview().await.ok();
@@ -412,19 +442,22 @@ pub async fn t0(d: &Devices, c: &Config, levels: &LiveLevels) -> Result<()> {
         d.stream.auto().await
     }
     .await;
-    let mut first_err = stream_cut.as_ref().err().cloned();
-    if stream_cut.is_ok()
-        && let Err(e) = fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await
-    {
-        first_err.get_or_insert(e);
+    let mut failures = Vec::new();
+    match &stream_cut {
+        Ok(()) => {
+            if let Err(e) = fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
+                failures.push(format!("Could not fade the mics up: {e}"));
+            }
+        }
+        Err(e) => failures.push(format!("Could not cut the stream to live action: {e}")),
     }
     if let Err(e) = cut(&*d.screens, c.screens_atem.t0_input).await {
-        first_err.get_or_insert(e);
+        failures.push(format!("Could not switch the hall screens: {e}"));
     }
     if let Err(e) = d.counter.clear().await {
-        first_err.get_or_insert(e);
+        failures.push(format!("Could not clear the counter: {e}"));
     }
-    first_err.map_or(Ok(()), Err)
+    if failures.is_empty() { Ok(()) } else { Err(T0Error { on_air: stream_cut.is_ok(), failures }) }
 }
 
 #[cfg(test)]
@@ -842,5 +875,40 @@ mod tests {
         assert!(start.elapsed() <= GO_PUBLIC_WAIT);
         let warns = run.warns.lock().unwrap();
         assert!(warns.iter().any(|w| w.contains("public")), "{warns:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t0_reports_on_air_when_only_later_steps_fail() {
+        let (d, _log, h) = fake_devices();
+        h.counter.fail_next("clear");
+        let e = t0(&d, &Config::default(), &LiveLevels::default()).await.unwrap_err();
+        assert!(e.on_air, "{e:?}");
+        assert_eq!(e.failures.len(), 1, "{e:?}");
+        assert!(e.failures[0].contains("counter"), "{e:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t0_stream_cut_failure_is_not_on_air() {
+        let (d, log, h) = fake_devices();
+        h.stream.fail_next("auto");
+        let e = t0(&d, &Config::default(), &LiveLevels::default()).await.unwrap_err();
+        assert!(!e.on_air, "{e:?}");
+        // Mics stay down; the hall and the counter are still handled.
+        assert!(!log.calls().iter().any(|c| matches!(c, Call::StreamSetAudioLevel(..))));
+        assert!(log.calls().contains(&Call::CounterClear));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn countdown_t0_partial_failure_is_live_with_warning() {
+        let (d, _log, h) = fake_devices();
+        h.player.set_position(Some(MS(50_000)));
+        let run = spawn_countdown(&d, &Config::default(), Readiness::Ready, LiveLevels::default());
+        sleep(MS(300)).await;
+        h.counter.fail_next("clear");
+        h.player.emit(PlayerEvent::Ended);
+        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: true });
+        assert_eq!(run.stages.lock().unwrap().last(), Some(&Stage::Live));
+        let warns = run.warns.lock().unwrap();
+        assert!(warns.iter().any(|w| w.contains("counter")), "{warns:?}");
     }
 }

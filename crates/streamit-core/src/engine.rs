@@ -10,7 +10,7 @@ use crate::audio::LiveLevels;
 use crate::config::Config;
 use crate::devices::{self, BroadcastCheck, BroadcastSummary, DeviceError, Devices, Fix, Phase};
 use crate::end::{EndOutcome, end_service};
-use crate::golive::{self, CountdownOutcome, Readiness, Stage, Stage0Report};
+use crate::golive::{self, CountdownOutcome, Readiness, Stage, Stage0Report, T0Error};
 use crate::recovery::{self, Assessment, Offer};
 use crate::rollin::{self, Cue, CueList, CueState, RollinOutcome};
 use std::collections::BTreeMap;
@@ -103,6 +103,7 @@ impl Default for Snapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashKey {
     GoLive,
+    Recover,
 }
 
 pub struct EngineHandle {
@@ -113,12 +114,19 @@ pub struct EngineHandle {
 /// The snapshot, shared with the sequence tasks so they can publish progress.
 type Shared = Arc<watch::Sender<Snapshot>>;
 
-/// The sequence that makes the engine busy.
+/// The one sequence that may run at a time. Every press that starts a sequence
+/// is ignored while another runs (`busy`), with the documented exceptions:
+/// Go Live pre-empts a countdown, and End Service and Recover during a video
+/// stop it and wait for its return path.
 enum Job {
     Prepare,
     Countdown { cancel: CancellationToken },
     End { skip: Arc<Notify> },
     Video { index: usize, stop: CancellationToken, unmute: Arc<Notify> },
+    /// T-0 by hand. `preempt_public` is set when it pre-empted a countdown:
+    /// whether that countdown had made the broadcast public.
+    GoLive { preempt_public: Option<bool> },
+    Recover,
 }
 
 impl Job {
@@ -128,6 +136,8 @@ impl Job {
             Job::Countdown { .. } => "the countdown",
             Job::End { .. } => "End Service",
             Job::Video { .. } => "a video",
+            Job::GoLive { .. } => "Go Live",
+            Job::Recover => "Recover",
         }
     }
 }
@@ -143,6 +153,8 @@ enum Done {
     Countdown { result: devices::Result<CountdownOutcome>, public: bool, before: Stage },
     Ended(EndOutcome),
     Video { index: usize, outcome: RollinOutcome },
+    WentLive { result: Result<(), T0Error>, preempt_public: Option<bool> },
+    Recovered { ok: bool, assessment: Assessment },
 }
 
 struct Refreshed {
@@ -155,12 +167,10 @@ struct Refreshed {
     assessment: Assessment,
 }
 
-/// Results of side tasks that change engine state, applied by the loop.
+/// Results of side tasks, applied by the loop.
 enum Aux {
     Checked { sel_gen: u64, check: Result<BroadcastCheck, String> },
     Refreshed(Box<Refreshed>),
-    Recovered { epoch: u64, ok: bool, assessment: Assessment },
-    WentLive(devices::Result<()>),
     ClearFlash(u64),
     ClearKeyFlash(u64),
 }
@@ -181,22 +191,18 @@ pub struct Engine {
     cues: CueList,
     broadcasts: Vec<BroadcastSummary>,
     running: Option<Running>,
-    /// Bumped when a job starts or finishes and when Go Live lands. An assessment
-    /// started under an older epoch may not set the stage, and only adds offers.
+    /// Bumped when a job starts or finishes. A Refresh assessment started under
+    /// an older epoch may not set the stage, and only adds offers.
     epoch: u64,
     /// Bumped on every Select Broadcast; older check and refresh results do not
     /// change the selection.
     sel_gen: u64,
-    /// End Service waits for the running video, Recover and Go Live.
-    end_pending: bool,
-    /// Go Live waits for the countdown it pre-empted to run its cancel path.
+    /// Go Live is waiting for the countdown it pre-empted to run its cancel path.
     golive_pending: bool,
-    golive_in_flight: bool,
-    /// Set when Go Live pre-empted a countdown: whether that countdown had gone public.
-    preempt_public: Option<bool>,
-    /// Recover waits for the running video's return path.
+    /// Recover / End Service are waiting for the running video's return path
+    /// (Recover first, then End).
     recover_pending: bool,
-    recover_in_flight: bool,
+    end_pending: bool,
     flash_gen: u64,
     key_flash_gen: u64,
     aux: mpsc::UnboundedSender<Aux>,
@@ -221,12 +227,9 @@ impl Engine {
             running: None,
             epoch: 0,
             sel_gen: 0,
-            end_pending: false,
             golive_pending: false,
-            golive_in_flight: false,
-            preempt_public: None,
             recover_pending: false,
-            recover_in_flight: false,
+            end_pending: false,
             flash_gen: 0,
             key_flash_gen: 0,
             aux,
@@ -324,9 +327,6 @@ impl Engine {
                 if let Some(why) = self.busy() {
                     return self.ignore(&cmd, &why);
                 }
-                if self.golive_in_flight {
-                    return self.ignore(&cmd, "Go Live is in progress");
-                }
                 if matches!(self.stage(), Stage::Countdown { .. } | Stage::Live) {
                     return self.ignore(&cmd, "the service is counting down or live");
                 }
@@ -335,9 +335,6 @@ impl Engine {
             Command::Countdown => {
                 if let Some(why) = self.busy() {
                     return self.ignore(&cmd, &why);
-                }
-                if self.golive_in_flight {
-                    return self.ignore(&cmd, "Go Live is in progress");
                 }
                 let before = self.stage();
                 if matches!(before, Stage::Live | Stage::Ending { .. }) {
@@ -353,6 +350,7 @@ impl Engine {
                 _ => self.ignore(&cmd, "no countdown is running"),
             },
             Command::EndService => match &self.running {
+                None => self.start_end(),
                 Some(Running { job: Job::End { skip }, .. }) => {
                     info!("End Service pressed again: skipping the closing hold");
                     skip.notify_one();
@@ -366,18 +364,10 @@ impl Engine {
                     let why = format!("{} is running", r.job.name());
                     self.ignore(&cmd, &why);
                 }
-                None => {
-                    self.end_pending = true;
-                    if self.recover_in_flight || self.golive_in_flight {
-                        info!("End Service will run once Recover / Go Live has finished");
-                    }
-                    self.maybe_start_end();
-                }
             },
             Command::PlayCue(i) => {
                 let i = *i;
-                let why = self.busy().or_else(|| self.recover_in_flight.then(|| "Recover is running".to_string()));
-                if let Some(why) = why {
+                if let Some(why) = self.busy() {
                     self.flash(i);
                     return self.ignore(&cmd, &why);
                 }
@@ -396,53 +386,47 @@ impl Engine {
                 _ => self.ignore(&cmd, "no video is playing"),
             },
             Command::GoPublic => self.spawn_go_public(),
+            Command::EndBroadcast => self.spawn_end_broadcast(),
             Command::GoLive => {
-                if self.golive_in_flight {
-                    return self.ignore(&cmd, "Go Live is already in progress");
+                if matches!(self.stage(), Stage::Ending { .. } | Stage::Ended) {
+                    self.flash_key(FlashKey::GoLive);
+                    return self.ignore(&cmd, "the service has ended");
                 }
-                // R14: only when idle, or pre-empting a countdown. Never alongside
-                // Prepare, End Service or a video (stop the video first).
                 match &self.running {
-                    None => {
-                        self.golive_in_flight = true;
-                        self.spawn_t0();
-                    }
-                    Some(Running { job: Job::Countdown { cancel }, .. }) => {
+                    None => self.start_golive(None),
+                    Some(Running { job: Job::Countdown { cancel }, .. }) if !self.golive_pending => {
                         info!("Go Live during the countdown: stopping the countdown first");
                         cancel.cancel();
-                        self.golive_in_flight = true;
                         self.golive_pending = true;
                     }
                     Some(r) => {
-                        let why = format!("{} is running", r.job.name());
+                        let why = if self.golive_pending {
+                            "Go Live is already in progress".to_string()
+                        } else {
+                            format!("{} is running", r.job.name())
+                        };
                         self.flash_key(FlashKey::GoLive);
                         self.ignore(&cmd, &why);
                     }
                 }
             }
-            Command::EndBroadcast => self.spawn_end_broadcast(),
-            Command::Recover => {
-                if self.recover_in_flight {
-                    return self.ignore(&cmd, "Recover is already in progress");
+            Command::Recover => match &self.running {
+                None => self.start_recover(),
+                Some(Running { job: Job::Video { stop, .. }, .. }) if !self.recover_pending => {
+                    info!("Recover during a video: stopping the video first");
+                    stop.cancel();
+                    self.recover_pending = true;
                 }
-                // R14: ignored while Prepare, the countdown or End Service runs.
-                match &self.running {
-                    None => {
-                        self.recover_in_flight = true;
-                        self.spawn_recover();
-                    }
-                    Some(Running { job: Job::Video { stop, .. }, .. }) => {
-                        info!("Recover during a video: stopping the video first");
-                        stop.cancel();
-                        self.recover_in_flight = true;
-                        self.recover_pending = true;
-                    }
-                    Some(r) => {
-                        let why = format!("{} is running", r.job.name());
-                        self.ignore(&cmd, &why);
-                    }
+                Some(r) => {
+                    let why = if self.recover_pending {
+                        "Recover is already waiting for the video".to_string()
+                    } else {
+                        format!("{} is running", r.job.name())
+                    };
+                    self.flash_key(FlashKey::Recover);
+                    self.ignore(&cmd, &why);
                 }
-            }
+            },
             Command::SelectBroadcast(id) => {
                 self.sel_gen += 1;
                 let b = self.summary_for(id);
@@ -498,7 +482,7 @@ impl Engine {
         });
     }
 
-    // ---- busy jobs ----
+    // ---- jobs ----
 
     fn start_prepare(&mut self) {
         let (d, c, snap, levels, bid) = (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone(), self.bid());
@@ -584,6 +568,34 @@ impl Engine {
         self.begin(Job::Video { index, stop, unmute }, handle);
     }
 
+    fn start_golive(&mut self, preempt_public: Option<bool>) {
+        let (d, c, levels) = (self.d.clone(), self.config(), self.levels.clone());
+        let handle = tokio::spawn(async move {
+            let l = lock(&levels).clone();
+            let result = golive::t0(&d, &c, &l).await;
+            Done::WentLive { result, preempt_public }
+        });
+        self.begin(Job::GoLive { preempt_public }, handle);
+    }
+
+    fn start_recover(&mut self) {
+        let (d, c, snap, levels, bid) = (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone(), self.selected());
+        let handle = tokio::spawn(async move {
+            let l = lock(&levels).clone();
+            let ok = match recovery::recover(&d, &c, &l).await {
+                Ok(()) => true,
+                Err(e) => {
+                    set_warning(&snap, format!("Recover could not finish: {e}"));
+                    false
+                }
+            };
+            // Recover never runs alongside a video, so no player is active.
+            let assessment = recovery::assess(&d, &c, bid.as_deref(), false).await;
+            Done::Recovered { ok, assessment }
+        });
+        self.begin(Job::Recover, handle);
+    }
+
     fn finish(&mut self, res: Result<Done, JoinError>) {
         let Some(Running { job, .. }) = self.running.take() else { return };
         self.epoch += 1;
@@ -592,6 +604,13 @@ impl Engine {
             Ok(Done::Countdown { result, public, before }) => self.finish_countdown(result, public, before),
             Ok(Done::Ended(out)) => self.finish_end(out),
             Ok(Done::Video { index, outcome }) => self.finish_video(index, outcome),
+            Ok(Done::WentLive { result, preempt_public }) => self.finish_golive(result, preempt_public),
+            Ok(Done::Recovered { ok, assessment }) => {
+                if ok {
+                    self.set(|s| s.mics_ducked = false);
+                }
+                self.apply_assessment(assessment, self.epoch);
+            }
             Err(e) => {
                 warn!(job = job.name(), error = %e, "sequence task failed");
                 let reason = format!("{} stopped unexpectedly: {e}", job.name());
@@ -603,6 +622,10 @@ impl Engine {
                     Job::Countdown { .. } => {
                         self.finish_countdown(Err(DeviceError::Other(reason)), false, Stage::Idle)
                     }
+                    // Unknown whether the stream cut happened: treated as not on air.
+                    Job::GoLive { preempt_public } => {
+                        self.finish_golive(Err(T0Error { on_air: false, failures: vec![reason] }), preempt_public)
+                    }
                     _ => set_warning(&self.snap, reason),
                 }
             }
@@ -610,20 +633,14 @@ impl Engine {
         self.after_job();
     }
 
-    /// Run whatever was waiting for the job to finish.
+    /// Run what was waiting for a video's return path: Recover, then End Service.
     fn after_job(&mut self) {
         if self.running.is_some() {
             return;
         }
         if std::mem::take(&mut self.recover_pending) {
-            self.spawn_recover();
-        }
-        self.maybe_start_end();
-    }
-
-    fn maybe_start_end(&mut self) {
-        if self.end_pending && self.running.is_none() && !self.recover_in_flight && !self.golive_in_flight {
-            self.end_pending = false;
+            self.start_recover();
+        } else if std::mem::take(&mut self.end_pending) {
             self.start_end();
         }
     }
@@ -631,28 +648,21 @@ impl Engine {
     fn finish_countdown(&mut self, result: devices::Result<CountdownOutcome>, public: bool, before: Stage) {
         let golive = std::mem::take(&mut self.golive_pending);
         match result {
-            Ok(CountdownOutcome::Live { public }) => {
-                if golive {
-                    // The countdown reached T-0 itself before the cancel: no second t0.
-                    self.golive_in_flight = false;
+            // Reached T-0 by itself (even if Go Live was pressed meanwhile): no second t0.
+            Ok(CountdownOutcome::Live { public }) => self.set(|s| {
+                s.stage = Stage::Live;
+                remove(&mut s.offers, Offer::GoLive);
+                if public {
+                    remove(&mut s.offers, Offer::GoPublic);
+                } else {
+                    add(&mut s.offers, Offer::GoPublic);
                 }
-                self.set(|s| {
-                    s.stage = Stage::Live;
-                    remove(&mut s.offers, Offer::GoLive);
-                    if public {
-                        remove(&mut s.offers, Offer::GoPublic);
-                    } else {
-                        add(&mut s.offers, Offer::GoPublic);
-                    }
-                });
-            }
+            }),
             // Pre-empted by Go Live: the hall is back, so run t0 now. The stage is
-            // not restored, so nothing (e.g. Prepare) reopens before Live lands.
+            // not left on Countdown; the Go Live job's result sets the final one.
             Ok(CountdownOutcome::Stopped) if golive => {
-                // Not left on Countdown while t0 runs; t0's result sets the final stage.
                 self.set(|s| s.stage = Stage::Prepared(Readiness::Waiting("Going live".into())));
-                self.preempt_public = Some(public);
-                self.spawn_t0();
+                self.start_golive(Some(public));
             }
             Ok(CountdownOutcome::Stopped) => self.set(|s| s.stage = before),
             Err(e) => {
@@ -666,11 +676,40 @@ impl Engine {
                     s.last_warning = Some(msg);
                 });
                 if golive {
-                    self.preempt_public = Some(public);
-                    self.spawn_t0();
+                    self.start_golive(Some(public));
                 }
             }
         }
+    }
+
+    /// Live whenever the stream cut succeeded, even if later steps failed (then
+    /// with a warning). After a pre-empt that did not go public, Go Public is offered.
+    fn finish_golive(&mut self, result: Result<(), T0Error>, preempt_public: Option<bool>) {
+        let (on_air, warning) = match &result {
+            Ok(()) => (true, None),
+            Err(e) if e.on_air => (true, Some(format!("Live, but some T-0 steps failed: {e}"))),
+            Err(e) => (false, Some(format!("Go Live did not complete: {e}"))),
+        };
+        self.set(|s| {
+            if on_air {
+                s.stage = Stage::Live;
+                remove(&mut s.offers, Offer::GoLive);
+                match preempt_public {
+                    Some(false) => add(&mut s.offers, Offer::GoPublic),
+                    Some(true) => remove(&mut s.offers, Offer::GoPublic),
+                    None => {}
+                }
+            } else if let Some(public) = preempt_public {
+                s.stage = Stage::Prepared(Readiness::Warning(warning.clone().unwrap_or_default()));
+                add(&mut s.offers, Offer::GoLive);
+                if !public {
+                    add(&mut s.offers, Offer::GoPublic);
+                }
+            }
+            if let Some(w) = warning {
+                s.last_warning = Some(w);
+            }
+        });
     }
 
     fn finish_end(&mut self, out: EndOutcome) {
@@ -725,16 +764,6 @@ impl Engine {
         });
     }
 
-    /// T-0 for Go Live. Single-flight (`golive_in_flight`); the result is applied by the loop.
-    fn spawn_t0(&self) {
-        let (d, c, levels, aux) = (self.d.clone(), self.config(), self.levels.clone(), self.aux.clone());
-        tokio::spawn(async move {
-            let l = lock(&levels).clone();
-            let r = golive::t0(&d, &c, &l).await;
-            let _ = aux.send(Aux::WentLive(r));
-        });
-    }
-
     fn spawn_end_broadcast(&self) {
         let (d, snap, bid) = (self.d.clone(), self.snap.clone(), self.bid());
         tokio::spawn(async move {
@@ -742,25 +771,6 @@ impl Engine {
                 Ok(()) => snap.send_modify(|s| remove(&mut s.offers, Offer::EndBroadcast)),
                 Err(e) => set_warning(&snap, format!("Could not end the YouTube broadcast: {e}")),
             }
-        });
-    }
-
-    /// Recover, then re-assess. Single-flight (`recover_in_flight`).
-    fn spawn_recover(&self) {
-        let (d, c, snap, levels, aux) =
-            (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone(), self.aux.clone());
-        let (bid, player_active, epoch) = (self.selected(), self.video_running(), self.epoch);
-        tokio::spawn(async move {
-            let l = lock(&levels).clone();
-            let ok = match recovery::recover(&d, &c, &l).await {
-                Ok(()) => true,
-                Err(e) => {
-                    set_warning(&snap, format!("Recover could not finish: {e}"));
-                    false
-                }
-            };
-            let assessment = recovery::assess(&d, &c, bid.as_deref(), player_active).await;
-            let _ = aux.send(Aux::Recovered { epoch, ok, assessment });
         });
     }
 
@@ -796,48 +806,6 @@ impl Engine {
                 });
             }
             Aux::Refreshed(r) => self.apply_refresh(*r),
-            Aux::Recovered { epoch, ok, assessment } => {
-                self.recover_in_flight = false;
-                if ok {
-                    self.set(|s| s.mics_ducked = false);
-                }
-                self.apply_assessment(assessment, epoch);
-                self.maybe_start_end();
-            }
-            Aux::WentLive(r) => {
-                self.golive_in_flight = false;
-                // After a pre-empt: whether the countdown had gone public.
-                let preempt = self.preempt_public.take();
-                self.epoch += 1;
-                match r {
-                    Ok(()) if matches!(self.stage(), Stage::Ending { .. } | Stage::Ended) => {
-                        info!("Go Live finished after End Service; the stage stays as it is");
-                    }
-                    Ok(()) => self.set(|s| {
-                        s.stage = Stage::Live;
-                        remove(&mut s.offers, Offer::GoLive);
-                        match preempt {
-                            Some(false) => add(&mut s.offers, Offer::GoPublic),
-                            Some(true) => remove(&mut s.offers, Offer::GoPublic),
-                            None => {}
-                        }
-                    }),
-                    Err(e) => {
-                        let msg = format!("Go Live did not complete: {e}");
-                        self.set(|s| {
-                            if let Some(public) = preempt {
-                                s.stage = Stage::Prepared(Readiness::Warning(msg.clone()));
-                                add(&mut s.offers, Offer::GoLive);
-                                if !public {
-                                    add(&mut s.offers, Offer::GoPublic);
-                                }
-                            }
-                            s.last_warning = Some(msg);
-                        });
-                    }
-                }
-                self.maybe_start_end();
-            }
             Aux::ClearFlash(generation) => {
                 if generation == self.flash_gen {
                     self.set(|s| s.flash = None);
@@ -872,7 +840,7 @@ impl Engine {
     /// stale one (the epoch has moved on) never sets the stage and only adds offers.
     fn apply_assessment(&self, a: Assessment, epoch: u64) {
         let current = epoch == self.epoch;
-        let busy = self.running.is_some() || self.golive_in_flight;
+        let busy = self.running.is_some();
         if !current {
             info!("merging the offers of a stale assessment");
         }
@@ -1568,6 +1536,122 @@ mod tests {
         // Go Live may be pressed again.
         send(&e, Command::GoLive).await;
         until(&mut e, "Live", |s| s.stage == Stage::Live).await;
+    }
+
+    // ---- R15 ----
+
+    const IN8_OFF: Call = Call::StreamSetAudioOn(AudioSourceId { input: 8, source: -65280 }, false);
+
+    #[tokio::test(start_paused = true)]
+    async fn play_cue_ignored_while_go_live_runs() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![cue("a", Destination::HallAndOnline)]));
+        send(&e, Command::GoLive).await; // t0's mic fade takes 1 s
+        sleep(MS(100)).await;
+        send(&e, Command::PlayCue(0)).await;
+        until(&mut e, "cue flash", |s| s.flash == Some(0)).await;
+        until(&mut e, "Live", |s| s.stage == Stage::Live).await;
+        sleep(MS(500)).await;
+        assert_eq!(count(&log, |c| matches!(c, Call::PlayerLoad(..))), 0, "{:?}", log.calls());
+        assert_eq!(snap(&e).cues[0].1, CueState::Cued);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn go_live_and_recover_exclusive() {
+        // Go Live first: Recover is ignored and flashes.
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::GoLive).await;
+        sleep(MS(100)).await;
+        send(&e, Command::Recover).await;
+        until(&mut e, "Recover flash", |s| s.flash_key == Some(FlashKey::Recover)).await;
+        until(&mut e, "Live", |s| s.stage == Stage::Live).await;
+        sleep(Duration::from_secs(3)).await;
+        assert!(!log.calls().contains(&IN8_OFF), "{:?}", log.calls());
+
+        // Recover first: Go Live is ignored and flashes.
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Recover).await;
+        sleep(MS(100)).await;
+        send(&e, Command::GoLive).await;
+        until(&mut e, "Go Live flash", |s| s.flash_key == Some(FlashKey::GoLive)).await;
+        sleep(Duration::from_secs(3)).await;
+        assert!(log.calls().contains(&IN8_OFF), "{:?}", log.calls());
+        assert!(!log.calls().contains(&Call::CounterClear), "{:?}", log.calls());
+        assert_ne!(snap(&e).stage, Stage::Live);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prepare_ignored_while_recover_runs() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Recover).await;
+        sleep(MS(100)).await;
+        send(&e, Command::Prepare).await;
+        send(&e, Command::Countdown).await;
+        sleep(Duration::from_secs(3)).await;
+        assert!(log.calls().contains(&IN8_OFF));
+        assert!(!log.calls().contains(&Call::EncoderStart), "{:?}", log.calls());
+        assert_eq!(count(&log, |c| matches!(c, Call::PlayerLoad(..))), 0);
+        // Recover has finished: Prepare is accepted again.
+        send(&e, Command::Prepare).await;
+        until(&mut e, "Prepared", |s| s.stage == Stage::Prepared(Readiness::Ready)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn go_live_ignored_after_ended() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::EndService).await;
+        until(&mut e, "Ended", |s| s.stage == Stage::Ended).await;
+        let before = log.calls().len();
+        send(&e, Command::GoLive).await;
+        until(&mut e, "Go Live flash", |s| s.flash_key == Some(FlashKey::GoLive)).await;
+        sleep(Duration::from_secs(3)).await;
+        assert_eq!(log.calls().len(), before, "{:?}", log.calls());
+        assert_eq!(snap(&e).stage, Stage::Ended);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t0_partial_failure_after_cut_stays_live_with_warning() {
+        // Go Live from idle.
+        let (d, log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        h.counter.fail_next("clear");
+        send(&e, Command::GoLive).await;
+        let s = until(&mut e, "Live", |s| s.stage == Stage::Live).await;
+        assert!(s.last_warning.as_deref().is_some_and(|w| w.contains("counter")), "{:?}", s.last_warning);
+        send(&e, Command::Prepare).await;
+        sleep(Duration::from_secs(2)).await;
+        assert_eq!(snap(&e).stage, Stage::Live);
+        assert!(!log.calls().contains(&Call::EncoderStart));
+
+        // Go Live pre-empting a countdown.
+        let (d, _log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        h.screens.fail_times("set_preview", 1); // cancel path's hall return fails
+        h.counter.fail_times("clear", 2); // cancel path and t0 both fail to clear
+        send(&e, Command::GoLive).await;
+        let s = until(&mut e, "Live", |s| s.stage == Stage::Live).await;
+        assert!(s.last_warning.is_some());
+        sleep(Duration::from_secs(2)).await;
+        assert_eq!(snap(&e).stage, Stage::Live);
+
+        // The countdown's own T-0.
+        let (d, _log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        h.counter.fail_next("clear");
+        h.player.emit(PlayerEvent::Ended);
+        until(&mut e, "Live", |s| s.stage == Stage::Live).await;
+        sleep(Duration::from_secs(15)).await;
+        let s = snap(&e);
+        assert_eq!(s.stage, Stage::Live);
+        assert!(!s.offers.contains(&Offer::GoLive), "{:?}", s.offers);
     }
 
     #[tokio::test(start_paused = true)]
