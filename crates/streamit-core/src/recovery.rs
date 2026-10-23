@@ -5,6 +5,10 @@ use crate::config::{AudioSourceId, Config};
 use crate::devices::{Devices, EncoderStatus, Result};
 use crate::golive::{Readiness, Stage, cut};
 use crate::rollin::{STEREO_SOURCE, TRANSITION_TIMEOUT};
+use std::time::Duration;
+
+/// Longest `assess` waits for the broadcast's life cycle; past it the life cycle is unknown.
+pub const LIFE_CYCLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Offer {
@@ -18,6 +22,9 @@ pub enum Offer {
 pub struct Assessment {
     pub stage: Stage,
     pub offer: Vec<Offer>,
+    /// A broadcast was given but its life cycle could not be read (failed or timed
+    /// out), so the YouTube-based offers (Go Public, Go Live, End Broadcast) say nothing.
+    pub broadcast_unknown: bool,
 }
 
 /// Read every device and say what the operator may press. Read-only: no action
@@ -52,9 +59,10 @@ pub async fn assess(d: &Devices, c: &Config, bid: Option<&str>, player_active: b
         || mic_muted;
 
     let life_cycle = match bid {
-        Some(id) => d.yt.life_cycle(id).await.ok(),
+        Some(id) => tokio::time::timeout(LIFE_CYCLE_TIMEOUT, d.yt.life_cycle(id)).await.ok().and_then(|r| r.ok()),
         None => None,
     };
+    let broadcast_unknown = bid.is_some() && life_cycle.is_none();
     let lc = life_cycle.as_deref();
 
     let mut stage = Stage::Idle;
@@ -71,7 +79,7 @@ pub async fn assess(d: &Devices, c: &Config, bid: Option<&str>, player_active: b
         stage = Stage::Prepared(Readiness::Ready);
         offer.extend([Offer::GoPublic, Offer::GoLive]);
     }
-    Assessment { stage, offer }
+    Assessment { stage, offer, broadcast_unknown }
 }
 
 /// One-press fix for a crash during a video. Every step is attempted; failures
@@ -209,10 +217,21 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn slow_life_cycle_is_unknown_after_timeout() {
+        let (d, _l, h) = rig();
+        h.yt.set_life_cycle("live");
+        h.yt.set_delay("life_cycle", Duration::from_secs(60));
+        let start = tokio::time::Instant::now();
+        let a = assess(&d, &cfg(), Some("b"), false).await;
+        assert!(start.elapsed() <= LIFE_CYCLE_TIMEOUT + Duration::from_millis(100), "{:?}", start.elapsed());
+        assert_eq!(a, Assessment { stage: Stage::Idle, offer: vec![], broadcast_unknown: true });
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn quiet_start_is_idle_with_no_offers() {
         let (d, _l, _h) = rig();
         let a = assess(&d, &cfg(), None, false).await;
-        assert_eq!(a, Assessment { stage: Stage::Idle, offer: vec![] });
+        assert_eq!(a, Assessment { stage: Stage::Idle, offer: vec![], broadcast_unknown: false });
     }
 
     #[tokio::test(start_paused = true)]
@@ -300,7 +319,7 @@ mod tests {
         h.encoder.fail_next("status");
         h.yt.fail_next("life_cycle");
         let a = assess(&d, &cfg(), Some("b"), false).await;
-        assert_eq!(a, Assessment { stage: Stage::Idle, offer: vec![] });
+        assert_eq!(a, Assessment { stage: Stage::Idle, offer: vec![], broadcast_unknown: true });
     }
 
     #[tokio::test(start_paused = true)]

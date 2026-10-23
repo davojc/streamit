@@ -1075,7 +1075,8 @@ impl Engine {
                 0,
                 if startup {
                     format!(
-                        "The startup check did not finish reading YouTube within {secs} s; the equipment was still                          checked. Press Refresh to try again"
+                        "The startup check did not finish reading YouTube within {secs} s; the equipment was still \
+                         checked. Press Refresh to try again"
                     )
                 } else {
                     format!("Refresh did not finish reading YouTube within {secs} s; the equipment was still checked")
@@ -1103,7 +1104,9 @@ impl Engine {
     /// the stage is Idle (R20): an assessment can raise Idle to Prepared or Live, but
     /// never lowers Prepared/Countdown/Live/Ending/Ended, because a single failed read
     /// mid-service would otherwise show Idle. A stale one (the epoch has moved on)
-    /// never sets the stage and only adds offers.
+    /// never sets the stage and only adds offers. When the broadcast's life cycle could
+    /// not be read, the YouTube offers it would have decided are kept as they were;
+    /// Recover, which comes from the equipment alone, still follows the assessment.
     fn apply_assessment(&self, a: Assessment, epoch: u64) {
         let current = epoch == self.epoch;
         let busy = self.running.is_some();
@@ -1112,7 +1115,16 @@ impl Engine {
         }
         self.set(|s| {
             if current {
-                s.offers = a.offer;
+                if a.broadcast_unknown {
+                    info!("broadcast state unknown: keeping the YouTube offers");
+                    let kept: Vec<Offer> = s.offers.iter().copied().filter(|o| *o != Offer::Recover).collect();
+                    s.offers = a.offer;
+                    for o in kept {
+                        add(&mut s.offers, o);
+                    }
+                } else {
+                    s.offers = a.offer;
+                }
                 if !busy && s.stage == Stage::Idle {
                     if a.stage == Stage::Live {
                         log(s, "Found the service already live".into());
@@ -1188,8 +1200,9 @@ fn mss(d: Duration) -> String {
 
 /// Stage 0 plus assessment. Keeps `current` selected whatever the list says (R23);
 /// only an empty selection takes stage 0's choice. Only the YouTube part is bounded by
-/// `REFRESH_TIMEOUT`; on timeout the rest carries on with no broadcast, so the equipment
-/// assessment is always made (a crash left on the DeckLink still offers Recover).
+/// `REFRESH_TIMEOUT`; on timeout the rest carries on with the operator's selection (if
+/// any), so the equipment assessment is always made (a crash left on the DeckLink still
+/// offers Recover) and the selected broadcast's state is still asked for.
 async fn refresh(
     d: Devices,
     c: Config,
@@ -1198,6 +1211,7 @@ async fn refresh(
     epoch: u64,
     sel_gen: u64,
 ) -> Refreshed {
+    let kept = current.clone();
     let youtube = async {
         let mut report = golive::stage0_youtube(&d, &c).await;
         let selected = current.or_else(|| report.selected.clone());
@@ -1216,7 +1230,7 @@ async fn refresh(
     let (mut report, selected, check, youtube_timed_out) = match tokio::time::timeout(REFRESH_TIMEOUT, youtube).await
     {
         Ok((report, selected, check)) => (report, selected, check, false),
-        Err(_) => (Stage0Report::default(), None, None, true),
+        Err(_) => (Stage0Report::default(), kept, None, true),
     };
     report.device_errors.extend(golive::stage0_devices(&d).await);
     let assessment = recovery::assess(&d, &c, selected.as_deref(), player_active).await;
@@ -2222,7 +2236,13 @@ mod tests {
         let mut e = Engine::spawn(d, c);
         let s = until(&mut e, "Recover offered", |s| s.offers.contains(&Offer::Recover)).await;
         assert!(start.elapsed() <= REFRESH_TIMEOUT + Duration::from_secs(1), "took {:?}", start.elapsed());
-        assert!(s.last_warning.as_deref().is_some_and(|w| w.contains("YouTube")), "{:?}", s.last_warning);
+        assert_eq!(
+            s.last_warning.as_deref(),
+            Some(
+                "The startup check did not finish reading YouTube within 10 s; the equipment was still checked. \
+                 Press Refresh to try again"
+            )
+        );
 
         // A manual Refresh: the device reading still lands while YouTube is slow.
         h.stream.set_program_state(1);
@@ -2231,6 +2251,70 @@ mod tests {
         let s = until(&mut e, "Recover withdrawn", |s| !s.offers.contains(&Offer::Recover)).await;
         assert!(start.elapsed() <= REFRESH_TIMEOUT + Duration::from_secs(1), "took {:?}", start.elapsed());
         assert!(s.last_warning.as_deref().is_some_and(|w| w.contains("Refresh did not finish")), "{:?}", s.last_warning);
+    }
+
+    /// Live on the holding still after a restart (Go Live and End Broadcast offered). A
+    /// Refresh while YouTube is slow keeps the selection and those offers.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_with_slow_youtube_keeps_offers() {
+        for slow_life_cycle in [false, true] {
+            let (d, _log, h) = rig();
+            let c = cfg(vec![]);
+            let still = d.stream.media_player_input(c.read().unwrap().stream_atem.media_player);
+            h.stream.set_program_state(still);
+            h.encoder.set_status(crate::devices::EncoderStatus::Streaming);
+            h.yt.set_life_cycle("live");
+            let mut e = Engine::spawn(d, c);
+            let want = [Offer::GoLive, Offer::EndBroadcast];
+            let s = until(&mut e, "Live with offers", |s| {
+                s.stage == Stage::Live && want.iter().all(|o| s.offers.contains(o))
+            })
+            .await;
+            assert_eq!(selected_id(&s).as_deref(), Some("b1"));
+
+            h.yt.set_delay("upcoming", Duration::from_secs(60));
+            if slow_life_cycle {
+                h.yt.set_delay("life_cycle", Duration::from_secs(60));
+            }
+            let start = tokio::time::Instant::now();
+            send(&e, Command::Refresh).await;
+            let s = until(&mut e, "the refresh's warning", |s| {
+                s.last_warning.as_deref().is_some_and(|w| w.contains("Refresh did not finish"))
+            })
+            .await;
+            sleep(MS(100)).await;
+            let s2 = snap(&e);
+            let bound = REFRESH_TIMEOUT + recovery::LIFE_CYCLE_TIMEOUT + Duration::from_secs(1);
+            assert!(start.elapsed() <= bound, "slow life cycle {slow_life_cycle}: took {:?}", start.elapsed());
+            assert_eq!(selected_id(&s).as_deref(), Some("b1"), "slow life cycle {slow_life_cycle}");
+            assert!(s.check.is_some(), "slow life cycle {slow_life_cycle}: the last check is kept");
+            for o in want {
+                assert!(s2.offers.contains(&o), "slow life cycle {slow_life_cycle}: {o:?} dropped: {:?}", s2.offers);
+            }
+            assert_eq!(s2.stage, Stage::Live);
+        }
+    }
+
+    /// Only a foreign broadcast is active: nothing is selected, and Go Live goes on air
+    /// locally with the no-broadcast warning, never touching that broadcast.
+    #[tokio::test(start_paused = true)]
+    async fn stale_foreign_broadcast_not_selected_and_go_live_warns() {
+        let (d, log, h) = rig();
+        h.yt.set_upcoming(vec![BroadcastSummary {
+            life_cycle: "live".into(),
+            bound_stream_id: Some("someone-else".into()),
+            ..summary("foreign")
+        }]);
+        let c = cfg(vec![]);
+        c.write().unwrap().youtube.stream_id = Some("s1".into());
+        let mut e = Engine::spawn(d, c);
+        sleep(MS(500)).await;
+        assert_eq!(selected_id(&snap(&e)), None);
+        send(&e, Command::GoLive).await;
+        let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        assert_eq!(selected_id(&s), None);
+        assert_eq!(s.last_warning.as_deref(), Some(NO_BROADCAST));
+        assert_eq!(live_transitions(&log), 0, "{:?}", log.calls());
     }
 
     // ---- R23 ----
