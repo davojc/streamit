@@ -1,0 +1,10 @@
+[package]
+name = "streamit-videohub"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+streamit-core = { path = "../streamit-core" }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
+tracing = { workspace = true }

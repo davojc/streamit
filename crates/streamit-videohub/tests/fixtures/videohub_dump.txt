@@ -1,0 +1,26 @@
+PROTOCOL PREAMBLE:
+Version: 2.8
+
+VIDEOHUB DEVICE:
+Device present: true
+Model name: Blackmagic Smart Videohub 40x40
+Video inputs: 40
+Video outputs: 40
+
+INPUT LABELS:
+0 Camera 1
+7 Camera 8
+11 DeckLink
+
+OUTPUT LABELS:
+10 Stream ATEM 8
+
+VIDEO OUTPUT LOCKS:
+10 U
+
+VIDEO OUTPUT ROUTING:
+0 0
+1 1
+10 7
+39 39
+

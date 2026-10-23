@@ -28,4 +28,20 @@ Without `--features gst` the app wires a stand-in player and counter that report
 
 ## Probe your devices
 
-_To be filled in by later tasks (device discovery and probe instructions)._
+_More entries are added by later tasks (device discovery and the other probes)._
+
+### VideoHub
+
+Prints the raw dump the VideoHub sends on connect, then its routes (numbered from 1, as on the front panel):
+
+```
+cargo run -p streamit-videohub --example probe -- 192.168.4.100 dump
+```
+
+Save the raw dump over `crates/streamit-videohub/tests/fixtures/videohub_dump.txt` so the tests parse a real capture.
+
+To test a route (this really switches the router, so only do it when nothing live depends on that output):
+
+```
+cargo run -p streamit-videohub --example probe -- 192.168.4.100 route <output> <input>
+```
