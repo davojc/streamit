@@ -4311,6 +4311,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "streamit-sim"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "streamit-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "streamit-videohub"
 version = "0.1.0"
 dependencies = [
