@@ -47,6 +47,8 @@ pub enum Stage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stage0Report {
     pub signed_in: bool,
+    /// The broadcast list was read. When false, `broadcasts` is empty and says nothing.
+    pub listed: bool,
     pub broadcasts: Vec<BroadcastSummary>,
     pub selected: Option<String>,
     pub check: Option<BroadcastCheck>,
@@ -60,8 +62,19 @@ pub enum CountdownOutcome {
     Stopped,
 }
 
+/// The broadcast to select when none is: one already in testing or live and bound to
+/// our stream (R23: StreamIt restarted mid-service), else the first in the list.
+pub fn preferred_broadcast(list: &[BroadcastSummary], stream_id: Option<&str>) -> Option<String> {
+    let on_air = |b: &&BroadcastSummary| {
+        matches!(b.life_cycle.as_str(), "testing" | "live" | "testStarting" | "liveStarting")
+            && stream_id.is_some()
+            && b.bound_stream_id.as_deref() == stream_id
+    };
+    list.iter().find(on_air).or(list.first()).map(|b| b.id.clone())
+}
+
 /// Stage 0: read-only checks. Changes nothing on any device.
-pub async fn stage0(d: &Devices) -> Stage0Report {
+pub async fn stage0(d: &Devices, c: &Config) -> Stage0Report {
     let mut device_errors = Vec::new();
     let signed_in = match d.yt.signed_in().await {
         Ok(v) => v,
@@ -70,18 +83,18 @@ pub async fn stage0(d: &Devices) -> Stage0Report {
             false
         }
     };
-    let broadcasts = if signed_in {
+    let (listed, broadcasts) = if signed_in {
         match d.yt.upcoming().await {
-            Ok(v) => v,
+            Ok(v) => (true, v),
             Err(e) => {
                 device_errors.push(format!("YouTube broadcasts: {e}"));
-                Vec::new()
+                (false, Vec::new())
             }
         }
     } else {
-        Vec::new()
+        (false, Vec::new())
     };
-    let selected = broadcasts.first().map(|b| b.id.clone());
+    let selected = preferred_broadcast(&broadcasts, c.youtube.stream_id.as_deref());
     let check = match &selected {
         Some(id) => match d.yt.check(id).await {
             Ok(c) => Some(c),
@@ -101,7 +114,7 @@ pub async fn stage0(d: &Devices) -> Stage0Report {
     if let Err(e) = d.encoder.status().await {
         device_errors.push(format!("Encoder: {e}"));
     }
-    Stage0Report { signed_in, broadcasts, selected, check, device_errors }
+    Stage0Report { signed_in, listed, broadcasts, selected, check, device_errors }
 }
 
 fn note(problems: &mut Vec<String>, warn: &impl Fn(String), msg: String) {
@@ -530,14 +543,14 @@ mod tests {
             bound_stream_id: None,
         };
         h.yt.set_upcoming(vec![b("first"), b("second")]);
-        let r = stage0(&d).await;
+        let r = stage0(&d, &Config::default()).await;
         assert!(r.signed_in);
         assert_eq!(r.broadcasts.len(), 2);
         assert_eq!(r.selected.as_deref(), Some("first"));
         assert!(r.check.is_some());
         assert!(r.device_errors.is_empty(), "{:?}", r.device_errors);
         h.encoder.fail_next("status");
-        let r = stage0(&d).await;
+        let r = stage0(&d, &Config::default()).await;
         assert_eq!(r.device_errors.len(), 1);
         assert!(log.calls().is_empty());
     }

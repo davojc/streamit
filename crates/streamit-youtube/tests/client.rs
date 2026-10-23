@@ -59,12 +59,69 @@ async fn upcoming_sorted_by_scheduled_start() {
             broadcast("n", None, None)]})))
         .mount(&s)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/youtube/v3/liveBroadcasts"))
+        .and(query_param("broadcastStatus", "active"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[]})))
+        .mount(&s)
+        .await;
     let list = client(&s, Some("s1")).upcoming().await.unwrap();
     let ids: Vec<_> = list.iter().map(|b| b.id.as_str()).collect();
     assert_eq!(ids, ["a", "b", "n"]);
     assert_eq!(list[0].bound_stream_id.as_deref(), Some("s1"));
     assert_eq!(list[0].life_cycle, "ready");
     assert_eq!(list[0].title, "T a");
+}
+
+#[tokio::test]
+async fn upcoming_includes_active_broadcasts_deduped() {
+    let s = MockServer::start().await;
+    token_ok(&s).await;
+    let mut live = broadcast("live", Some("2026-11-01T09:00:00Z"), Some("s1"));
+    live["status"]["lifeCycleStatus"] = json!("live");
+    Mock::given(method("GET"))
+        .and(path("/youtube/v3/liveBroadcasts"))
+        .and(query_param("broadcastStatus", "upcoming"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[
+            broadcast("next", Some("2026-11-08T09:00:00Z"), None),
+            broadcast("dup", Some("2026-11-05T09:00:00Z"), None)]})))
+        .expect(1)
+        .mount(&s)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/youtube/v3/liveBroadcasts"))
+        .and(query_param("broadcastStatus", "active"))
+        .and(query_param("maxResults", "25"))
+        .and(query_param("part", "id,snippet,contentDetails,status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[
+            live.clone(),
+            broadcast("dup", Some("2026-11-05T09:00:00Z"), None)]})))
+        .expect(1)
+        .mount(&s)
+        .await;
+    let list = client(&s, Some("s1")).upcoming().await.unwrap();
+    let ids: Vec<_> = list.iter().map(|b| b.id.as_str()).collect();
+    assert_eq!(ids, ["live", "dup", "next"]);
+    assert_eq!(list[0].life_cycle, "live");
+}
+
+#[tokio::test]
+async fn upcoming_fails_when_active_list_fails() {
+    let s = MockServer::start().await;
+    token_ok(&s).await;
+    Mock::given(method("GET"))
+        .and(path("/youtube/v3/liveBroadcasts"))
+        .and(query_param("broadcastStatus", "upcoming"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[broadcast("a", None, None)]})))
+        .mount(&s)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/youtube/v3/liveBroadcasts"))
+        .and(query_param("broadcastStatus", "active"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&s)
+        .await;
+    assert!(client(&s, Some("s1")).upcoming().await.is_err());
 }
 
 #[tokio::test]

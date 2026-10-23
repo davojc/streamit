@@ -118,6 +118,37 @@ impl YouTubeClient {
             .collect())
     }
 
+    /// One `liveBroadcasts.list` page filtered by `broadcastStatus` (`upcoming` or `active`).
+    async fn list_broadcasts(&self, status: &str) -> Result<Vec<BroadcastSummary>> {
+        let v = self
+            .call(
+                Method::GET,
+                "liveBroadcasts",
+                &[
+                    ("part", "id,snippet,contentDetails,status"),
+                    ("broadcastStatus", status),
+                    ("maxResults", "25"),
+                ],
+                None,
+            )
+            .await?;
+        Ok(v["items"]
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|b| {
+                Some(BroadcastSummary {
+                    id: b["id"].as_str()?.to_string(),
+                    title: b["snippet"]["title"].as_str().unwrap_or("").to_string(),
+                    scheduled_start: b["snippet"]["scheduledStartTime"].as_str().map(String::from),
+                    life_cycle: b["status"]["lifeCycleStatus"].as_str().unwrap_or("").to_string(),
+                    bound_stream_id: b["contentDetails"]["boundStreamId"].as_str().map(String::from),
+                })
+            })
+            .collect())
+    }
+
     async fn broadcast(&self, id: &str, part: &str) -> Result<Value> {
         let v = self
             .call(Method::GET, "liveBroadcasts", &[("part", part), ("id", id)], None)
@@ -155,34 +186,15 @@ impl Broadcasts for YouTubeClient {
         self.auth.signed_in().await
     }
 
+    /// R23: the channel's upcoming and active (live) broadcasts, merged and deduped by
+    /// id, so the broadcast that is on air stays in the list. Fails if either list fails.
     async fn upcoming(&self) -> Result<Vec<BroadcastSummary>> {
-        let v = self
-            .call(
-                Method::GET,
-                "liveBroadcasts",
-                &[
-                    ("part", "id,snippet,contentDetails,status"),
-                    ("broadcastStatus", "upcoming"),
-                    ("maxResults", "25"),
-                ],
-                None,
-            )
-            .await?;
-        let mut list: Vec<BroadcastSummary> = v["items"]
-            .as_array()
-            .map(|a| a.as_slice())
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|b| {
-                Some(BroadcastSummary {
-                    id: b["id"].as_str()?.to_string(),
-                    title: b["snippet"]["title"].as_str().unwrap_or("").to_string(),
-                    scheduled_start: b["snippet"]["scheduledStartTime"].as_str().map(String::from),
-                    life_cycle: b["status"]["lifeCycleStatus"].as_str().unwrap_or("").to_string(),
-                    bound_stream_id: b["contentDetails"]["boundStreamId"].as_str().map(String::from),
-                })
-            })
-            .collect();
+        let mut list = self.list_broadcasts("active").await?;
+        for b in self.list_broadcasts("upcoming").await? {
+            if !list.iter().any(|x| x.id == b.id) {
+                list.push(b);
+            }
+        }
         // RFC 3339 UTC strings sort chronologically; unscheduled broadcasts go last.
         list.sort_by(|a, b| {
             a.scheduled_start.is_none().cmp(&b.scheduled_start.is_none())

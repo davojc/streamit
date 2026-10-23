@@ -311,8 +311,11 @@ impl Engine {
         info!(command = ?cmd, reason = why, "command ignored");
     }
 
+    /// The summary for `id` from the last list read, else the one the snapshot already
+    /// shows for it, else a bare one titled with the id.
     fn summary_for(&self, id: &str) -> BroadcastSummary {
-        self.broadcasts.iter().find(|b| b.id == id).cloned().unwrap_or_else(|| BroadcastSummary {
+        let shown = self.snap.borrow().broadcast.clone().filter(|b| b.id == id);
+        self.broadcasts.iter().find(|b| b.id == id).cloned().or(shown).unwrap_or_else(|| BroadcastSummary {
             id: id.into(),
             title: id.into(),
             scheduled_start: None,
@@ -857,15 +860,23 @@ impl Engine {
         }
     }
 
+    /// R23: a refresh never replaces or clears the operator's selection. It only fills an
+    /// empty one; a failed list read keeps the last list.
     fn apply_refresh(&mut self, r: Refreshed) {
-        self.broadcasts = r.report.broadcasts;
+        if r.report.listed {
+            self.broadcasts = r.report.broadcasts;
+        }
         let current_sel = r.sel_gen == self.sel_gen;
         let broadcast = r.selected.as_deref().map(|id| self.summary_for(id));
         let errors = r.report.device_errors.join("; ");
         self.set(|s| {
-            if current_sel {
-                s.broadcast = broadcast;
-                s.check = r.check;
+            if current_sel && let Some(b) = broadcast {
+                let same = s.broadcast.as_ref().is_some_and(|x| x.id == b.id);
+                // A failed check of the same broadcast keeps the last good one.
+                if !same || r.check.is_some() {
+                    s.check = r.check;
+                }
+                s.broadcast = Some(b);
             }
             if !errors.is_empty() {
                 s.last_warning = Some(errors);
@@ -909,7 +920,8 @@ fn set_prepared(s: &mut Snapshot, r: Readiness) {
     }
 }
 
-/// Stage 0 plus assessment. Keeps `current` selected if it is still upcoming.
+/// Stage 0 plus assessment. Keeps `current` selected whatever the list says (R23);
+/// only an empty selection takes stage 0's choice.
 async fn refresh(
     d: Devices,
     c: Config,
@@ -918,10 +930,8 @@ async fn refresh(
     epoch: u64,
     sel_gen: u64,
 ) -> Refreshed {
-    let mut report = golive::stage0(&d).await;
-    let selected = current
-        .filter(|id| report.broadcasts.iter().any(|b| &b.id == id))
-        .or_else(|| report.selected.clone());
+    let mut report = golive::stage0(&d, &c).await;
+    let selected = current.or_else(|| report.selected.clone());
     let check = match &selected {
         Some(id) if selected != report.selected => match d.yt.check(id).await {
             Ok(c) => Some(c),
@@ -1798,6 +1808,72 @@ mod tests {
         let s = until(&mut e, "stopped", |s| s.job.is_none() && !matches!(s.stage, Stage::Countdown { .. })).await;
         assert!(s.offers.contains(&Offer::GoLive), "{:?}", s.offers);
         assert!(s.offers.contains(&Offer::GoPublic), "the countdown had not gone public: {:?}", s.offers);
+    }
+
+    // ---- R23 ----
+
+    fn selected_id(s: &Snapshot) -> Option<String> {
+        s.broadcast.as_ref().map(|b| b.id.clone())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_keeps_selection_not_in_list() {
+        let (d, _log, h) = rig();
+        h.yt.set_upcoming(vec![summary("b1"), summary("b2")]);
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        until(&mut e, "b1", |s| selected_id(s).as_deref() == Some("b1")).await;
+        send(&e, Command::SelectBroadcast("b2".into())).await;
+        until(&mut e, "b2 checked", |s| selected_id(s).as_deref() == Some("b2") && s.check.is_some()).await;
+        // b2 has gone from YouTube's list (it went live and then ended, say).
+        h.yt.set_upcoming(vec![summary("b1")]);
+        h.encoder.fail_next("status"); // so the refresh leaves a warning to wait for
+        send(&e, Command::Refresh).await;
+        until(&mut e, "the refresh's warning", |s| s.last_warning.is_some()).await;
+        sleep(MS(500)).await;
+        let s = snap(&e);
+        assert_eq!(selected_id(&s).as_deref(), Some("b2"));
+        assert_eq!(s.broadcast.unwrap().title, "b2");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_failure_keeps_selection() {
+        let (d, _log, h) = rig();
+        h.yt.set_upcoming(vec![summary("b1"), summary("b2")]);
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        until(&mut e, "b1", |s| selected_id(s).as_deref() == Some("b1")).await;
+        send(&e, Command::SelectBroadcast("b2".into())).await;
+        until(&mut e, "b2 checked", |s| selected_id(s).as_deref() == Some("b2") && s.check.is_some()).await;
+        h.yt.fail_next("upcoming");
+        send(&e, Command::Refresh).await;
+        until(&mut e, "the refresh's warning", |s| {
+            s.last_warning.as_deref().is_some_and(|w| w.contains("broadcasts"))
+        })
+        .await;
+        sleep(MS(500)).await;
+        let s = snap(&e);
+        assert_eq!(selected_id(&s).as_deref(), Some("b2"));
+        assert_eq!(s.broadcast.unwrap().title, "b2");
+        assert!(s.check.is_some(), "the check is kept too");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_prefers_live_bound_broadcast() {
+        let (d, _log, h) = rig();
+        let bound = |id: &str, lc: &str, stream: Option<&str>| BroadcastSummary {
+            life_cycle: lc.into(),
+            bound_stream_id: stream.map(String::from),
+            ..summary(id)
+        };
+        h.yt.set_upcoming(vec![
+            summary("next-week"),
+            bound("other-key", "live", Some("someone-else")),
+            bound("ours", "testing", Some("s1")),
+        ]);
+        let c = cfg(vec![]);
+        c.write().unwrap().youtube.stream_id = Some("s1".into());
+        let mut e = Engine::spawn(d, c);
+        let s = until(&mut e, "a selection", |s| s.broadcast.is_some()).await;
+        assert_eq!(selected_id(&s).as_deref(), Some("ours"));
     }
 
     #[tokio::test(start_paused = true)]

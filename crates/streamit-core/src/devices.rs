@@ -102,6 +102,7 @@ pub enum Phase {
 #[async_trait]
 pub trait Broadcasts: Send + Sync {
     async fn signed_in(&self) -> Result<bool>;
+    /// The channel's upcoming and active broadcasts (R23), soonest first.
     async fn upcoming(&self) -> Result<Vec<BroadcastSummary>>;
     async fn check(&self, id: &str) -> Result<BroadcastCheck>;
     async fn fix(&self, id: &str, fix: Fix) -> Result<()>;
