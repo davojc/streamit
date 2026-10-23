@@ -82,7 +82,11 @@ pub async fn recover(d: &Devices, c: &Config, levels: &LiveLevels) -> Result<()>
     let mut failures: Vec<String> = Vec::new();
     let mut fail = |what: &str, e: crate::devices::DeviceError| failures.push(format!("{what}: {e}"));
 
-    // 1. Stream ATEM off the DeckLink.
+    // 1. Stream ATEM off the DeckLink. A real ATEM reports the old program until a mix
+    // completes (I3), so a running transition lands first.
+    if let Err(e) = d.stream.wait_transition_done(TRANSITION_TIMEOUT).await {
+        fail("A stream transition did not finish", e);
+    }
     match d.stream.program().await {
         Ok(p) if p == sa.decklink_input => {
             let r = match d.stream.preview().await {
@@ -105,6 +109,9 @@ pub async fn recover(d: &Devices, c: &Config, levels: &LiveLevels) -> Result<()>
 
     // 2. Hall screens off the DeckLink.
     let sc = &c.screens_atem;
+    if let Err(e) = d.screens.wait_transition_done(TRANSITION_TIMEOUT).await {
+        fail("A hall screens transition did not finish", e);
+    }
     match d.screens.program().await {
         Ok(p) if p == sc.decklink_input => {
             let r = match d.screens.preview().await {
@@ -347,6 +354,24 @@ mod tests {
         recover(&d, &cfg(), &LiveLevels::default()).await.unwrap();
         assert_eq!(d.stream.program().await.unwrap(), d.stream.media_player_input(1));
         assert!(!log.calls().iter().any(is_mic), "{:?}", log.calls());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recover_waits_for_a_running_transition() {
+        let (d, log, h) = rig();
+        h.stream.set_auto_delay(std::time::Duration::from_millis(1000));
+        h.screens.set_auto_delay(std::time::Duration::from_millis(1000));
+        h.hub.set_route(OUT, DK);
+        // Both switchers are mid-mix onto the DeckLink when Recover is pressed.
+        d.stream.set_preview(8).await.unwrap();
+        d.stream.auto().await.unwrap();
+        d.screens.set_preview(8).await.unwrap();
+        d.screens.auto().await.unwrap();
+        recover(&d, &cfg(), &LiveLevels::default()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_ne!(d.stream.program().await.unwrap(), 8, "{:?}", log.calls());
+        assert_ne!(d.screens.program().await.unwrap(), 8, "{:?}", log.calls());
+        assert_eq!(d.hub.route_of(OUT).await.unwrap(), CAM8);
     }
 
     #[tokio::test(start_paused = true)]

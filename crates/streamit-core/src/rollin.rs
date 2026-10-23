@@ -391,7 +391,12 @@ pub async fn play_reporting(
         note(&mut problems, format!("Could not turn off input 8 audio: {e}"));
     }
     // R11: the hall leaves the DeckLink first, before the stream's return transition.
+    // I3: a real ATEM reports the old program until a mix completes, so let the forward
+    // transition land before reading where each switcher is.
     if dest.screens_picture() {
+        if let Err(e) = d.screens.wait_transition_done(TRANSITION_TIMEOUT).await {
+            note(&mut problems, format!("The hall screens transition to the video did not finish: {e}"));
+        }
         let on_video = match d.screens.program().await {
             Ok(p) => p == c.screens_atem.decklink_input,
             Err(e) => {
@@ -405,6 +410,9 @@ pub async fn play_reporting(
         }
     }
     if dest.stream_picture() {
+        if let Err(e) = d.stream.wait_transition_done(TRANSITION_TIMEOUT).await {
+            note(&mut problems, format!("The stream transition to the video did not finish: {e}"));
+        }
         let on8 = match d.stream.program().await {
             Ok(p) => p == sa.decklink_input,
             Err(e) => {
@@ -986,6 +994,32 @@ mod tests {
             assert_eq!(h.stream.audio_level(MIC).await.unwrap(), FLOOR_DB, "duck {duck}");
             // The video's own sound still comes and goes.
             assert_in_order(&calls, &[Call::StreamSetAudioOn(IN8, true), Call::StreamSetAudioOn(IN8, false)]);
+        }
+    }
+
+    /// I3: a real ATEM reports the old program until a mix completes. Stop pressed while
+    /// the forward transitions are still running must still take both switchers back.
+    #[tokio::test(start_paused = true)]
+    async fn early_stop_during_forward_transition_still_returns() {
+        for dest in [Destination::HallAndOnline, Destination::HallOnly] {
+            let (d, log, h) = rig();
+            h.stream.set_auto_delay(MS(2000)); // longer than the 1 s mic fade
+            h.screens.set_auto_delay(MS(2000));
+            let run = spawn_play(&d, &cfg(), cue(dest));
+            until(&log, Call::PlayerPlay).await;
+            // The forward mixes are still running.
+            assert_eq!(h.screens.program().await.unwrap(), 1, "{dest:?}");
+            run.stop.cancel();
+            let (r, _) = run.task.await.unwrap();
+            assert_eq!(r, RollinOutcome::Stopped, "{dest:?}: {:?}", log.calls());
+            sleep(Duration::from_secs(3)).await;
+            assert_eq!(h.screens.program().await.unwrap(), 1, "{dest:?}: the hall is left on the stopped video");
+            assert_eq!(h.stream.program().await.unwrap(), 1, "{dest:?}: the stream is left on input 8");
+            if dest == Destination::HallAndOnline {
+                assert_eq!(h.hub.route_of(OUT).await.unwrap(), CAM8, "{dest:?}");
+                let calls = log.calls();
+                assert_eq!(calls.last(), Some(&Call::HubRoute { output: OUT, input: CAM8 }), "{calls:?}");
+            }
         }
     }
 

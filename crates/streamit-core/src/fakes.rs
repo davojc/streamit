@@ -76,6 +76,23 @@ struct SwitcherState {
     program: u16,
     preview: u16,
     levels: HashMap<AudioSourceId, f32>,
+    /// How long an `auto` takes to land (zero: at once).
+    auto_delay: Duration,
+    /// A running mix: when it lands, and the (program, preview) it lands on.
+    pending: Option<(tokio::time::Instant, u16, u16)>,
+}
+
+impl SwitcherState {
+    /// Land a mix whose time has come. Like a real ATEM, the old program is reported until then.
+    fn settle(&mut self) {
+        if let Some((at, program, preview)) = self.pending
+            && tokio::time::Instant::now() >= at
+        {
+            self.program = program;
+            self.preview = preview;
+            self.pending = None;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -92,7 +109,13 @@ impl FakeSwitcher {
             kind,
             log,
             fails: Failures::default(),
-            st: Arc::new(Mutex::new(SwitcherState { program: 1, preview: 2, levels: HashMap::new() })),
+            st: Arc::new(Mutex::new(SwitcherState {
+                program: 1,
+                preview: 2,
+                levels: HashMap::new(),
+                auto_delay: Duration::ZERO,
+                pending: None,
+            })),
         }
     }
     /// The next call to `method` fails once.
@@ -111,6 +134,11 @@ impl FakeSwitcher {
     pub fn set_preview_state(&self, input: u16) {
         self.st.lock().unwrap().preview = input;
     }
+    /// Every later `auto` takes `d` (on the tokio clock) to land: `program` reports the old
+    /// input until then, and `wait_transition_done` waits for it.
+    pub fn set_auto_delay(&self, d: Duration) {
+        self.st.lock().unwrap().auto_delay = d;
+    }
     /// Script an audio level without logging a call.
     pub fn set_audio_level_state(&self, src: AudioSourceId, db: f32) {
         self.st.lock().unwrap().levels.insert(src, db);
@@ -124,11 +152,15 @@ impl FakeSwitcher {
 impl Switcher for FakeSwitcher {
     async fn program(&self) -> Result<u16> {
         self.fails.check("program")?;
-        Ok(self.st.lock().unwrap().program)
+        let mut s = self.st.lock().unwrap();
+        s.settle();
+        Ok(s.program)
     }
     async fn preview(&self) -> Result<u16> {
         self.fails.check("preview")?;
-        Ok(self.st.lock().unwrap().preview)
+        let mut s = self.st.lock().unwrap();
+        s.settle();
+        Ok(s.preview)
     }
     async fn set_preview(&self, input: u16) -> Result<()> {
         self.rec(Call::StreamSetPreview(input), Call::ScreensSetPreview(input));
@@ -139,19 +171,40 @@ impl Switcher for FakeSwitcher {
     async fn set_program(&self, input: u16) -> Result<()> {
         self.rec(Call::StreamSetProgram(input), Call::ScreensSetProgram(input));
         self.fails.check("set_program")?;
-        self.st.lock().unwrap().program = input;
+        let mut s = self.st.lock().unwrap();
+        s.pending = None;
+        s.program = input;
         Ok(())
     }
     async fn auto(&self) -> Result<()> {
         self.rec(Call::StreamAuto, Call::ScreensAuto);
         self.fails.check("auto")?;
         let mut s = self.st.lock().unwrap();
-        let s = &mut *s;
-        std::mem::swap(&mut s.program, &mut s.preview);
+        // A mix already running lands first.
+        if let Some((_, program, preview)) = s.pending.take() {
+            s.program = program;
+            s.preview = preview;
+        }
+        if s.auto_delay.is_zero() {
+            let s = &mut *s;
+            std::mem::swap(&mut s.program, &mut s.preview);
+        } else {
+            s.pending = Some((tokio::time::Instant::now() + s.auto_delay, s.preview, s.program));
+        }
         Ok(())
     }
-    async fn wait_transition_done(&self, _timeout: Duration) -> Result<()> {
-        self.fails.check("wait_transition_done")
+    async fn wait_transition_done(&self, timeout: Duration) -> Result<()> {
+        self.fails.check("wait_transition_done")?;
+        let at = self.st.lock().unwrap().pending.map(|(at, ..)| at);
+        let Some(at) = at else { return Ok(()) };
+        let limit = tokio::time::Instant::now() + timeout;
+        if at > limit {
+            tokio::time::sleep_until(limit).await;
+            return Err(DeviceError::Timeout("transition still running".into()));
+        }
+        tokio::time::sleep_until(at).await;
+        self.st.lock().unwrap().settle();
+        Ok(())
     }
 }
 
