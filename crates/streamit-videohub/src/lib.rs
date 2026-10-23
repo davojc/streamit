@@ -9,9 +9,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use streamit_core::devices::{DeviceError, Result, Router};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
@@ -103,6 +103,10 @@ impl Default for Timings {
 #[derive(Default)]
 struct State {
     connected: bool,
+    /// True once this session's first VIDEO OUTPUT ROUTING block has arrived.
+    synced: bool,
+    /// Incremented per session, so a stale resync request never kills a newer session.
+    epoch: u64,
     /// 1-based output -> 1-based input.
     table: HashMap<u16, u16>,
 }
@@ -122,7 +126,28 @@ pub struct VideoHub {
     state: Arc<Mutex<State>>,
     cmds: mpsc::Sender<Cmd>,
     timings: Timings,
+    /// Asks the session to drop the link and reconnect (lost reply sync).
+    reset: Arc<Notify>,
     task: JoinHandle<()>,
+}
+
+/// Aborts the task when dropped (a dropped `JoinHandle` only detaches).
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[derive(Default)]
+struct Outcome {
+    /// The `VideoHub` handle is gone.
+    gone: bool,
+    /// The dump arrived on this connection.
+    synced: bool,
+    /// Reconnect immediately (no backoff).
+    resync: bool,
 }
 
 impl Drop for VideoHub {
@@ -141,11 +166,13 @@ impl VideoHub {
     pub async fn connect_with(addr: SocketAddr, timings: Timings) -> Result<Arc<VideoHub>> {
         let state = Arc::new(Mutex::new(State::default()));
         let (tx, rx) = mpsc::channel(16);
-        let task = tokio::spawn(run(addr, timings.clone(), state.clone(), rx));
+        let reset = Arc::new(Notify::new());
+        let task = tokio::spawn(run(addr, timings.clone(), state.clone(), rx, reset.clone()));
         Ok(Arc::new(VideoHub {
             state,
             cmds: tx,
             timings,
+            reset,
             task,
         }))
     }
@@ -159,13 +186,21 @@ fn down() -> DeviceError {
     DeviceError::Disconnected("videohub link is down".into())
 }
 
+fn usable(s: &State) -> Result<()> {
+    if !s.connected {
+        Err(down())
+    } else if !s.synced {
+        Err(DeviceError::Disconnected("not synced".into()))
+    } else {
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Router for VideoHub {
     async fn route_of(&self, output: u16) -> Result<u16> {
         let s = self.lock();
-        if !s.connected {
-            return Err(down());
-        }
+        usable(&s)?;
         s.table
             .get(&output)
             .copied()
@@ -178,9 +213,11 @@ impl Router for VideoHub {
                 "outputs and inputs are numbered from 1".into(),
             ));
         }
-        if !self.lock().connected {
-            return Err(down());
-        }
+        let epoch = {
+            let s = self.lock();
+            usable(&s)?;
+            s.epoch
+        };
         let (reply, rx) = oneshot::channel();
         self.cmds
             .send(Cmd {
@@ -191,9 +228,15 @@ impl Router for VideoHub {
             .await
             .map_err(|_| down())?;
         match tokio::time::timeout(self.timings.route_timeout, rx).await {
-            Err(_) => Err(DeviceError::Timeout(format!(
-                "no ACK for route {output} <- {input}"
-            ))),
+            Err(_) => {
+                // A lost reply would skew the ACK/NAK queue: drop the link and resync.
+                if self.lock().epoch == epoch {
+                    self.reset.notify_one();
+                }
+                Err(DeviceError::Timeout(format!(
+                    "no ACK for route {output} <- {input}"
+                )))
+            }
             Ok(Err(_)) => Err(down()),
             Ok(Ok(true)) => Ok(()),
             Ok(Ok(false)) => Err(DeviceError::Refused(format!(
@@ -208,6 +251,7 @@ async fn run(
     t: Timings,
     state: Arc<Mutex<State>>,
     mut cmds: mpsc::Receiver<Cmd>,
+    reset: Arc<Notify>,
 ) {
     let backoff = if t.backoff.is_empty() {
         vec![Duration::from_secs(1)]
@@ -218,15 +262,20 @@ async fn run(
     loop {
         match tokio::time::timeout(t.connect_timeout, TcpStream::connect(addr)).await {
             Ok(Ok(stream)) => {
-                attempt = 0;
                 tracing::info!(%addr, "videohub connected");
                 set_link(&state, true);
-                let gone = session(stream, &t, &state, &mut cmds).await;
+                let out = session(stream, &t, &state, &mut cmds, &reset).await;
                 set_link(&state, false);
-                if gone {
+                if out.gone {
                     return;
                 }
+                if out.synced {
+                    attempt = 0;
+                }
                 tracing::warn!(%addr, "videohub link lost");
+                if out.resync {
+                    continue;
+                }
             }
             Ok(Err(e)) => tracing::debug!(%addr, "videohub connect failed: {e}"),
             Err(_) => tracing::debug!(%addr, "videohub connect timed out"),
@@ -239,11 +288,16 @@ async fn run(
 fn set_link(state: &Mutex<State>, up: bool) {
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
     s.connected = up;
+    s.synced = false;
     s.table.clear();
+    if up {
+        s.epoch += 1;
+    }
 }
 
 fn apply_routing(state: &Mutex<State>, block: &Block) {
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    s.synced = true;
     for line in &block.lines {
         let mut it = line.split_whitespace().map(str::parse::<u16>);
         if let (Some(Ok(o)), Some(Ok(i))) = (it.next(), it.next()) {
@@ -252,42 +306,53 @@ fn apply_routing(state: &Mutex<State>, block: &Block) {
     }
 }
 
-/// Runs one connection until it ends. Returns true when the `VideoHub` handle is gone.
+/// Longest line accepted from the device; a longer one means the link is garbage.
+const MAX_LINE: u64 = 64 * 1024;
+
+/// Runs one connection until it ends.
 async fn session(
     stream: TcpStream,
     t: &Timings,
     state: &Mutex<State>,
     cmds: &mut mpsc::Receiver<Cmd>,
-) -> bool {
+    reset: &Notify,
+) -> Outcome {
     // Commands queued while the link was down are stale: dropping them reports Disconnected.
     while cmds.try_recv().is_ok() {}
+    // So is a resync request left over from a previous session.
+    let _ = tokio::time::timeout(Duration::ZERO, reset.notified()).await;
 
     let (rd, mut wr) = stream.into_split();
     let (btx, mut brx) = mpsc::unbounded_channel::<Block>();
-    let reader = tokio::spawn(async move {
-        let mut lines = BufReader::new(rd);
+    let _reader = AbortOnDrop(tokio::spawn(async move {
+        let mut rd = BufReader::new(rd);
         let mut parser = BlockParser::default();
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         loop {
             buf.clear();
-            match lines.read_line(&mut buf).await {
+            let n = match (&mut rd).take(MAX_LINE).read_until(b'\n', &mut buf).await {
                 Ok(0) | Err(_) => return,
-                Ok(_) => {
-                    if let Some(b) = parser.push_line(&buf)
-                        && btx.send(b).is_err()
-                    {
-                        return;
-                    }
-                }
+                Ok(n) => n as u64,
+            };
+            if n >= MAX_LINE && buf.last() != Some(&b'\n') {
+                tracing::warn!("videohub sent an over-long line; dropping link");
+                return;
+            }
+            // Labels may not be UTF-8 (e.g. Latin-1); decode lossily.
+            let line = String::from_utf8_lossy(&buf);
+            if let Some(b) = parser.push_line(&line)
+                && btx.send(b).is_err()
+            {
+                return;
             }
         }
-    });
+    }));
 
     let mut pending: VecDeque<Pending> = VecDeque::new();
     let mut ping_deadline: Option<Instant> = None;
     let mut tick = tokio::time::interval_at(Instant::now() + t.ping_interval, t.ping_interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut gone = false;
+    let mut out = Outcome::default();
 
     loop {
         let dead = async {
@@ -304,11 +369,8 @@ async fn session(
                     "ACK" | "NAK" => {
                         let ack = block.name == "ACK";
                         match pending.pop_front() {
+                            // The device's own routing broadcast updates the table.
                             Some(Pending::Route(c)) => {
-                                if ack {
-                                    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-                                    s.table.insert(c.out, c.inp);
-                                }
                                 let _ = c.reply.send(ack);
                             }
                             Some(Pending::Ping) => ping_deadline = None,
@@ -319,7 +381,7 @@ async fn session(
                 }
             }
             cmd = cmds.recv() => {
-                let Some(c) = cmd else { gone = true; break };
+                let Some(c) = cmd else { out.gone = true; break };
                 if wr.write_all(format_route(c.out, c.inp).as_bytes()).await.is_err() {
                     break;
                 }
@@ -338,9 +400,14 @@ async fn session(
                 tracing::warn!("videohub did not answer PING");
                 break;
             }
+            _ = reset.notified() => {
+                tracing::warn!("videohub reply lost; resyncing");
+                out.resync = true;
+                break;
+            }
         }
     }
-    reader.abort();
+    out.synced = state.lock().unwrap_or_else(|e| e.into_inner()).synced;
     // Dropping `pending` drops the reply senders, so waiting route() calls see Disconnected.
-    gone
+    out
 }

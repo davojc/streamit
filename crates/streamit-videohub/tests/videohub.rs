@@ -214,3 +214,80 @@ async fn answered_pings_keep_link_up() {
     }
     assert_eq!(hub.route_of(11).await, Ok(13));
 }
+
+#[tokio::test]
+async fn timeout_then_nak_never_reports_ok() {
+    let (l, addr) = fake().await;
+    let hub = VideoHub::connect_with(addr, fast()).await.unwrap();
+    let mut s = accept_with_dump(&l).await;
+    wait_route(&hub, 11, 13).await;
+
+    // Route A: the device reads it but never replies.
+    let h = hub.clone();
+    let a = tokio::spawn(async move { h.route(11, 5).await });
+    read_msg(&mut s).await;
+    assert!(matches!(a.await.unwrap(), Err(DeviceError::Timeout(_))));
+
+    // The hub must drop the link and reconnect, discarding the skewed queue.
+    let mut s2 = tokio::time::timeout(Duration::from_secs(3), accept_with_dump(&l))
+        .await
+        .expect("no reconnect after timeout");
+    wait_route(&hub, 11, 13).await;
+
+    // Route B is refused; nothing from the old link may leak into it.
+    let h = hub.clone();
+    let b = tokio::spawn(async move { h.route(11, 6).await });
+    read_msg(&mut s2).await;
+    s2.write_all(b"NAK\n\n").await.unwrap();
+    assert!(matches!(b.await.unwrap(), Err(DeviceError::Refused(_))));
+    assert_eq!(hub.route_of(11).await, Ok(13));
+}
+
+#[tokio::test]
+async fn route_of_before_dump_is_disconnected() {
+    let (l, addr) = fake().await;
+    let hub = VideoHub::connect_with(addr, fast()).await.unwrap();
+    let (mut s, _) = l.accept().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        hub.route_of(11).await,
+        Err(DeviceError::Disconnected("not synced".into()))
+    );
+    assert!(matches!(
+        hub.route(11, 2).await,
+        Err(DeviceError::Disconnected(_))
+    ));
+    s.write_all(DUMP.as_bytes()).await.unwrap();
+    wait_route(&hub, 11, 13).await;
+}
+
+#[tokio::test]
+async fn reconnect_replaces_table_with_new_dump() {
+    let (l, addr) = fake().await;
+    let hub = VideoHub::connect_with(addr, fast()).await.unwrap();
+    let s = accept_with_dump(&l).await;
+    wait_route(&hub, 11, 13).await;
+    assert_eq!(hub.route_of(1).await, Ok(1));
+    drop(s);
+    let (mut s2, _) = l.accept().await.unwrap();
+    s2.write_all(b"VIDEO OUTPUT ROUTING:\n10 2\n\n")
+        .await
+        .unwrap();
+    wait_route(&hub, 11, 3).await;
+    assert_eq!(
+        hub.route_of(1).await,
+        Err(DeviceError::Other("unknown output".into()))
+    );
+}
+
+#[tokio::test]
+async fn non_utf8_label_does_not_break_link() {
+    let (l, addr) = fake().await;
+    let hub = VideoHub::connect_with(addr, fast()).await.unwrap();
+    let mut s = accept_with_dump(&l).await;
+    wait_route(&hub, 11, 13).await;
+    s.write_all(b"INPUT LABELS:\n0 Caf\xe9 Chapel\n\nVIDEO OUTPUT ROUTING:\n10 5\n\n")
+        .await
+        .unwrap();
+    wait_route(&hub, 11, 6).await; // same connection: no reconnect happened
+}
