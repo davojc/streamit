@@ -55,7 +55,8 @@ pub struct Stage0Report {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CountdownOutcome {
-    Live,
+    /// T-0 is done. `public` is whether the broadcast went public (go-public settled Ok).
+    Live { public: bool },
     Stopped,
 }
 
@@ -310,9 +311,9 @@ pub async fn countdown(
         // LIVE is reported as soon as the cut is done; YouTube never holds it back.
         progress(Stage::Live);
     }
-    settle_go_public(pub_task.take(), &warn).await;
+    let settled = settle_go_public(pub_task.take(), &warn).await;
     r?;
-    Ok(CountdownOutcome::Live)
+    Ok(CountdownOutcome::Live { public: settled.unwrap_or(public) })
 }
 
 /// Waits at most `GO_PUBLIC_WAIT` for an in-flight `go_public`; on timeout it is
@@ -627,7 +628,7 @@ mod tests {
         assert!(run.stages.lock().unwrap().iter().any(|s| matches!(s, Stage::Countdown { public: true, .. })));
 
         h.player.emit(PlayerEvent::Ended);
-        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live);
+        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: true });
         assert_eq!(run.stages.lock().unwrap().last(), Some(&Stage::Live));
         assert!(log.calls().ends_with(&[Call::ScreensSetPreview(6), Call::ScreensAuto, Call::CounterClear]));
         assert!(run.warns.lock().unwrap().is_empty(), "{:?}", run.warns.lock().unwrap());
@@ -646,7 +647,7 @@ mod tests {
         assert!(pos(&calls, &Call::YtTransition(Phase::Live)) > pos(&calls, &Call::PlayerPlay));
         assert_eq!(run.warns.lock().unwrap().len(), 1);
         h.player.emit(PlayerEvent::Ended);
-        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live);
+        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: true });
         assert_eq!(live_transitions(&log), 1);
     }
 
@@ -689,7 +690,7 @@ mod tests {
         ));
         assert!(!run.stages.lock().unwrap().iter().any(|s| matches!(s, Stage::Countdown { public: true, .. })));
         h.player.emit(PlayerEvent::Ended);
-        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live);
+        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: false });
         assert_eq!(live_transitions(&log), 8);
     }
 
@@ -837,7 +838,7 @@ mod tests {
         assert!(log.calls().ends_with(&[Call::ScreensSetPreview(6), Call::ScreensAuto, Call::CounterClear]));
         // The hung go-public is given a bounded wait, then reported.
         let start = Instant::now();
-        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live);
+        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: false });
         assert!(start.elapsed() <= GO_PUBLIC_WAIT);
         let warns = run.warns.lock().unwrap();
         assert!(warns.iter().any(|w| w.contains("public")), "{warns:?}");

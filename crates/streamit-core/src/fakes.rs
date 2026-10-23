@@ -270,9 +270,21 @@ pub struct FakeBroadcasts {
     fails: Failures,
     st: Arc<Mutex<YtState>>,
     hang_transition: Arc<std::sync::atomic::AtomicBool>,
+    delays: Arc<Mutex<HashMap<String, Duration>>>,
 }
 
 impl FakeBroadcasts {
+    /// Every later call to `method` (`upcoming`, `check` or `life_cycle`) first
+    /// waits `d` (on the tokio clock). `Duration::ZERO` removes the delay.
+    pub fn set_delay(&self, method: &str, d: Duration) {
+        self.delays.lock().unwrap().insert(method.to_string(), d);
+    }
+    async fn delay(&self, method: &str) {
+        let d = self.delays.lock().unwrap().get(method).copied().unwrap_or_default();
+        if !d.is_zero() {
+            tokio::time::sleep(d).await;
+        }
+    }
     /// The next call to `method` fails once.
     pub fn fail_next(&self, method: &str) {
         self.fails.add(method, 1);
@@ -309,10 +321,12 @@ impl Broadcasts for FakeBroadcasts {
         Ok(self.st.lock().unwrap().signed_in)
     }
     async fn upcoming(&self) -> Result<Vec<BroadcastSummary>> {
+        self.delay("upcoming").await;
         self.fails.check("upcoming")?;
         Ok(self.st.lock().unwrap().upcoming.clone())
     }
     async fn check(&self, _id: &str) -> Result<BroadcastCheck> {
+        self.delay("check").await;
         self.fails.check("check")?;
         Ok(self.st.lock().unwrap().check)
     }
@@ -325,6 +339,7 @@ impl Broadcasts for FakeBroadcasts {
         Ok(self.st.lock().unwrap().health.clone())
     }
     async fn life_cycle(&self, _id: &str) -> Result<String> {
+        self.delay("life_cycle").await;
         self.fails.check("life_cycle")?;
         Ok(self.st.lock().unwrap().life_cycle.clone())
     }
@@ -458,6 +473,7 @@ pub fn fake_devices() -> (Devices, CallLog, FakeHandles) {
             life_cycle: "ready".into(),
         })),
         hang_transition: Default::default(),
+        delays: Default::default(),
     };
     let (tx, _) = tokio::sync::broadcast::channel(16);
     let player = FakePlayer {

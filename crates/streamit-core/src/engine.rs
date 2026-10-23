@@ -8,11 +8,11 @@
 //! Every ignored command is logged at `info`.
 use crate::audio::LiveLevels;
 use crate::config::Config;
-use crate::devices::{self, BroadcastCheck, BroadcastSummary, Devices, Fix, Phase};
+use crate::devices::{self, BroadcastCheck, BroadcastSummary, DeviceError, Devices, Fix, Phase};
 use crate::end::{EndOutcome, end_service};
 use crate::golive::{self, CountdownOutcome, Readiness, Stage, Stage0Report};
 use crate::recovery::{self, Assessment, Offer};
-use crate::rollin::{self, Cue, CueList, CueState, Destination, RollinOutcome};
+use crate::rollin::{self, Cue, CueList, CueState, RollinOutcome};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -137,6 +137,9 @@ enum Done {
 }
 
 struct Refreshed {
+    /// Engine epoch and selection generation when the refresh started.
+    epoch: u64,
+    sel_gen: u64,
     report: Stage0Report,
     selected: Option<String>,
     check: Option<BroadcastCheck>,
@@ -145,9 +148,10 @@ struct Refreshed {
 
 /// Results of side tasks that change engine state, applied by the loop.
 enum Aux {
-    Checked { id: String, check: Result<BroadcastCheck, String> },
+    Checked { sel_gen: u64, check: Result<BroadcastCheck, String> },
     Refreshed(Box<Refreshed>),
-    Assessed(Assessment),
+    Recovered { epoch: u64, ok: bool, assessment: Assessment },
+    WentLive(devices::Result<()>),
     ClearFlash(u64),
 }
 
@@ -167,8 +171,20 @@ pub struct Engine {
     cues: CueList,
     broadcasts: Vec<BroadcastSummary>,
     running: Option<Running>,
-    /// End Service was pressed during a video: run it once the video has returned.
-    end_after_video: bool,
+    /// Bumped when a job starts or finishes and when Go Live lands. An assessment
+    /// started under an older epoch may not set the stage, and only adds offers.
+    epoch: u64,
+    /// Bumped on every Select Broadcast; older check and refresh results do not
+    /// change the selection.
+    sel_gen: u64,
+    /// End Service waits for the running video, Recover and Go Live.
+    end_pending: bool,
+    /// Go Live waits for the countdown it pre-empted to run its cancel path.
+    golive_pending: bool,
+    golive_in_flight: bool,
+    /// Recover waits for the running video's return path.
+    recover_pending: bool,
+    recover_in_flight: bool,
     flash_gen: u64,
     aux: mpsc::UnboundedSender<Aux>,
 }
@@ -190,7 +206,13 @@ impl Engine {
             cues,
             broadcasts: Vec::new(),
             running: None,
-            end_after_video: false,
+            epoch: 0,
+            sel_gen: 0,
+            end_pending: false,
+            golive_pending: false,
+            golive_in_flight: false,
+            recover_pending: false,
+            recover_in_flight: false,
             flash_gen: 0,
             aux,
         };
@@ -199,7 +221,7 @@ impl Engine {
     }
 
     async fn run(mut self, mut rx: mpsc::Receiver<Command>, mut aux_rx: mpsc::UnboundedReceiver<Aux>) {
-        let r = refresh(self.d.clone(), self.config(), None, false).await;
+        let r = refresh(self.d.clone(), self.config(), None, false, self.epoch, self.sel_gen).await;
         self.apply_refresh(r);
         loop {
             let wake = tokio::select! {
@@ -256,6 +278,10 @@ impl Engine {
         self.running.as_ref().map(|r| format!("{} is running", r.job.name()))
     }
 
+    fn video_running(&self) -> bool {
+        matches!(self.running, Some(Running { job: Job::Video { .. }, .. }))
+    }
+
     fn ignore(&self, cmd: &Command, why: &str) {
         info!(command = ?cmd, reason = why, "command ignored");
     }
@@ -270,6 +296,11 @@ impl Engine {
         })
     }
 
+    fn begin(&mut self, job: Job, handle: JoinHandle<Done>) {
+        self.epoch += 1;
+        self.running = Some(Running { job, handle });
+    }
+
     // ---- commands ----
 
     fn handle(&mut self, cmd: Command) {
@@ -277,6 +308,9 @@ impl Engine {
             Command::Prepare => {
                 if let Some(why) = self.busy() {
                     return self.ignore(&cmd, &why);
+                }
+                if self.golive_in_flight {
+                    return self.ignore(&cmd, "Go Live is in progress");
                 }
                 if matches!(self.stage(), Stage::Countdown { .. } | Stage::Live) {
                     return self.ignore(&cmd, "the service is counting down or live");
@@ -287,6 +321,9 @@ impl Engine {
                 if let Some(why) = self.busy() {
                     return self.ignore(&cmd, &why);
                 }
+                if self.golive_in_flight {
+                    return self.ignore(&cmd, "Go Live is in progress");
+                }
                 let before = self.stage();
                 if matches!(before, Stage::Live | Stage::Ending { .. }) {
                     return self.ignore(&cmd, "the service is live or ending");
@@ -294,11 +331,13 @@ impl Engine {
                 self.start_countdown(before);
             }
             Command::StopCountdown => match &self.running {
-                Some(Running { job: Job::Countdown { cancel }, .. }) => cancel.cancel(),
+                Some(Running { job: Job::Countdown { cancel }, .. }) if !self.golive_pending => cancel.cancel(),
+                Some(Running { job: Job::Countdown { .. }, .. }) => {
+                    self.ignore(&cmd, "Go Live is already stopping the countdown")
+                }
                 _ => self.ignore(&cmd, "no countdown is running"),
             },
             Command::EndService => match &self.running {
-                None => self.start_end(),
                 Some(Running { job: Job::End { skip }, .. }) => {
                     info!("End Service pressed again: skipping the closing hold");
                     skip.notify_one();
@@ -306,16 +345,24 @@ impl Engine {
                 Some(Running { job: Job::Video { stop, .. }, .. }) => {
                     info!("End Service during a video: stopping the video first");
                     stop.cancel();
-                    self.end_after_video = true;
+                    self.end_pending = true;
                 }
                 Some(r) => {
                     let why = format!("{} is running", r.job.name());
                     self.ignore(&cmd, &why);
                 }
+                None => {
+                    self.end_pending = true;
+                    if self.recover_in_flight || self.golive_in_flight {
+                        info!("End Service will run once Recover / Go Live has finished");
+                    }
+                    self.maybe_start_end();
+                }
             },
             Command::PlayCue(i) => {
                 let i = *i;
-                if let Some(why) = self.busy() {
+                let why = self.busy().or_else(|| self.recover_in_flight.then(|| "Recover is running".to_string()));
+                if let Some(why) = why {
                     self.flash(i);
                     return self.ignore(&cmd, &why);
                 }
@@ -328,18 +375,50 @@ impl Engine {
                 Some(Running { job: Job::Video { stop, .. }, .. }) => stop.cancel(),
                 _ => self.ignore(&cmd, "no video is playing"),
             },
+            // `mics_ducked` clears only when the roll-in reports a successful fade up.
             Command::UnmuteMics => match &self.running {
-                Some(Running { job: Job::Video { unmute, .. }, .. }) => {
-                    unmute.notify_one();
-                    self.set(|s| s.mics_ducked = false);
-                }
+                Some(Running { job: Job::Video { unmute, .. }, .. }) => unmute.notify_one(),
                 _ => self.ignore(&cmd, "no video is playing"),
             },
             Command::GoPublic => self.spawn_go_public(),
-            Command::GoLive => self.spawn_go_live(),
+            Command::GoLive => {
+                if self.golive_in_flight {
+                    return self.ignore(&cmd, "Go Live is already in progress");
+                }
+                self.golive_in_flight = true;
+                match &self.running {
+                    Some(Running { job: Job::Countdown { cancel }, .. }) => {
+                        info!("Go Live during the countdown: stopping the countdown first");
+                        cancel.cancel();
+                        self.golive_pending = true;
+                    }
+                    _ => self.spawn_t0(),
+                }
+            }
             Command::EndBroadcast => self.spawn_end_broadcast(),
-            Command::Recover => self.spawn_recover(),
-            Command::SelectBroadcast(id) => self.spawn_check(id.clone(), None),
+            Command::Recover => {
+                if self.recover_in_flight {
+                    return self.ignore(&cmd, "Recover is already in progress");
+                }
+                self.recover_in_flight = true;
+                match &self.running {
+                    Some(Running { job: Job::Video { stop, .. }, .. }) => {
+                        info!("Recover during a video: stopping the video first");
+                        stop.cancel();
+                        self.recover_pending = true;
+                    }
+                    _ => self.spawn_recover(),
+                }
+            }
+            Command::SelectBroadcast(id) => {
+                self.sel_gen += 1;
+                let b = self.summary_for(id);
+                self.set(|s| {
+                    s.broadcast = Some(b);
+                    s.check = None;
+                });
+                self.spawn_check(id.clone(), None);
+            }
             Command::FixBroadcast(fix) => match self.selected() {
                 Some(id) => self.spawn_check(id, Some(*fix)),
                 None => {
@@ -349,9 +428,9 @@ impl Engine {
             },
             Command::Refresh => {
                 let (d, c, sel, aux) = (self.d.clone(), self.config(), self.selected(), self.aux.clone());
-                let player_active = matches!(self.running, Some(Running { job: Job::Video { .. }, .. }));
+                let (player_active, epoch, sel_gen) = (self.video_running(), self.epoch, self.sel_gen);
                 tokio::spawn(async move {
-                    let r = refresh(d, c, sel, player_active).await;
+                    let r = refresh(d, c, sel, player_active, epoch, sel_gen).await;
                     let _ = aux.send(Aux::Refreshed(Box::new(r)));
                 });
             }
@@ -387,14 +466,14 @@ impl Engine {
                 &c,
                 &bid,
                 &mut l,
-                move |r| p.send_modify(|s| s.stage = Stage::Prepared(r)),
+                move |r| p.send_modify(|s| set_prepared(s, r)),
                 move |m| set_warning(&w, m),
             )
             .await;
             *lock(&levels) = l;
             Done::Prepared(r)
         });
-        self.running = Some(Running { job: Job::Prepare, handle });
+        self.begin(Job::Prepare, handle);
     }
 
     fn start_countdown(&mut self, before: Stage) {
@@ -427,7 +506,7 @@ impl Engine {
             .await;
             Done::Countdown { result, public: public.load(Ordering::SeqCst), before }
         });
-        self.running = Some(Running { job: Job::Countdown { cancel }, handle });
+        self.begin(Job::Countdown { cancel }, handle);
     }
 
     fn start_end(&mut self) {
@@ -437,34 +516,35 @@ impl Engine {
             let out = end_service(&d, &c, &bid, s2, move |st| snap.send_modify(|s| s.stage = st)).await;
             Done::Ended(out)
         });
-        self.running = Some(Running { job: Job::End { skip }, handle });
+        self.begin(Job::End { skip }, handle);
     }
 
     fn start_video(&mut self, index: usize) {
         let Some(cue) = self.cues.get(index).cloned() else { return };
         self.cues.state[index] = CueState::Playing;
-        let ducks = cue.destination != Destination::HallOnly;
         let rows = cue_rows(&self.cues);
         self.set(|s| {
             s.cues = rows;
             s.playing = Some(index);
-            s.mics_ducked = ducks;
         });
         let (stop, unmute) = (CancellationToken::new(), Arc::new(Notify::new()));
-        let (d, c, levels, st, um) = (self.d.clone(), self.config(), self.levels.clone(), stop.clone(), unmute.clone());
+        let (d, c, snap, levels, st, um) =
+            (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone(), stop.clone(), unmute.clone());
         let handle = tokio::spawn(async move {
             let mut l = lock(&levels).clone();
-            let outcome = rollin::play(&d, &c, &cue, &mut l, st, um).await;
+            let mics = move |down: bool| snap.send_modify(|s| s.mics_ducked = down);
+            let outcome = rollin::play_reporting(&d, &c, &cue, &mut l, st, um, mics).await;
             *lock(&levels) = l;
             Done::Video { index, outcome }
         });
-        self.running = Some(Running { job: Job::Video { index, stop, unmute }, handle });
+        self.begin(Job::Video { index, stop, unmute }, handle);
     }
 
     fn finish(&mut self, res: Result<Done, JoinError>) {
         let Some(Running { job, .. }) = self.running.take() else { return };
+        self.epoch += 1;
         match res {
-            Ok(Done::Prepared(r)) => self.set(|s| s.stage = Stage::Prepared(r)),
+            Ok(Done::Prepared(r)) => self.set(|s| set_prepared(s, r)),
             Ok(Done::Countdown { result, public, before }) => self.finish_countdown(result, public, before),
             Ok(Done::Ended(out)) => self.finish_end(out),
             Ok(Done::Video { index, outcome }) => self.finish_video(index, outcome),
@@ -475,18 +555,56 @@ impl Engine {
                     Job::Video { index, .. } => {
                         self.finish_video(index, RollinOutcome::Failed { recover_needed: true, reason })
                     }
+                    // Handled like a countdown error: back to Prepared, Go Live / Go Public offered.
+                    Job::Countdown { .. } => {
+                        self.finish_countdown(Err(DeviceError::Other(reason)), false, Stage::Idle)
+                    }
                     _ => set_warning(&self.snap, reason),
                 }
             }
         }
+        self.after_job();
+    }
+
+    /// Run whatever was waiting for the job to finish.
+    fn after_job(&mut self) {
+        if self.running.is_some() {
+            return;
+        }
+        if std::mem::take(&mut self.recover_pending) {
+            self.spawn_recover();
+        }
+        self.maybe_start_end();
+    }
+
+    fn maybe_start_end(&mut self) {
+        if self.end_pending && self.running.is_none() && !self.recover_in_flight && !self.golive_in_flight {
+            self.end_pending = false;
+            self.start_end();
+        }
     }
 
     fn finish_countdown(&mut self, result: devices::Result<CountdownOutcome>, public: bool, before: Stage) {
+        let golive = std::mem::take(&mut self.golive_pending);
         match result {
-            Ok(CountdownOutcome::Live) => self.set(|s| {
-                s.stage = Stage::Live;
-                remove(&mut s.offers, Offer::GoLive);
-            }),
+            Ok(CountdownOutcome::Live { public }) => {
+                if golive {
+                    // The countdown reached T-0 itself before the cancel: no second t0.
+                    self.golive_in_flight = false;
+                }
+                self.set(|s| {
+                    s.stage = Stage::Live;
+                    remove(&mut s.offers, Offer::GoLive);
+                    if public {
+                        remove(&mut s.offers, Offer::GoPublic);
+                    } else {
+                        add(&mut s.offers, Offer::GoPublic);
+                    }
+                });
+            }
+            // Pre-empted by Go Live: the hall is back, so run t0 now. The stage is
+            // not restored, so nothing (e.g. Prepare) reopens before Live lands.
+            Ok(CountdownOutcome::Stopped) if golive => self.spawn_t0(),
             Ok(CountdownOutcome::Stopped) => self.set(|s| s.stage = before),
             Err(e) => {
                 let msg = format!("The countdown failed ({e}); press Go Live manually");
@@ -498,6 +616,9 @@ impl Engine {
                     }
                     s.last_warning = Some(msg);
                 });
+                if golive {
+                    self.spawn_t0();
+                }
             }
         }
     }
@@ -517,6 +638,7 @@ impl Engine {
         });
     }
 
+    /// `mics_ducked` is left as the roll-in last reported it.
     fn finish_video(&mut self, index: usize, outcome: RollinOutcome) {
         let (state, warning, recover) = match outcome {
             RollinOutcome::Finished | RollinOutcome::Stopped => (CueState::Played, None, false),
@@ -532,7 +654,6 @@ impl Engine {
         self.set(|s| {
             s.cues = rows;
             s.playing = None;
-            s.mics_ducked = false;
             if let Some(w) = warning {
                 s.last_warning = Some(w);
             }
@@ -540,9 +661,6 @@ impl Engine {
                 add(&mut s.offers, Offer::Recover);
             }
         });
-        if std::mem::take(&mut self.end_after_video) {
-            self.start_end();
-        }
     }
 
     // ---- always-accepted side tasks ----
@@ -557,17 +675,13 @@ impl Engine {
         });
     }
 
-    fn spawn_go_live(&self) {
-        let (d, c, snap, levels) = (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone());
+    /// T-0 for Go Live. Single-flight (`golive_in_flight`); the result is applied by the loop.
+    fn spawn_t0(&self) {
+        let (d, c, levels, aux) = (self.d.clone(), self.config(), self.levels.clone(), self.aux.clone());
         tokio::spawn(async move {
             let l = lock(&levels).clone();
-            match golive::t0(&d, &c, &l).await {
-                Ok(()) => snap.send_modify(|s| {
-                    s.stage = Stage::Live;
-                    remove(&mut s.offers, Offer::GoLive);
-                }),
-                Err(e) => set_warning(&snap, format!("Go Live did not complete: {e}")),
-            }
+            let r = golive::t0(&d, &c, &l).await;
+            let _ = aux.send(Aux::WentLive(r));
         });
     }
 
@@ -581,24 +695,28 @@ impl Engine {
         });
     }
 
+    /// Recover, then re-assess. Single-flight (`recover_in_flight`).
     fn spawn_recover(&self) {
         let (d, c, snap, levels, aux) =
             (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone(), self.aux.clone());
-        let bid = self.selected();
-        let player_active = matches!(self.running, Some(Running { job: Job::Video { .. }, .. }));
+        let (bid, player_active, epoch) = (self.selected(), self.video_running(), self.epoch);
         tokio::spawn(async move {
             let l = lock(&levels).clone();
-            if let Err(e) = recovery::recover(&d, &c, &l).await {
-                set_warning(&snap, format!("Recover could not finish: {e}"));
-            }
-            let a = recovery::assess(&d, &c, bid.as_deref(), player_active).await;
-            let _ = aux.send(Aux::Assessed(a));
+            let ok = match recovery::recover(&d, &c, &l).await {
+                Ok(()) => true,
+                Err(e) => {
+                    set_warning(&snap, format!("Recover could not finish: {e}"));
+                    false
+                }
+            };
+            let assessment = recovery::assess(&d, &c, bid.as_deref(), player_active).await;
+            let _ = aux.send(Aux::Recovered { epoch, ok, assessment });
         });
     }
 
     /// Optionally apply `fix` to broadcast `id`, then re-check it.
     fn spawn_check(&self, id: String, fix: Option<Fix>) {
-        let (d, snap, aux) = (self.d.clone(), self.snap.clone(), self.aux.clone());
+        let (d, snap, aux, sel_gen) = (self.d.clone(), self.snap.clone(), self.aux.clone(), self.sel_gen);
         tokio::spawn(async move {
             if let Some(f) = fix
                 && let Err(e) = d.yt.fix(&id, f).await
@@ -606,7 +724,7 @@ impl Engine {
                 set_warning(&snap, format!("Could not fix the broadcast: {e}"));
             }
             let check = d.yt.check(&id).await.map_err(|e| e.to_string());
-            let _ = aux.send(Aux::Checked { id, check });
+            let _ = aux.send(Aux::Checked { sel_gen, check });
         });
     }
 
@@ -614,21 +732,45 @@ impl Engine {
 
     fn apply_aux(&mut self, a: Aux) {
         match a {
-            Aux::Checked { id, check } => {
-                let b = self.summary_for(&id);
-                self.set(|s| {
-                    s.broadcast = Some(b);
-                    match check {
-                        Ok(c) => s.check = Some(c),
-                        Err(e) => {
-                            s.check = None;
-                            s.last_warning = Some(format!("Could not check the broadcast: {e}"));
-                        }
+            Aux::Checked { sel_gen, check } => {
+                if sel_gen != self.sel_gen {
+                    info!("dropping a broadcast check for an earlier selection");
+                    return;
+                }
+                self.set(|s| match check {
+                    Ok(c) => s.check = Some(c),
+                    Err(e) => {
+                        s.check = None;
+                        s.last_warning = Some(format!("Could not check the broadcast: {e}"));
                     }
                 });
             }
             Aux::Refreshed(r) => self.apply_refresh(*r),
-            Aux::Assessed(a) => self.apply_assessment(a),
+            Aux::Recovered { epoch, ok, assessment } => {
+                self.recover_in_flight = false;
+                if ok {
+                    self.set(|s| s.mics_ducked = false);
+                }
+                self.apply_assessment(assessment, epoch);
+                self.maybe_start_end();
+            }
+            Aux::WentLive(r) => {
+                self.golive_in_flight = false;
+                match r {
+                    Ok(()) if matches!(self.stage(), Stage::Ending { .. } | Stage::Ended) => {
+                        info!("Go Live finished after End Service; the stage stays as it is");
+                    }
+                    Ok(()) => {
+                        self.epoch += 1;
+                        self.set(|s| {
+                            s.stage = Stage::Live;
+                            remove(&mut s.offers, Offer::GoLive);
+                        });
+                    }
+                    Err(e) => set_warning(&self.snap, format!("Go Live did not complete: {e}")),
+                }
+                self.maybe_start_end();
+            }
             Aux::ClearFlash(generation) => {
                 if generation == self.flash_gen {
                     self.set(|s| s.flash = None);
@@ -639,32 +781,60 @@ impl Engine {
 
     fn apply_refresh(&mut self, r: Refreshed) {
         self.broadcasts = r.report.broadcasts;
+        let current_sel = r.sel_gen == self.sel_gen;
         let broadcast = r.selected.as_deref().map(|id| self.summary_for(id));
         let errors = r.report.device_errors.join("; ");
         self.set(|s| {
-            s.broadcast = broadcast;
-            s.check = r.check;
+            if current_sel {
+                s.broadcast = broadcast;
+                s.check = r.check;
+            }
             if !errors.is_empty() {
                 s.last_warning = Some(errors);
             }
         });
-        self.apply_assessment(r.assessment);
+        self.apply_assessment(r.assessment, r.epoch);
     }
 
-    /// Offers always follow the assessment; the stage only when no job is running.
-    fn apply_assessment(&self, a: Assessment) {
-        let busy = self.running.is_some();
+    /// A current assessment sets the offers, and the stage when no job runs. A
+    /// stale one (the epoch has moved on) never sets the stage and only adds offers.
+    fn apply_assessment(&self, a: Assessment, epoch: u64) {
+        let current = epoch == self.epoch;
+        let busy = self.running.is_some() || self.golive_in_flight;
+        if !current {
+            info!("merging the offers of a stale assessment");
+        }
         self.set(|s| {
-            s.offers = a.offer;
-            if !busy {
-                s.stage = a.stage;
+            if current {
+                s.offers = a.offer;
+                if !busy {
+                    s.stage = a.stage;
+                }
+            } else {
+                for o in a.offer {
+                    add(&mut s.offers, o);
+                }
             }
         });
     }
 }
 
+/// Prepare never moves the stage off Live (Go Live may have landed meanwhile).
+fn set_prepared(s: &mut Snapshot, r: Readiness) {
+    if s.stage != Stage::Live {
+        s.stage = Stage::Prepared(r);
+    }
+}
+
 /// Stage 0 plus assessment. Keeps `current` selected if it is still upcoming.
-async fn refresh(d: Devices, c: Config, current: Option<String>, player_active: bool) -> Refreshed {
+async fn refresh(
+    d: Devices,
+    c: Config,
+    current: Option<String>,
+    player_active: bool,
+    epoch: u64,
+    sel_gen: u64,
+) -> Refreshed {
     let mut report = golive::stage0(&d).await;
     let selected = current
         .filter(|id| report.broadcasts.iter().any(|b| &b.id == id))
@@ -680,7 +850,7 @@ async fn refresh(d: Devices, c: Config, current: Option<String>, player_active: 
         _ => report.check,
     };
     let assessment = recovery::assess(&d, &c, selected.as_deref(), player_active).await;
-    Refreshed { report, selected, check, assessment }
+    Refreshed { epoch, sel_gen, report, selected, check, assessment }
 }
 
 fn read(c: &RwLock<Config>) -> Config {
@@ -1055,5 +1225,199 @@ mod tests {
         send(&e, Command::SelectBroadcast("b2".into())).await;
         let s = until(&mut e, "b2", |s| s.broadcast.as_ref().is_some_and(|b| b.id == "b2")).await;
         assert_eq!(s.check.map(|c| c.bound_to_ours), Some(false));
+    }
+
+    // ---- R13 ----
+
+    fn stream_autos(log: &CallLog) -> usize {
+        count(log, |c| *c == Call::StreamAuto)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn golive_mid_countdown_preempts() {
+        let (d, log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        send(&e, Command::GoLive).await;
+        until(&mut e, "Live", |s| s.stage == Stage::Live).await;
+        let calls = log.calls();
+        // The countdown's cancel path (video stopped, counter cleared) runs before t0.
+        assert!(pos(&calls, &Call::PlayerStop) < pos(&calls, &Call::StreamAuto), "{calls:?}");
+        assert_eq!(stream_autos(&log), 1, "{calls:?}");
+        // The countdown is gone: its video ending changes nothing.
+        h.player.emit(PlayerEvent::Ended);
+        sleep(Duration::from_secs(15)).await;
+        assert_eq!(stream_autos(&log), 1, "{:?}", log.calls());
+        assert_eq!(snap(&e).stage, Stage::Live);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn double_golive_ignored() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::GoLive).await;
+        send(&e, Command::GoLive).await;
+        until(&mut e, "Live", |s| s.stage == Stage::Live).await;
+        sleep(Duration::from_secs(5)).await;
+        assert_eq!(stream_autos(&log), 1, "{:?}", log.calls());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_countdown_after_golive_does_not_reopen_prepare() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        // Presses while Go Live is in flight.
+        send(&e, Command::GoLive).await;
+        send(&e, Command::StopCountdown).await;
+        sleep(MS(50)).await; // the countdown has returned; t0 is still fading the mics up
+        send(&e, Command::Prepare).await;
+        until(&mut e, "Live", |s| s.stage == Stage::Live).await;
+        // Presses once live.
+        send(&e, Command::StopCountdown).await;
+        send(&e, Command::Prepare).await;
+        sleep(Duration::from_secs(5)).await;
+        assert_eq!(snap(&e).stage, Stage::Live);
+        assert!(!log.calls().contains(&Call::EncoderStart), "{:?}", log.calls());
+        assert_eq!(count(&log, |c| matches!(c, Call::StreamSetMediaStill(..))), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recover_during_video_waits_for_return_path() {
+        let (d, log, _h) = rig();
+        let c = cfg(vec![cue("a", Destination::HallAndOnline)]);
+        c.write().unwrap().videohub.fallback_normal_input = CAM8;
+        let mut e = Engine::spawn(d, c);
+        send(&e, Command::PlayCue(0)).await;
+        // Recover pressed in the VideoHub settle window.
+        until_call(&log, Call::HubRoute { output: OUT, input: DK }).await;
+        send(&e, Command::Recover).await;
+        for _ in 0..1000 {
+            if count(&log, |c| *c == Call::HubRoute { output: OUT, input: CAM8 }) == 2 {
+                break;
+            }
+            sleep(MS(10)).await;
+        }
+        let calls = log.calls();
+        let restores: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c == Call::HubRoute { output: OUT, input: CAM8 })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(restores.len(), 2, "{calls:?}");
+        // Nothing touched the route before the roll-in stopped its video.
+        assert!(pos(&calls, &Call::PlayerStop) < restores[0], "{calls:?}");
+        // The roll-in never went on air (it was stopped during the settle).
+        assert!(!calls.contains(&Call::StreamSetPreview(8)), "{calls:?}");
+        let s = until(&mut e, "cue played", |s| s.cues[0].1 == CueState::Played).await;
+        assert_eq!(s.playing, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn double_recover_ignored() {
+        let (d, log, _h) = rig();
+        let e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Recover).await;
+        send(&e, Command::Recover).await;
+        sleep(Duration::from_secs(5)).await;
+        let in8_off = Call::StreamSetAudioOn(AudioSourceId { input: 8, source: -65280 }, false);
+        assert_eq!(count(&log, |c| *c == in8_off), 1, "{:?}", log.calls());
+        // Once it has finished, Recover is accepted again.
+        send(&e, Command::Recover).await;
+        sleep(Duration::from_secs(5)).await;
+        assert_eq!(count(&log, |c| *c == in8_off), 2, "{:?}", log.calls());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_refresh_does_not_overwrite_live() {
+        let (d, _log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        // A slow Refresh whose assessment (broadcast state unreadable) says Idle.
+        h.yt.set_delay("upcoming", Duration::from_secs(5));
+        h.yt.fail_next("life_cycle");
+        send(&e, Command::Refresh).await;
+        sleep(MS(10)).await;
+        h.player.emit(PlayerEvent::Ended);
+        until(&mut e, "Live", |s| s.stage == Stage::Live).await;
+        sleep(Duration::from_secs(10)).await;
+        assert_eq!(snap(&e).stage, Stage::Live);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn later_select_wins() {
+        let (d, _log, h) = rig();
+        h.yt.set_upcoming(vec![summary("b1"), summary("b2"), summary("b3")]);
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        until(&mut e, "b1", |s| s.broadcast.as_ref().is_some_and(|b| b.id == "b1")).await;
+        h.yt.set_delay("check", Duration::from_secs(5));
+        send(&e, Command::SelectBroadcast("b2".into())).await;
+        sleep(MS(10)).await;
+        h.yt.set_delay("check", Duration::ZERO);
+        send(&e, Command::SelectBroadcast("b3".into())).await;
+        until(&mut e, "b3", |s| s.broadcast.as_ref().is_some_and(|b| b.id == "b3")).await;
+        sleep(Duration::from_secs(10)).await;
+        let s = snap(&e);
+        assert_eq!(s.broadcast.map(|b| b.id).as_deref(), Some("b3"));
+        assert!(s.check.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_without_public_offers_go_public() {
+        let (d, _log, h) = rig();
+        h.yt.fail_times("transition", 4);
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        h.player.emit(PlayerEvent::Ended);
+        let s = until(&mut e, "GoPublic offered", |s| s.offers.contains(&Offer::GoPublic)).await;
+        assert_eq!(s.stage, Stage::Live);
+        assert!(!s.offers.contains(&Offer::GoLive));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_and_public_offers_nothing() {
+        let (d, _log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        h.player.emit(PlayerEvent::Ended);
+        until(&mut e, "Live", |s| s.stage == Stage::Live).await;
+        sleep(Duration::from_secs(15)).await;
+        assert!(snap(&e).offers.is_empty(), "{:?}", snap(&e).offers);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mics_stay_ducked_until_unmute_fade_succeeds() {
+        let (d, log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![cue("a", Destination::HallAndOnline)]));
+        send(&e, Command::PlayCue(0)).await;
+        until_call(&log, Call::PlayerPlay).await;
+        sleep(MS(1500)).await;
+        h.stream.fail_next("set_audio_level");
+        send(&e, Command::UnmuteMics).await;
+        sleep(MS(1500)).await;
+        assert!(snap(&e).mics_ducked, "the fade up failed, so the mics are still down");
+        // A second press works.
+        send(&e, Command::UnmuteMics).await;
+        until(&mut e, "unducked", |s| !s.mics_ducked).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_fade_up_keeps_mics_ducked() {
+        let (d, log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![cue("a", Destination::HallAndOnline)]));
+        send(&e, Command::PlayCue(0)).await;
+        until_call(&log, Call::PlayerPlay).await;
+        sleep(MS(1500)).await;
+        h.stream.fail_next("audio_level"); // the return-path fade up cannot start
+        h.player.emit(PlayerEvent::Ended);
+        let s = until(&mut e, "cue error", |s| matches!(s.cues[0].1, CueState::Error(_))).await;
+        assert!(s.mics_ducked);
+        assert!(s.offers.contains(&Offer::Recover));
     }
 }

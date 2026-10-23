@@ -225,6 +225,20 @@ pub async fn play(
     stop: CancellationToken,
     unmute: Arc<Notify>,
 ) -> RollinOutcome {
+    play_reporting(d, c, cue, levels, stop, unmute, |_| {}).await
+}
+
+/// `play`, also reporting the mics: `mics_ducked(true)` as the fade down starts,
+/// `mics_ducked(false)` only once a fade back up has succeeded.
+pub async fn play_reporting(
+    d: &Devices,
+    c: &Config,
+    cue: &Cue,
+    levels: &mut LiveLevels,
+    stop: CancellationToken,
+    unmute: Arc<Notify>,
+    mics_ducked: impl Fn(bool),
+) -> RollinOutcome {
     let sa = &c.stream_atem;
     let hub = &c.videohub;
     let dest = cue.destination;
@@ -307,6 +321,9 @@ pub async fn play(
         }
     }
     // 4. Play, with the mic fade-down running alongside.
+    if mics_down {
+        mics_ducked(true);
+    }
     let fade_down = async {
         if mics_down { fade(&*d.stream, &sa.mic_sources, Target::Floor, sa.fade).await } else { Ok(()) }
     };
@@ -347,7 +364,10 @@ pub async fn play(
                     // Only a fade that worked counts: otherwise Unmute stays armed
                     // and the return path still fades the mics up.
                     match fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
-                        Ok(()) => unmuted = true,
+                        Ok(()) => {
+                            unmuted = true;
+                            mics_ducked(false);
+                        }
                         Err(e) => note(&mut problems, format!("Could not fade the mics up: {e}")),
                     }
                 }
@@ -401,8 +421,11 @@ pub async fn play(
         }
     }
     if mics_down {
-        if !unmuted && let Err(e) = fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
-            note(&mut problems, format!("Could not fade the mics up: {e}"));
+        if !unmuted {
+            match fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
+                Ok(()) => mics_ducked(false),
+                Err(e) => note(&mut problems, format!("Could not fade the mics up: {e}")),
+            }
         }
         if !audio_off_first && let Err(e) = d.stream.set_audio_on(in8, false).await {
             note(&mut problems, format!("Could not turn off input 8 audio: {e}"));
