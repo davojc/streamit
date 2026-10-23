@@ -179,7 +179,7 @@ mod tests {
         (d, log, h)
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn assess_makes_no_action_calls() {
         let (d, log, h) = rig();
         h.stream.set_program_state(8);
@@ -193,14 +193,14 @@ mod tests {
         assert!(log.calls().is_empty(), "{:?}", log.calls());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn quiet_start_is_idle_with_no_offers() {
         let (d, _l, _h) = rig();
         let a = assess(&d, &cfg(), None, false).await;
         assert_eq!(a, Assessment { stage: Stage::Idle, offer: vec![] });
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn stuck_on_decklink_offers_recover() {
         let (d, _l, h) = rig();
         h.stream.set_program_state(8);
@@ -211,7 +211,7 @@ mod tests {
         assert!(assess(&d, &cfg(), None, true).await.offer.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn screens_on_decklink_or_route_on_decklink_offers_recover() {
         let (d, _l, h) = rig();
         h.screens.set_program_state(8);
@@ -221,7 +221,7 @@ mod tests {
         assert_eq!(assess(&d, &cfg(), None, false).await.offer, vec![Offer::Recover]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn muted_mics_on_live_stream_offer_recover() {
         let (d, _l, h) = rig();
         h.encoder.set_status(EncoderStatus::Streaming);
@@ -231,7 +231,7 @@ mod tests {
         assert!(assess(&d, &cfg(), None, false).await.offer.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn testing_broadcast_offers_go_public_and_go_live() {
         let (d, _l, h) = rig();
         h.encoder.set_status(EncoderStatus::Streaming);
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(a.stage, Stage::Idle);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn live_broadcast_on_live_input_is_live() {
         let (d, _l, h) = rig();
         h.encoder.set_status(EncoderStatus::Streaming);
@@ -254,7 +254,7 @@ mod tests {
         assert!(a.offer.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn live_on_media_player_offers_go_live_and_end() {
         let (d, _l, h) = rig();
         h.yt.set_life_cycle("live");
@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(a.offer, vec![Offer::GoLive, Offer::EndBroadcast]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn failed_reads_are_unknown_and_offer_nothing() {
         let (d, _l, h) = rig();
         h.stream.fail_next("program");
@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(a, Assessment { stage: Stage::Idle, offer: vec![] });
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn unreadable_program_while_streaming_is_idle() {
         let (d, _l, h) = rig();
         h.encoder.set_status(EncoderStatus::Streaming);
@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(a.stage, Stage::Idle);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn recover_restores_route_after_cutting_away() {
         let (d, log, h) = rig();
         h.stream.set_program_state(8);
@@ -303,10 +303,12 @@ mod tests {
         let route = pos(&Call::HubRoute { output: OUT, input: CAM8 });
         assert!(pos(&Call::StreamAuto) < route && pos(&Call::ScreensAuto) < route);
         assert!(pos(&Call::StreamSetAudioOn(AudioSourceId { input: 8, source: STEREO_SOURCE }, false)) < route);
+        let last_fade = calls.iter().rposition(|c| matches!(c, Call::StreamSetAudioLevel(..))).expect("mics faded");
+        assert!(last_fade < route, "mic fade must precede the route restore");
         assert_eq!(route, calls.len() - 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn recover_with_preview_holding_cue_just_autos() {
         let (d, log, h) = rig();
         h.stream.set_program_state(8);
@@ -316,7 +318,7 @@ mod tests {
         assert!(log.calls().contains(&Call::StreamAuto));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn recover_skips_route_when_stream_still_on_decklink() {
         let (d, log, h) = rig();
         h.stream.set_program_state(8);
