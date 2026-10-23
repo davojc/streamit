@@ -1,0 +1,226 @@
+//! Logging decorators for the device traits. Every action call is logged at `info` with
+//! its arguments and result (`warn` when it fails); read getters (program, route_of,
+//! status, signed_in, upcoming, check, health, life_cycle, audio_level, position) are
+//! not logged, because the health poll calls them every 2 s. Arguments are numbers,
+//! file paths and broadcast ids only: no tokens or secrets pass through these traits.
+use async_trait::async_trait;
+use std::fmt::Debug;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+use streamit_core::config::AudioSourceId;
+use streamit_core::devices::{
+    BroadcastCheck, BroadcastSummary, Broadcasts, Counter, Encoder, EncoderStatus, Fix, Health, Phase,
+    Player, PlayerEvent, Result, Router, StreamSwitcher, Switcher,
+};
+use tokio::sync::broadcast;
+use tracing::{info, warn};
+
+pub struct Logged<T: ?Sized> {
+    device: &'static str,
+    inner: Arc<T>,
+}
+
+impl<T: ?Sized> Logged<T> {
+    pub fn wrap(device: &'static str, inner: Arc<T>) -> Arc<Logged<T>> {
+        Arc::new(Logged { device, inner })
+    }
+}
+
+fn done<R: Debug>(device: &str, call: String, r: Result<R>) -> Result<R> {
+    match &r {
+        Ok(v) => info!(device, call = %call, result = ?v, "device call"),
+        Err(e) => warn!(device, call = %call, error = %e, "device call failed"),
+    }
+    r
+}
+
+#[async_trait]
+impl<T: Switcher + ?Sized> Switcher for Logged<T> {
+    async fn program(&self) -> Result<u16> {
+        self.inner.program().await
+    }
+    async fn preview(&self) -> Result<u16> {
+        self.inner.preview().await
+    }
+    async fn set_preview(&self, input: u16) -> Result<()> {
+        done(self.device, format!("set_preview({input})"), self.inner.set_preview(input).await)
+    }
+    async fn set_program(&self, input: u16) -> Result<()> {
+        done(self.device, format!("set_program({input})"), self.inner.set_program(input).await)
+    }
+    async fn auto(&self) -> Result<()> {
+        done(self.device, "auto()".into(), self.inner.auto().await)
+    }
+    async fn wait_transition_done(&self, timeout: Duration) -> Result<()> {
+        done(self.device, format!("wait_transition_done({timeout:?})"), self.inner.wait_transition_done(timeout).await)
+    }
+}
+
+#[async_trait]
+impl<T: StreamSwitcher + ?Sized> StreamSwitcher for Logged<T> {
+    async fn set_media_player_still(&self, player: u8, still: u16) -> Result<()> {
+        done(
+            self.device,
+            format!("set_media_player_still({player}, {still})"),
+            self.inner.set_media_player_still(player, still).await,
+        )
+    }
+    fn media_player_input(&self, player: u8) -> u16 {
+        self.inner.media_player_input(player)
+    }
+    async fn audio_level(&self, src: AudioSourceId) -> Result<f32> {
+        self.inner.audio_level(src).await
+    }
+    async fn set_audio_level(&self, src: AudioSourceId, db: f32) -> Result<()> {
+        done(
+            self.device,
+            format!("set_audio_level({}/{}, {db} dB)", src.input, src.source),
+            self.inner.set_audio_level(src, db).await,
+        )
+    }
+    async fn set_audio_on(&self, src: AudioSourceId, on: bool) -> Result<()> {
+        done(
+            self.device,
+            format!("set_audio_on({}/{}, {on})", src.input, src.source),
+            self.inner.set_audio_on(src, on).await,
+        )
+    }
+}
+
+#[async_trait]
+impl<T: Router + ?Sized> Router for Logged<T> {
+    async fn route_of(&self, output: u16) -> Result<u16> {
+        self.inner.route_of(output).await
+    }
+    async fn route(&self, output: u16, input: u16) -> Result<()> {
+        done(self.device, format!("route({output}, {input})"), self.inner.route(output, input).await)
+    }
+}
+
+#[async_trait]
+impl<T: Encoder + ?Sized> Encoder for Logged<T> {
+    async fn start(&self) -> Result<()> {
+        done(self.device, "start()".into(), self.inner.start().await)
+    }
+    async fn stop(&self) -> Result<()> {
+        done(self.device, "stop()".into(), self.inner.stop().await)
+    }
+    async fn status(&self) -> Result<EncoderStatus> {
+        self.inner.status().await
+    }
+}
+
+#[async_trait]
+impl<T: Broadcasts + ?Sized> Broadcasts for Logged<T> {
+    async fn signed_in(&self) -> Result<bool> {
+        self.inner.signed_in().await
+    }
+    async fn upcoming(&self) -> Result<Vec<BroadcastSummary>> {
+        self.inner.upcoming().await
+    }
+    async fn check(&self, id: &str) -> Result<BroadcastCheck> {
+        self.inner.check(id).await
+    }
+    async fn fix(&self, id: &str, fix: Fix) -> Result<()> {
+        done(self.device, format!("fix({id}, {fix:?})"), self.inner.fix(id, fix).await)
+    }
+    async fn health(&self) -> Result<Health> {
+        self.inner.health().await
+    }
+    async fn life_cycle(&self, id: &str) -> Result<String> {
+        self.inner.life_cycle(id).await
+    }
+    async fn transition(&self, id: &str, to: Phase) -> Result<()> {
+        done(self.device, format!("transition({id}, {to:?})"), self.inner.transition(id, to).await)
+    }
+}
+
+#[async_trait]
+impl<T: Player + ?Sized> Player for Logged<T> {
+    async fn load(&self, path: &Path, gain_db: f32) -> Result<Duration> {
+        done(self.device, format!("load({}, {gain_db} dB)", path.display()), self.inner.load(path, gain_db).await)
+    }
+    async fn play(&self) -> Result<()> {
+        done(self.device, "play()".into(), self.inner.play().await)
+    }
+    async fn stop(&self) -> Result<()> {
+        done(self.device, "stop()".into(), self.inner.stop().await)
+    }
+    fn position(&self) -> Option<Duration> {
+        self.inner.position()
+    }
+    fn events(&self) -> broadcast::Receiver<PlayerEvent> {
+        self.inner.events()
+    }
+}
+
+#[async_trait]
+impl<T: Counter + ?Sized> Counter for Logged<T> {
+    async fn show(&self, remaining: Duration) -> Result<()> {
+        done(self.device, format!("show({}s)", remaining.as_secs()), self.inner.show(remaining).await)
+    }
+    async fn clear(&self) -> Result<()> {
+        done(self.device, "clear()".into(), self.inner.clear().await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use streamit_core::fakes::{Call, fake_devices};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Capture {
+            self.clone()
+        }
+    }
+
+    impl Capture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_actions_with_args_and_forwards_results() {
+        let cap = Capture::default();
+        let sub = tracing_subscriber::fmt().with_writer(cap.clone()).with_ansi(false).finish();
+        let _g = tracing::subscriber::set_default(sub);
+        let (d, log, h) = fake_devices();
+        let hub = Logged::wrap("VideoHub", d.hub.clone());
+
+        assert_eq!(hub.route(3, 5).await, Ok(()));
+        assert!(log.calls().contains(&Call::HubRoute { output: 3, input: 5 }));
+        assert_eq!(hub.route_of(3).await, Ok(5)); // forwarded, not logged
+        h.hub.fail_next("route");
+        assert!(hub.route(4, 6).await.is_err());
+
+        let yt = Logged::wrap("YouTube", d.yt.clone());
+        yt.transition("b1", Phase::Live).await.unwrap();
+
+        let text = cap.text();
+        let line = |needle: &str| text.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle} in {text}"));
+        assert!(line("route(3, 5)").contains("INFO"), "{text}");
+        assert!(line("route(3, 5)").contains("VideoHub"), "{text}");
+        assert!(line("route(4, 6)").contains("WARN"), "{text}");
+        assert!(line("transition(b1, Live)").contains("INFO"), "{text}");
+        assert!(!text.contains("route_of"), "reads are not logged: {text}");
+    }
+}

@@ -41,7 +41,8 @@ const STATUS_KEYS: [(DeviceKind, &str); 7] = [
     (DeviceKind::DeckLink, "DECKLINK"),
     (DeviceKind::Ndi, "NDI"),
 ];
-const PHASE_KEY: u8 = 7;
+/// The key that shows the service stage (top right).
+pub const PHASE_KEY: u8 = 7;
 
 const PREPARE: u8 = 8;
 const COUNTDOWN: u8 = 9;

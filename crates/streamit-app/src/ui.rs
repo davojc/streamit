@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use streamit_core::config::{AudioSourceId, Config};
 use streamit_core::devices::{BroadcastSummary, Broadcasts, Fix};
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
+use streamit_core::golive::Stage;
 use streamit_core::rollin::{Cue, CueState, Destination, MAX_CUES};
 use streamit_deck::layout::{self, KEYS, Rgb};
 use streamit_youtube::{API_BASE, Auth, StreamSummary, YouTubeClient};
@@ -115,9 +116,23 @@ fn device_settings(c: &Config) -> impl PartialEq + use<> {
             c.web_presenter.address.clone(),
         ),
         c.youtube.clone(),
-        c.playout.clone(),
+        // The countdown file is read when the countdown starts, so it is not listed.
+        (c.playout.decklink_device, c.playout.video_mode.clone()),
         c.ndi.clone(),
     )
+}
+
+/// Where the settings live, and whether the window may write them (false when an
+/// unreadable file could not be backed up).
+pub struct ConfigFile {
+    pub path: PathBuf,
+    pub writable: bool,
+}
+
+/// Closing now could leave the service half done: the service has started and not
+/// ended, or a sequence or a video is running.
+fn service_at_risk(s: &Snapshot) -> bool {
+    !matches!(s.stage, Stage::Idle | Stage::Ended) || s.job.is_some() || s.playing.is_some()
 }
 
 pub struct StreamItApp {
@@ -126,7 +141,11 @@ pub struct StreamItApp {
     snap: watch::Receiver<Snapshot>,
     yt: Arc<dyn Broadcasts>,
     config: Arc<RwLock<Config>>,
-    config_path: PathBuf,
+    file: ConfigFile,
+    ctx: egui::Context,
+    /// The close button was pressed during a service: ask first.
+    confirm_close: bool,
+    close_confirmed: bool,
     /// The config the devices were built from.
     startup: Config,
     draft: Config,
@@ -153,14 +172,18 @@ pub struct StreamItApp {
     streams: Vec<StreamSummary>,
     streams_job: Pending<Result<Vec<StreamSummary>, String>>,
     streams_status: String,
+    /// File dialogs run on the runtime (they would block the window); results land here.
+    add_files_job: Pending<Vec<PathBuf>>,
+    countdown_job: Pending<Option<PathBuf>>,
 }
 
 impl StreamItApp {
     pub fn new(
+        ctx: &egui::Context,
         rt: Handle,
         s: Started,
         config: Arc<RwLock<Config>>,
-        config_path: PathBuf,
+        file: ConfigFile,
         startup: Config,
         load_error: Option<String>,
     ) -> StreamItApp {
@@ -171,7 +194,10 @@ impl StreamItApp {
             snap: s.snap,
             yt: s.yt,
             config,
-            config_path,
+            file,
+            ctx: ctx.clone(),
+            confirm_close: false,
+            close_confirmed: false,
             live_inputs_text: join_inputs(&draft.stream_atem.live_inputs),
             cues: startup.cues.clone(),
             engine_cues: startup.cues.clone(),
@@ -193,9 +219,11 @@ impl StreamItApp {
             streams: Vec::new(),
             streams_job: Pending::default(),
             streams_status: String::new(),
+            add_files_job: Pending::default(),
+            countdown_job: Pending::default(),
         };
-        app.load_broadcasts(None);
-        app.scan(None);
+        app.load_broadcasts();
+        app.scan();
         app
     }
 
@@ -205,16 +233,14 @@ impl StreamItApp {
         }
     }
 
-    fn load_broadcasts(&mut self, ctx: Option<&egui::Context>) {
+    fn load_broadcasts(&mut self) {
         let yt = self.yt.clone();
-        let ctx = ctx.cloned().unwrap_or_default();
         self.broadcasts_job
-            .start(&self.rt, &ctx, async move { yt.upcoming().await.map_err(|e| e.to_string()) });
+            .start(&self.rt, &self.ctx, async move { yt.upcoming().await.map_err(|e| e.to_string()) });
     }
 
-    fn scan(&mut self, ctx: Option<&egui::Context>) {
-        let ctx = ctx.cloned().unwrap_or_default();
-        self.scan_job.start(&self.rt, &ctx, async move {
+    fn scan(&mut self) {
+        self.scan_job.start(&self.rt, &self.ctx, async move {
             tokio::task::spawn_blocking(|| discovery::browse(SCAN_FOR)).await.unwrap_or_default()
         });
     }
@@ -242,7 +268,7 @@ impl StreamItApp {
                     // The running YouTube client reads the new sign-in from the Credential
                     // Manager; refresh the engine and the broadcast list.
                     self.send(Command::Refresh);
-                    self.load_broadcasts(None);
+                    self.load_broadcasts();
                     if device_settings(&self.draft) != device_settings(&self.startup) {
                         format!("Signed in. {RESTART_NOTE} (YouTube settings changed).")
                     } else {
@@ -261,6 +287,29 @@ impl StreamItApp {
                 Err(e) => self.streams_status = format!("Could not list streams: {e}"),
             }
         }
+        if let Some(f) = self.countdown_job.take().flatten() {
+            self.draft.playout.countdown_file = f;
+        }
+    }
+
+    /// Adds the files the dialog returned, unless a video started meanwhile.
+    fn take_added_files(&mut self, snap: &Snapshot) {
+        let Some(files) = self.add_files_job.take() else { return };
+        if files.is_empty() {
+            return;
+        }
+        if snap.playing.is_some() {
+            self.notice = Some("Videos not added: the cue list is locked while a video plays.".into());
+            return;
+        }
+        let room = MAX_CUES.saturating_sub(self.cues.len());
+        if files.len() > room {
+            self.notice = Some(format!("Only {room} more video(s) fit in the cue list ({MAX_CUES} at most)."));
+        }
+        for f in files.into_iter().take(room) {
+            self.cues.push(new_cue(&f));
+        }
+        self.cues_dirty_at = Some(Instant::now());
     }
 
     /// Keeps the window's cue list and the engine's in step, and saves the engine's list.
@@ -300,7 +349,10 @@ impl StreamItApp {
             c.clone()
         };
         self.draft.cues = cues.to_vec();
-        if let Err(e) = c.save(&self.config_path) {
+        if !self.file.writable {
+            return;
+        }
+        if let Err(e) = c.save(&self.file.path) {
             warn!("saving the cue list: {e:#}");
             self.notice = Some(format!("Could not save the cue list: {e:#}"));
         }
@@ -321,9 +373,13 @@ impl StreamItApp {
             *shared = c.clone();
             c
         };
-        match c.save(&self.config_path) {
+        if !self.file.writable {
+            self.notice = Some("Not saved: the settings file could not be backed up (see the log).".into());
+            return;
+        }
+        match c.save(&self.file.path) {
             Ok(()) => {
-                info!(path = %self.config_path.display(), "settings saved");
+                info!(path = %self.file.path.display(), "settings saved");
                 let restart = device_settings(&c) != device_settings(&self.startup);
                 self.notice = Some(if restart {
                     format!("Saved. {RESTART_NOTE}.")
@@ -339,11 +395,55 @@ impl StreamItApp {
     }
 }
 
+impl StreamItApp {
+    /// The window's close button during a service asks first; it closes only on an
+    /// explicit confirm.
+    fn close_guard(&mut self, ui: &mut Ui, snap: &Snapshot) {
+        let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.viewport().close_requested()) && !self.close_confirmed && service_at_risk(snap) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            info!("close requested during a service; asking for confirmation");
+            self.confirm_close = true;
+        }
+        if !self.confirm_close {
+            return;
+        }
+        let what = match (&snap.job, snap.playing) {
+            (_, Some(i)) => format!("Video {} is playing.", i + 1),
+            (Some(job), None) => format!("{job} is running."),
+            (None, None) => format!("The service is at stage {:?}.", snap.stage),
+        };
+        egui::Modal::new(egui::Id::unique("confirm_close")).show(&ctx, |ui| {
+            ui.heading("Close StreamIt during the service?");
+            ui.label(what);
+            ui.label(
+                "Closing stops the Stream Deck and leaves the devices as they are now: a video, \
+                 the countdown or End Service stops part-way, and nothing returns the switchers, \
+                 the mics or the stream to normal. The YouTube broadcast and the Web Presenter keep \
+                 going until someone ends them.",
+            );
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new("Keep StreamIt open").strong()).clicked() {
+                    self.confirm_close = false;
+                }
+                if ui.button(RichText::new("Close anyway").color(Color32::RED)).clicked() {
+                    warn!("closing during the service (confirmed)");
+                    self.close_confirmed = true;
+                    self.confirm_close = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+        });
+    }
+}
+
 impl eframe::App for StreamItApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.poll_jobs();
         let snap = self.snap.borrow().clone();
+        self.take_added_files(&snap);
         self.sync_cues(&snap);
+        self.close_guard(ui, &snap);
         // Keep blinking keys, the countdown and device colours current.
         ui.ctx().request_repaint_after(Duration::from_millis(250));
 
@@ -417,7 +517,7 @@ impl StreamItApp {
 
         // Stage, warning, flash.
         ui.horizontal(|ui| {
-            let phase = layout::appearance(7, snap, blink);
+            let phase = layout::appearance(layout::PHASE_KEY, snap, blink);
             ui.label(
                 RichText::new(format!(" {} ", phase.text.replace('\n', " ")))
                     .size(22.0)
@@ -510,8 +610,7 @@ impl StreamItApp {
             let busy = self.broadcasts_job.running;
             if ui.add_enabled(!busy, egui::Button::new("Refresh")).clicked() {
                 self.send(Command::Refresh);
-                let ctx = ui.ctx().clone();
-                self.load_broadcasts(Some(&ctx));
+                self.load_broadcasts();
             }
             if busy {
                 ui.spinner();
@@ -551,16 +650,17 @@ impl StreamItApp {
         }
         let mut changed = false;
         ui.add_enabled_ui(!locked, |ui| {
-            if ui.add_enabled(self.cues.len() < MAX_CUES, egui::Button::new("Add videos...")).clicked()
-                && let Some(files) = rfd::FileDialog::new()
-                    .add_filter("Video", &["mp4", "mov", "m4v", "mkv", "mxf", "avi", "ts"])
-                    .add_filter("All files", &["*"])
-                    .pick_files()
-            {
-                for f in files.into_iter().take(MAX_CUES - self.cues.len()) {
-                    self.cues.push(new_cue(&f));
-                    changed = true;
-                }
+            let can_add = self.cues.len() < MAX_CUES && !self.add_files_job.running;
+            if ui.add_enabled(can_add, egui::Button::new("Add videos...")).clicked() {
+                self.add_files_job.start(&self.rt, &self.ctx, async {
+                    rfd::AsyncFileDialog::new()
+                        .add_filter("Video", &["mp4", "mov", "m4v", "mkv", "mxf", "avi", "ts"])
+                        .add_filter("All files", &["*"])
+                        .pick_files()
+                        .await
+                        .map(|v| v.iter().map(|f| f.path().to_path_buf()).collect())
+                        .unwrap_or_default()
+                });
             }
             let mut action: Option<(usize, i8)> = None; // -1 up, 1 down, 0 remove
             egui::Grid::new("cues").striped(true).show(ui, |ui| {
@@ -726,8 +826,7 @@ impl StreamItApp {
         ui.horizontal(|ui| {
             let busy = self.scan_job.running;
             if ui.add_enabled(!busy, egui::Button::new("Scan")).clicked() {
-                let ctx = ui.ctx().clone();
-                self.scan(Some(&ctx));
+                self.scan();
             }
             if busy {
                 ui.spinner();
@@ -945,10 +1044,14 @@ impl StreamItApp {
                 if ui.add(egui::TextEdit::singleline(&mut s).desired_width(360.0)).changed() {
                     c.playout.countdown_file = PathBuf::from(s);
                 }
-                if ui.button("Browse...").clicked()
-                    && let Some(f) = rfd::FileDialog::new().add_filter("Video", &["mp4", "mov", "m4v", "mkv"]).pick_file()
-                {
-                    c.playout.countdown_file = f;
+                if ui.add_enabled(!self.countdown_job.running, egui::Button::new("Browse...")).clicked() {
+                    self.countdown_job.start(&self.rt, &self.ctx, async {
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("Video", &["mp4", "mov", "m4v", "mkv"])
+                            .pick_file()
+                            .await
+                            .map(|f| f.path().to_path_buf())
+                    });
                 }
             });
             ui.end_row();
@@ -992,5 +1095,18 @@ mod tests {
         let mut c = a.clone();
         c.youtube.stream_id = Some("s".into());
         assert!(device_settings(&a) != device_settings(&c));
+        let mut d = a.clone();
+        d.playout.countdown_file = PathBuf::from("other.mp4");
+        assert!(device_settings(&a) == device_settings(&d), "the countdown file is read live");
+    }
+
+    #[test]
+    fn closing_is_risky_only_during_a_service() {
+        let idle = Snapshot::default();
+        assert!(!service_at_risk(&idle));
+        assert!(!service_at_risk(&Snapshot { stage: Stage::Ended, ..Snapshot::default() }));
+        assert!(service_at_risk(&Snapshot { stage: Stage::Live, ..Snapshot::default() }));
+        assert!(service_at_risk(&Snapshot { job: Some("Prepare"), ..Snapshot::default() }));
+        assert!(service_at_risk(&Snapshot { playing: Some(0), ..Snapshot::default() }));
     }
 }

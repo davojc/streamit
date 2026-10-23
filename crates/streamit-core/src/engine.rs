@@ -82,6 +82,9 @@ pub struct Snapshot {
     pub flash: Option<usize>,
     /// A non-cue key whose press was ignored; cleared after `FLASH_FOR`.
     pub flash_key: Option<FlashKey>,
+    /// The sequence running now (Prepare, the countdown, End Service, a video, Go Live,
+    /// Recover), if any.
+    pub job: Option<&'static str>,
 }
 
 impl Default for Snapshot {
@@ -98,6 +101,7 @@ impl Default for Snapshot {
             last_warning: None,
             flash: None,
             flash_key: None,
+            job: None,
         }
     }
 }
@@ -319,6 +323,8 @@ impl Engine {
 
     fn begin(&mut self, job: Job, handle: JoinHandle<Done>) {
         self.epoch += 1;
+        let name = job.name();
+        self.set(|s| s.job = Some(name));
         self.running = Some(Running { job, handle });
     }
 
@@ -615,6 +621,7 @@ impl Engine {
     fn finish(&mut self, res: Result<Done, JoinError>) {
         let Some(Running { job, .. }) = self.running.take() else { return };
         self.epoch += 1;
+        self.set(|s| s.job = None);
         match res {
             Ok(Done::Prepared(r)) => self.set(|s| set_prepared(s, r)),
             Ok(Done::Countdown { result, public, before }) => self.finish_countdown(result, public, before),
@@ -1730,5 +1737,17 @@ mod tests {
         assert!(s.last_warning.as_deref().unwrap().contains("video"), "{:?}", s.last_warning);
         assert_eq!(s.cues.len(), 1);
         assert_eq!(s.playing, Some(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_shows_the_running_job() {
+        let (d, log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![cue("a", Destination::HallOnly)]));
+        assert_eq!(snap(&e).job, None);
+        send(&e, Command::PlayCue(0)).await;
+        until_call(&log, Call::PlayerPlay).await;
+        assert_eq!(snap(&e).job, Some("a video"));
+        h.player.emit(PlayerEvent::Ended);
+        until(&mut e, "no job", |s| s.job.is_none() && s.playing.is_none()).await;
     }
 }

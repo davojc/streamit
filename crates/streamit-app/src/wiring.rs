@@ -18,12 +18,25 @@ use streamit_core::devices::{
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
+use crate::logged::Logged;
+use std::collections::BTreeSet;
 use tracing::{info, warn};
 
 /// How often every device is polled.
 pub const POLL_EVERY: Duration = Duration::from_secs(2);
 /// A poll with no answer in this time is a warning.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long startup waits for the network devices' first state before the engine's
+/// first assessment, so a restart mid-service sees what is on air.
+pub const STARTUP_WAIT: Duration = Duration::from_secs(5);
+/// The devices whose first good read after startup triggers a Refresh.
+pub const NETWORK: [DeviceKind; 5] = [
+    DeviceKind::StreamAtem,
+    DeviceKind::ScreensAtem,
+    DeviceKind::VideoHub,
+    DeviceKind::WebPresenter,
+    DeviceKind::YouTube,
+];
 /// How often a failed player/counter build is retried.
 #[cfg_attr(not(feature = "gst"), allow(dead_code))]
 const PLAYOUT_RETRY: Duration = Duration::from_secs(10);
@@ -367,46 +380,58 @@ pub struct Wired {
 /// Builds every device from `c`. Never fails: a device that cannot be built is a Down
 /// stand-in, and the network clients keep reconnecting by themselves.
 pub async fn build(c: &Config) -> Wired {
+    let mut stand_ins: Vec<DeviceKind> = Vec::new();
+    let mut stand_in = |kind: DeviceKind, what: &str, why: String| {
+        stand_ins.push(kind);
+        absent(what, why)
+    };
     let stream: Arc<dyn StreamSwitcher> = match socket_addr(&c.stream_atem.address, ATEM_PORT) {
         Ok(a) => match streamit_atem::AtemClient::connect(a).await {
             Ok(x) => x,
-            Err(e) => absent("Stream ATEM", e.to_string()),
+            Err(e) => stand_in(DeviceKind::StreamAtem, "Stream ATEM", e.to_string()),
         },
-        Err(e) => absent("Stream ATEM", e),
+        Err(e) => stand_in(DeviceKind::StreamAtem, "Stream ATEM", e),
     };
     let screens: Arc<dyn Switcher> = match socket_addr(&c.screens_atem.address, ATEM_PORT) {
         Ok(a) => match streamit_atem::AtemClient::connect(a).await {
             Ok(x) => x,
-            Err(e) => absent("Screens ATEM", e.to_string()),
+            Err(e) => stand_in(DeviceKind::ScreensAtem, "Screens ATEM", e.to_string()),
         },
-        Err(e) => absent("Screens ATEM", e),
+        Err(e) => stand_in(DeviceKind::ScreensAtem, "Screens ATEM", e),
     };
     let hub: Arc<dyn Router> = match socket_addr(&c.videohub.address, VIDEOHUB_PORT) {
         Ok(a) => match streamit_videohub::VideoHub::connect(a).await {
             Ok(x) => x,
-            Err(e) => absent("VideoHub", e.to_string()),
+            Err(e) => stand_in(DeviceKind::VideoHub, "VideoHub", e.to_string()),
         },
-        Err(e) => absent("VideoHub", e),
+        Err(e) => stand_in(DeviceKind::VideoHub, "VideoHub", e),
     };
     let encoder: Arc<dyn Encoder> = match socket_addr(&c.web_presenter.address, WEBPRESENTER_PORT) {
         Ok(a) => match streamit_webpresenter::WebPresenter::connect(a).await {
             Ok(x) => x,
-            Err(e) => absent("Web Presenter", e.to_string()),
+            Err(e) => stand_in(DeviceKind::WebPresenter, "Web Presenter", e.to_string()),
         },
-        Err(e) => absent("Web Presenter", e),
+        Err(e) => stand_in(DeviceKind::WebPresenter, "Web Presenter", e),
     };
-    let yt: Arc<dyn Broadcasts> = youtube(c);
+    let yt: Arc<dyn Broadcasts> = match youtube(c) {
+        Ok(y) => y,
+        Err(why) => stand_in(DeviceKind::YouTube, "YouTube", why),
+    };
     let (player, counter) = playout(c).await;
+    // Every action call is logged; reads are not (see logged.rs).
     let devices = Devices {
-        stream,
-        screens,
-        hub,
-        encoder,
-        yt,
-        player: player.clone(),
-        counter: counter.clone(),
+        stream: Logged::wrap("Stream ATEM", stream),
+        screens: Logged::wrap("Screens ATEM", screens),
+        hub: Logged::wrap("VideoHub", hub),
+        encoder: Logged::wrap("Web Presenter", encoder),
+        yt: Logged::wrap("YouTube", yt),
+        player: Logged::wrap("DeckLink", player.clone() as Arc<dyn Player>),
+        counter: Logged::wrap("NDI", counter.clone() as Arc<dyn Counter>),
     };
     let probes = Probes { devices: devices.clone(), player, counter };
+    // Stand-ins never come up, so only wait for the devices that were really built.
+    let real: Vec<DeviceKind> = NETWORK.iter().copied().filter(|k| !stand_ins.contains(k)).collect();
+    probes.wait_ready(&real, c.videohub.input8_output, STARTUP_WAIT).await;
     let health = probes.poll(c.videohub.input8_output).await;
     for (k, h) in &health {
         log_health(*k, h);
@@ -419,18 +444,14 @@ fn absent(what: &str, why: String) -> Arc<Absent> {
     Absent::new(why)
 }
 
-fn youtube(c: &Config) -> Arc<dyn Broadcasts> {
+fn youtube(c: &Config) -> Result<Arc<dyn Broadcasts>, String> {
     let y = &c.youtube;
     if y.client_id.trim().is_empty() || y.client_secret.trim().is_empty() {
-        return absent("YouTube", "YouTube client id and secret not set (Settings)".into());
+        return Err("YouTube client id and secret not set (Settings)".into());
     }
-    match streamit_youtube::Auth::load(&y.client_id, &y.client_secret) {
-        Ok(auth) => {
-            let base = url::Url::parse(streamit_youtube::API_BASE).expect("api base");
-            Arc::new(streamit_youtube::YouTubeClient::new(base, auth, y.stream_id.clone()))
-        }
-        Err(e) => absent("YouTube", e.to_string()),
-    }
+    let auth = streamit_youtube::Auth::load(&y.client_id, &y.client_secret).map_err(|e| e.to_string())?;
+    let base = url::Url::parse(streamit_youtube::API_BASE).expect("api base");
+    Ok(Arc::new(streamit_youtube::YouTubeClient::new(base, auth, y.stream_id.clone())))
 }
 
 #[cfg(feature = "gst")]
@@ -471,23 +492,60 @@ impl Probes {
         Probes { devices, player, counter }
     }
 
-    /// One read per device: program() for the ATEMs, route_of(input-8 output, or 1) for
-    /// the VideoHub, status() for the Web Presenter, signed_in() for YouTube.
-    pub async fn poll(&self, hub_output: u16) -> Vec<(DeviceKind, DeviceHealth)> {
+    /// One read for one device: program() for the ATEMs, route_of(input-8 output, or 1)
+    /// for the VideoHub, status() for the Web Presenter, signed_in() for YouTube.
+    async fn check(&self, kind: DeviceKind, hub_output: u16) -> DeviceHealth {
         let d = &self.devices;
         let out = if hub_output == 0 { 1 } else { hub_output };
-        let (stream, screens, hub, encoder, yt) = tokio::join!(
-            probe(d.stream.program()),
-            probe(d.screens.program()),
-            probe(d.hub.route_of(out)),
-            probe(d.encoder.status()),
-            async {
-                match tokio::time::timeout(PROBE_TIMEOUT, d.yt.signed_in()).await {
-                    Ok(Ok(false)) => DeviceHealth::Warning("not signed in to YouTube".into()),
-                    Ok(r) => health_of(&r),
-                    Err(_) => DeviceHealth::Warning("no reply from YouTube".into()),
-                }
+        match kind {
+            DeviceKind::StreamAtem => probe(d.stream.program()).await,
+            DeviceKind::ScreensAtem => probe(d.screens.program()).await,
+            DeviceKind::VideoHub => probe(d.hub.route_of(out)).await,
+            DeviceKind::WebPresenter => probe(d.encoder.status()).await,
+            DeviceKind::YouTube => match tokio::time::timeout(PROBE_TIMEOUT, d.yt.signed_in()).await {
+                Ok(Ok(false)) => DeviceHealth::Warning("not signed in to YouTube".into()),
+                Ok(r) => health_of(&r),
+                Err(_) => DeviceHealth::Warning("no reply from YouTube".into()),
             },
+            DeviceKind::DeckLink => self.player.health(),
+            DeviceKind::Ndi => self.counter.health(),
+            DeviceKind::StreamDeck => DeviceHealth::Ok, // reported by the deck itself
+        }
+    }
+
+    /// Waits (at most `limit` in total, all at once) until each of `kinds` answers its
+    /// read with anything but Down: the device has connected and sent its state.
+    pub async fn wait_ready(&self, kinds: &[DeviceKind], hub_output: u16, limit: Duration) {
+        let one = |k: DeviceKind| async move {
+            if !kinds.contains(&k) {
+                return;
+            }
+            while matches!(self.check(k, hub_output).await, DeviceHealth::Down(_)) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        let all = async {
+            tokio::join!(
+                one(DeviceKind::StreamAtem),
+                one(DeviceKind::ScreensAtem),
+                one(DeviceKind::VideoHub),
+                one(DeviceKind::WebPresenter),
+                one(DeviceKind::YouTube),
+            )
+        };
+        if tokio::time::timeout(limit, all).await.is_err() {
+            info!("startup: not every device answered within {} s; continuing", limit.as_secs());
+        }
+    }
+
+    /// One read per device, all at once.
+    pub async fn poll(&self, hub_output: u16) -> Vec<(DeviceKind, DeviceHealth)> {
+        let (stream, screens, hub, encoder, yt) = tokio::join!(
+            self.check(DeviceKind::StreamAtem, hub_output),
+            self.check(DeviceKind::ScreensAtem, hub_output),
+            self.check(DeviceKind::VideoHub, hub_output),
+            self.check(DeviceKind::WebPresenter, hub_output),
+            self.check(DeviceKind::YouTube, hub_output),
         );
         vec![
             (DeviceKind::StreamAtem, stream),
@@ -510,7 +568,10 @@ fn log_health(kind: DeviceKind, h: &DeviceHealth) {
 }
 
 /// Polls every `POLL_EVERY` and sends `Command::DeviceHealth` for each change. `seed` is
-/// the health already sent. Stops when the engine is gone.
+/// the health already sent. The first time a network device turns Ok after startup it
+/// also sends one `Command::Refresh` (per poll), so the engine reassesses with that
+/// device's state (a restart mid-service may come up before every device has answered).
+/// Stops when the engine is gone.
 pub fn spawn_health_poll(
     probes: Probes,
     config: Arc<RwLock<Config>>,
@@ -519,13 +580,25 @@ pub fn spawn_health_poll(
 ) -> JoinHandle<()> {
     let mut tracker = HealthTracker::default();
     tracker.changes(seed);
+    let mut ever_ok: BTreeSet<DeviceKind> =
+        seed.iter().filter(|(_, h)| *h == DeviceHealth::Ok).map(|(k, _)| *k).collect();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(POLL_EVERY).await;
             let out = config.read().unwrap_or_else(|e| e.into_inner()).videohub.input8_output;
+            let mut came_up = Vec::new();
             for (kind, h) in tracker.changes(&probes.poll(out).await) {
                 log_health(kind, &h);
+                if h == DeviceHealth::Ok && NETWORK.contains(&kind) && ever_ok.insert(kind) {
+                    came_up.push(kind);
+                }
                 if tx.send(Command::DeviceHealth(kind, h)).await.is_err() {
+                    return;
+                }
+            }
+            if !came_up.is_empty() {
+                info!(devices = ?came_up, "first contact after startup: reassessing");
+                if tx.send(Command::Refresh).await.is_err() {
                     return;
                 }
             }
@@ -660,5 +733,50 @@ mod tests {
         late.play().await.unwrap();
         assert!(log.calls().contains(&streamit_core::fakes::Call::PlayerPlay));
         assert_eq!(late.health(), DeviceHealth::Ok);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn device_ready_after_startup_triggers_one_refresh() {
+        let (d, _log, h) = fake_devices();
+        h.stream.fail_times("program", 2); // the startup poll and the first poll see it Down
+        let late = || -> Arc<Late<dyn Player>> { Late::new("x") };
+        let counter: Arc<Late<dyn Counter>> = Late::new("x");
+        let p = Probes::new(d, late(), counter);
+        let seed = p.poll(0).await;
+        assert!(matches!(seed[0], (DeviceKind::StreamAtem, DeviceHealth::Down(_))));
+        let (tx, mut rx) = mpsc::channel(64);
+        let cfg = Arc::new(RwLock::new(Config::default()));
+        let poll = spawn_health_poll(p, cfg, tx, &seed);
+        tokio::time::sleep(Duration::from_secs(13)).await; // six more polls
+        // A later drop and recovery is not the first time: no second Refresh.
+        h.stream.fail_next("program");
+        tokio::time::sleep(Duration::from_secs(9)).await;
+        poll.abort();
+        let mut cmds = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            cmds.push(c);
+        }
+        let refreshes = cmds.iter().filter(|c| **c == Command::Refresh).count();
+        assert_eq!(refreshes, 1, "{cmds:?}");
+        let up = cmds.iter().position(|c| *c == Command::DeviceHealth(DeviceKind::StreamAtem, DeviceHealth::Ok));
+        let refresh = cmds.iter().position(|c| *c == Command::Refresh);
+        assert!(up.is_some() && up < refresh, "health first, then Refresh: {cmds:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_waits_for_devices_to_answer() {
+        let (d, _log, h) = fake_devices();
+        h.hub.fail_times("route_of", 10); // ~1 s of Disconnected
+        let p = Probes::new(d, Late::new("x"), Late::new("x"));
+        let start = tokio::time::Instant::now();
+        p.wait_ready(&NETWORK, 0, STARTUP_WAIT).await;
+        assert!(start.elapsed() >= Duration::from_millis(900), "{:?}", start.elapsed());
+        assert!(start.elapsed() < STARTUP_WAIT);
+        assert_eq!(p.check(DeviceKind::VideoHub, 0).await, DeviceHealth::Ok);
+        // A device that never answers costs at most the limit.
+        h.stream.fail_times("program", 1000);
+        let start = tokio::time::Instant::now();
+        p.wait_ready(&NETWORK, 0, STARTUP_WAIT).await;
+        assert!(start.elapsed() <= STARTUP_WAIT + Duration::from_millis(200));
     }
 }

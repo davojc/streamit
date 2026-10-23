@@ -32,3 +32,4 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 streamit-core = { path = "../streamit-core", features = ["fakes"] }
+tokio = { workspace = true, features = ["full", "test-util"] }

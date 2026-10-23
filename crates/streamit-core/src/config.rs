@@ -190,8 +190,9 @@ impl Config {
     /// Load from `path`. A missing file yields the defaults.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
         match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text)
-                .with_context(|| format!("parsing config {}", path.display())),
+            Ok(text) => toml::from_str(&text).map_err(|e| {
+                anyhow::anyhow!("cannot read settings {} ({})", path.display(), describe_toml_error(&text, &e))
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(e).with_context(|| format!("reading config {}", path.display())),
         }
@@ -203,8 +204,77 @@ impl Config {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let text = toml::to_string_pretty(self).context("serializing config")?;
-        std::fs::write(path, text).with_context(|| format!("writing config {}", path.display()))
+        // Write a temp file next to it, then rename over it, so a failed or interrupted
+        // save never leaves a half-written config.
+        let tmp = temp_path(path);
+        let write = || -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, text.as_bytes())?;
+            f.sync_all()
+        };
+        if let Err(e) = write() {
+            if tmp.is_file() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            return Err(e).with_context(|| format!("writing config {}", tmp.display()));
+        }
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            anyhow::Error::new(e).context(format!("replacing config {}", path.display()))
+        })
     }
+}
+
+/// The temp file a save writes before renaming it over `path`: same directory.
+pub fn temp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+/// "line L, column C: <message>" for a TOML error, without the source line (which may
+/// hold the client secret) and with quoted values replaced by "…".
+fn describe_toml_error(text: &str, e: &toml::de::Error) -> String {
+    let at = match e.span() {
+        Some(span) => {
+            let before = &text[..span.start.min(text.len())];
+            let line = before.matches('\n').count() + 1;
+            let col = before.len() - before.rfind('\n').map_or(0, |i| i + 1) + 1;
+            format!("line {line}, column {col}: ")
+        }
+        None => String::new(),
+    };
+    format!("{at}{}", redact(e.message().lines().next().unwrap_or("")))
+}
+
+/// Replaces anything between quotes or backticks with "…", and numbers with "N".
+fn redact(msg: &str) -> String {
+    let mut out = String::new();
+    let mut quote: Option<char> = None;
+    for ch in msg.chars() {
+        match quote {
+            Some(q) if ch == q => {
+                out.push('…');
+                out.push(ch);
+                quote = None;
+            }
+            Some(_) => {}
+            None if matches!(ch, '"' | '`' | '\'') => {
+                out.push(ch);
+                quote = Some(ch);
+            }
+            None if ch.is_ascii_digit() => {
+                if !out.ends_with('N') {
+                    out.push('N');
+                }
+            }
+            None => out.push(ch),
+        }
+    }
+    if quote.is_some() {
+        out.push('…');
+    }
+    out
 }
 
 /// Default config location: `%APPDATA%\StreamIt\config.toml`, falling back to a
@@ -279,6 +349,44 @@ mod tests {
         ];
         c.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_is_atomic() {
+        let dir = std::env::temp_dir().join("streamit-cfg-atomic");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+        let mut c = Config::default();
+        c.save(&path).unwrap();
+        // A successful save goes through the temp file and leaves none behind.
+        let tmp = temp_path(&path);
+        assert_eq!(tmp.parent(), path.parent(), "temp file must be in the same directory");
+        assert!(!tmp.exists());
+        // A write that fails leaves the old file whole.
+        let before = std::fs::read_to_string(&path).unwrap();
+        std::fs::create_dir_all(&tmp).unwrap(); // the temp file cannot be created
+        c.timings.closing_hold = Duration::from_secs(99);
+        assert!(c.save(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(Config::load(&path).unwrap(), Config::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_error_hides_the_source_line() {
+        let dir = std::env::temp_dir().join("streamit-cfg-bad");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[youtube]\nclient_id = \"abc\"\nclient_secret = 12345678\n").unwrap();
+        let msg = format!("{:#}", Config::load(&path).unwrap_err());
+        assert!(msg.contains("line 3"), "{msg}");
+        assert!(!msg.contains("12345678"), "{msg}");
+        assert!(!msg.contains("client_secret ="), "{msg}");
+        std::fs::write(&path, "[youtube]\nclient_secret = \"GOCSPX-secret\nx = 1\n").unwrap();
+        let msg = format!("{:#}", Config::load(&path).unwrap_err());
+        assert!(!msg.contains("GOCSPX"), "{msg}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
