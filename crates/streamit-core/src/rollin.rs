@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 /// Most videos the cue list holds in v1.
 pub const MAX_CUES: usize = 14;
 /// Fairlight source id of an input's stereo pair.
-const STEREO_SOURCE: i64 = -65280;
+pub(crate) const STEREO_SOURCE: i64 = -65280;
 /// Longest wait for the return transition off input 8.
 pub const TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
 

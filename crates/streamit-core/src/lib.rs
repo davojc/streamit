@@ -6,3 +6,4 @@ pub mod audio;
 pub mod golive;
 pub mod rollin;
 pub mod end;
+pub mod recovery;
