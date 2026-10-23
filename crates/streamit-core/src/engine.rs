@@ -77,6 +77,8 @@ pub struct Snapshot {
     pub device_status: BTreeMap<DeviceKind, DeviceHealth>,
     pub last_warning: Option<String>,
     pub flash: Option<usize>,
+    /// A non-cue key whose press was ignored; cleared after `FLASH_FOR`.
+    pub flash_key: Option<FlashKey>,
 }
 
 impl Default for Snapshot {
@@ -92,8 +94,15 @@ impl Default for Snapshot {
             device_status: BTreeMap::new(),
             last_warning: None,
             flash: None,
+            flash_key: None,
         }
     }
+}
+
+/// Keys other than cues that flash when their press is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashKey {
+    GoLive,
 }
 
 pub struct EngineHandle {
@@ -153,6 +162,7 @@ enum Aux {
     Recovered { epoch: u64, ok: bool, assessment: Assessment },
     WentLive(devices::Result<()>),
     ClearFlash(u64),
+    ClearKeyFlash(u64),
 }
 
 enum Wake {
@@ -182,10 +192,13 @@ pub struct Engine {
     /// Go Live waits for the countdown it pre-empted to run its cancel path.
     golive_pending: bool,
     golive_in_flight: bool,
+    /// Set when Go Live pre-empted a countdown: whether that countdown had gone public.
+    preempt_public: Option<bool>,
     /// Recover waits for the running video's return path.
     recover_pending: bool,
     recover_in_flight: bool,
     flash_gen: u64,
+    key_flash_gen: u64,
     aux: mpsc::UnboundedSender<Aux>,
 }
 
@@ -211,9 +224,11 @@ impl Engine {
             end_pending: false,
             golive_pending: false,
             golive_in_flight: false,
+            preempt_public: None,
             recover_pending: false,
             recover_in_flight: false,
             flash_gen: 0,
+            key_flash_gen: 0,
             aux,
         };
         tokio::spawn(engine.run(rx, aux_rx));
@@ -385,14 +400,24 @@ impl Engine {
                 if self.golive_in_flight {
                     return self.ignore(&cmd, "Go Live is already in progress");
                 }
-                self.golive_in_flight = true;
+                // R14: only when idle, or pre-empting a countdown. Never alongside
+                // Prepare, End Service or a video (stop the video first).
                 match &self.running {
+                    None => {
+                        self.golive_in_flight = true;
+                        self.spawn_t0();
+                    }
                     Some(Running { job: Job::Countdown { cancel }, .. }) => {
                         info!("Go Live during the countdown: stopping the countdown first");
                         cancel.cancel();
+                        self.golive_in_flight = true;
                         self.golive_pending = true;
                     }
-                    _ => self.spawn_t0(),
+                    Some(r) => {
+                        let why = format!("{} is running", r.job.name());
+                        self.flash_key(FlashKey::GoLive);
+                        self.ignore(&cmd, &why);
+                    }
                 }
             }
             Command::EndBroadcast => self.spawn_end_broadcast(),
@@ -400,14 +425,22 @@ impl Engine {
                 if self.recover_in_flight {
                     return self.ignore(&cmd, "Recover is already in progress");
                 }
-                self.recover_in_flight = true;
+                // R14: ignored while Prepare, the countdown or End Service runs.
                 match &self.running {
+                    None => {
+                        self.recover_in_flight = true;
+                        self.spawn_recover();
+                    }
                     Some(Running { job: Job::Video { stop, .. }, .. }) => {
                         info!("Recover during a video: stopping the video first");
                         stop.cancel();
+                        self.recover_in_flight = true;
                         self.recover_pending = true;
                     }
-                    _ => self.spawn_recover(),
+                    Some(r) => {
+                        let why = format!("{} is running", r.job.name());
+                        self.ignore(&cmd, &why);
+                    }
                 }
             }
             Command::SelectBroadcast(id) => {
@@ -451,6 +484,17 @@ impl Engine {
         tokio::spawn(async move {
             tokio::time::sleep(FLASH_FOR).await;
             let _ = aux.send(Aux::ClearFlash(generation));
+        });
+    }
+
+    fn flash_key(&mut self, key: FlashKey) {
+        self.key_flash_gen += 1;
+        let generation = self.key_flash_gen;
+        self.set(|s| s.flash_key = Some(key));
+        let aux = self.aux.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(FLASH_FOR).await;
+            let _ = aux.send(Aux::ClearKeyFlash(generation));
         });
     }
 
@@ -604,7 +648,12 @@ impl Engine {
             }
             // Pre-empted by Go Live: the hall is back, so run t0 now. The stage is
             // not restored, so nothing (e.g. Prepare) reopens before Live lands.
-            Ok(CountdownOutcome::Stopped) if golive => self.spawn_t0(),
+            Ok(CountdownOutcome::Stopped) if golive => {
+                // Not left on Countdown while t0 runs; t0's result sets the final stage.
+                self.set(|s| s.stage = Stage::Prepared(Readiness::Waiting("Going live".into())));
+                self.preempt_public = Some(public);
+                self.spawn_t0();
+            }
             Ok(CountdownOutcome::Stopped) => self.set(|s| s.stage = before),
             Err(e) => {
                 let msg = format!("The countdown failed ({e}); press Go Live manually");
@@ -617,6 +666,7 @@ impl Engine {
                     s.last_warning = Some(msg);
                 });
                 if golive {
+                    self.preempt_public = Some(public);
                     self.spawn_t0();
                 }
             }
@@ -756,24 +806,46 @@ impl Engine {
             }
             Aux::WentLive(r) => {
                 self.golive_in_flight = false;
+                // After a pre-empt: whether the countdown had gone public.
+                let preempt = self.preempt_public.take();
+                self.epoch += 1;
                 match r {
                     Ok(()) if matches!(self.stage(), Stage::Ending { .. } | Stage::Ended) => {
                         info!("Go Live finished after End Service; the stage stays as it is");
                     }
-                    Ok(()) => {
-                        self.epoch += 1;
+                    Ok(()) => self.set(|s| {
+                        s.stage = Stage::Live;
+                        remove(&mut s.offers, Offer::GoLive);
+                        match preempt {
+                            Some(false) => add(&mut s.offers, Offer::GoPublic),
+                            Some(true) => remove(&mut s.offers, Offer::GoPublic),
+                            None => {}
+                        }
+                    }),
+                    Err(e) => {
+                        let msg = format!("Go Live did not complete: {e}");
                         self.set(|s| {
-                            s.stage = Stage::Live;
-                            remove(&mut s.offers, Offer::GoLive);
+                            if let Some(public) = preempt {
+                                s.stage = Stage::Prepared(Readiness::Warning(msg.clone()));
+                                add(&mut s.offers, Offer::GoLive);
+                                if !public {
+                                    add(&mut s.offers, Offer::GoPublic);
+                                }
+                            }
+                            s.last_warning = Some(msg);
                         });
                     }
-                    Err(e) => set_warning(&self.snap, format!("Go Live did not complete: {e}")),
                 }
                 self.maybe_start_end();
             }
             Aux::ClearFlash(generation) => {
                 if generation == self.flash_gen {
                     self.set(|s| s.flash = None);
+                }
+            }
+            Aux::ClearKeyFlash(generation) => {
+                if generation == self.key_flash_gen {
+                    self.set(|s| s.flash_key = None);
                 }
             }
         }
@@ -1405,6 +1477,97 @@ mod tests {
         // A second press works.
         send(&e, Command::UnmuteMics).await;
         until(&mut e, "unducked", |s| !s.mics_ducked).await;
+    }
+
+    // ---- R14 ----
+
+    /// Go Live was ignored: its key flashes and t0 (which clears the counter) never ran.
+    async fn assert_golive_ignored(e: &mut EngineHandle, log: &CallLog) {
+        send(e, Command::GoLive).await;
+        until(e, "Go Live flash", |s| s.flash_key == Some(FlashKey::GoLive)).await;
+        sleep(Duration::from_secs(2)).await;
+        assert!(!log.calls().contains(&Call::CounterClear), "{:?}", log.calls());
+        assert_eq!(snap(e).flash_key, None, "the flash clears after 1 s");
+        assert_ne!(snap(e).stage, Stage::Live);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn golive_ignored_during_prepare() {
+        let (d, log, h) = rig();
+        h.yt.set_health(crate::devices::Health::NotReceiving); // Prepare waits up to 60 s
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Prepare).await;
+        until_call(&log, Call::EncoderStart).await;
+        let autos = stream_autos(&log);
+        assert_golive_ignored(&mut e, &log).await;
+        assert_eq!(stream_autos(&log), autos);
+        assert!(matches!(snap(&e).stage, Stage::Prepared(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn golive_ignored_during_end_service() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::EndService).await;
+        until(&mut e, "Ending", |s| matches!(s.stage, Stage::Ending { .. })).await;
+        assert_golive_ignored(&mut e, &log).await;
+        until(&mut e, "Ended", |s| s.stage == Stage::Ended).await;
+        assert!(!log.calls().contains(&Call::CounterClear));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn golive_ignored_during_video() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![cue("a", Destination::HallAndOnline)]));
+        send(&e, Command::PlayCue(0)).await;
+        until_call(&log, Call::PlayerPlay).await;
+        assert_golive_ignored(&mut e, &log).await;
+        assert_eq!(snap(&e).playing, Some(0));
+        assert!(!log.calls().contains(&Call::PlayerStop));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recover_ignored_during_countdown() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        send(&e, Command::Recover).await;
+        sleep(Duration::from_secs(3)).await;
+        let in8_off = Call::StreamSetAudioOn(AudioSourceId { input: 8, source: -65280 }, false);
+        assert!(!log.calls().contains(&in8_off), "{:?}", log.calls());
+        assert!(matches!(snap(&e).stage, Stage::Countdown { .. }));
+        assert!(!log.calls().contains(&Call::PlayerStop), "the countdown keeps running");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preempt_unpublic_offers_go_public() {
+        let (d, _log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { public: false, .. })).await;
+        send(&e, Command::GoLive).await;
+        let s = until(&mut e, "Live", |s| s.stage == Stage::Live).await;
+        assert!(s.offers.contains(&Offer::GoPublic), "{:?}", s.offers);
+        assert!(!s.offers.contains(&Offer::GoLive), "{:?}", s.offers);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preempt_t0_failure_goes_prepared_with_go_live_offer() {
+        let (d, _log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        h.stream.fail_next("auto"); // t0's stream cut fails
+        send(&e, Command::GoLive).await;
+        let s = until(&mut e, "Prepared(Warning)", |s| matches!(s.stage, Stage::Prepared(Readiness::Warning(_)))).await;
+        assert!(s.offers.contains(&Offer::GoLive), "{:?}", s.offers);
+        assert!(s.offers.contains(&Offer::GoPublic), "{:?}", s.offers);
+        sleep(Duration::from_secs(5)).await;
+        assert!(matches!(snap(&e).stage, Stage::Prepared(Readiness::Warning(_))), "{:?}", snap(&e).stage);
+        // Go Live may be pressed again.
+        send(&e, Command::GoLive).await;
+        until(&mut e, "Live", |s| s.stage == Stage::Live).await;
     }
 
     #[tokio::test(start_paused = true)]
