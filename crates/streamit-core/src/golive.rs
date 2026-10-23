@@ -1153,7 +1153,7 @@ mod tests {
         let calls = log.calls();
         let retry = calls.iter().rposition(|c| *c == Call::YtTransition(Phase::Live)).unwrap();
         assert_t0_tail(&calls);
-        assert!(retry < calls.len() - 1, "the retry waited for T-0: {calls:?}");
+        assert!(retry < pos(&calls, &Call::CounterClear), "the retry waited for T-0: {calls:?}");
         assert_eq!(run.stages.lock().unwrap().last(), Some(&Stage::Live));
     }
 

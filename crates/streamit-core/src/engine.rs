@@ -178,9 +178,7 @@ enum Job {
     End { skip: Arc<Notify> },
     Video { index: usize, stop: CancellationToken, unmute: Arc<Notify> },
     /// Start service now by hand: T-0, going public alongside it unless already public.
-    /// `preempt_public` is set when it pre-empted a countdown: whether that countdown
-    /// had made the broadcast public.
-    GoLive { preempt_public: Option<bool> },
+    GoLive(GoLiveStart),
     Recover,
 }
 
@@ -191,10 +189,22 @@ impl Job {
             Job::Countdown { .. } => "the countdown",
             Job::End { .. } => "End Service",
             Job::Video { .. } => "a video",
-            Job::GoLive { .. } => "Go Live",
+            Job::GoLive(_) => "Go Live",
             Job::Recover => "Recover",
         }
     }
+}
+
+/// How a Start service now began; its job and its result both carry it.
+#[derive(Debug, Clone, Copy)]
+struct GoLiveStart {
+    /// Set when it pre-empted a countdown: whether that countdown had made the
+    /// broadcast public.
+    preempt_public: Option<bool>,
+    /// The broadcast was known to be public already, so no go-public ran.
+    already_public: bool,
+    /// No broadcast was selected, so no go-public ran.
+    no_broadcast: bool,
 }
 
 struct Running {
@@ -208,14 +218,8 @@ enum Done {
     Countdown { result: devices::Result<CountdownOutcome>, public: bool, before: Stage },
     Ended(EndOutcome),
     Video { index: usize, outcome: RollinOutcome },
-    /// `public` is the go-public's result (`None` if none ran); `already_public` says
-    /// the broadcast was known to be public before.
-    WentLive {
-        result: Result<(), T0Error>,
-        preempt_public: Option<bool>,
-        public: Option<devices::Result<()>>,
-        already_public: bool,
-    },
+    /// `public` is the go-public's result (`None` if none ran).
+    WentLive { result: Result<(), T0Error>, public: Option<devices::Result<()>>, start: GoLiveStart },
     Recovered { ok: bool, assessment: Assessment },
 }
 
@@ -721,14 +725,20 @@ impl Engine {
 
     /// Start service now (the GO LIVE key, or a pre-empted countdown): the T-0 cut and,
     /// in parallel, going public. The broadcast is known public when the pre-empted
-    /// countdown made it so, or when already Live (Go Live offered on the holding
-    /// still: YouTube is live). With no broadcast selected only the cut runs, and Go
-    /// Public is offered. The job slot is held until the go-public settles (at most
-    /// `GO_PUBLIC_WAIT`), so a second press can never start a second cut; LIVE is
-    /// shown as soon as the cut is done.
+    /// countdown made it so, when already Live (Go Live offered on the holding still:
+    /// YouTube is live), or when the selected broadcast was listed as live (live never
+    /// goes back to testing). With no broadcast selected only the cut runs, with a
+    /// warning and Go Public offered. While its own go-public runs, Go Public is not
+    /// offered, so "Retry going public" cannot start a second one alongside it. The job
+    /// slot is held until the go-public settles (at most `GO_PUBLIC_WAIT`), so a second
+    /// press can never start a second cut; LIVE is shown as soon as the cut is done.
     fn start_golive(&mut self, preempt_public: Option<bool>) {
-        let already_public = preempt_public == Some(true) || self.stage() == Stage::Live;
+        let start = self.golive_start(preempt_public);
         let bid = self.selected();
+        let going_public = !start.already_public && !start.no_broadcast;
+        if going_public {
+            self.set(|s| remove(&mut s.offers, Offer::GoPublic));
+        }
         let (d, c, levels, snap) = (self.d.clone(), self.config(), self.levels.clone(), self.snap.clone());
         let handle = tokio::spawn(async move {
             let l = lock(&levels).clone();
@@ -737,7 +747,7 @@ impl Engine {
                 &d,
                 &c,
                 bid.as_deref().unwrap_or_default(),
-                already_public || bid.is_none(),
+                !going_public,
                 &l,
                 |m| snap.send_modify(|s| log(s, m)),
                 |r| {
@@ -750,9 +760,19 @@ impl Engine {
                 },
             )
             .await;
-            Done::WentLive { result: out.t0, preempt_public, public: out.public, already_public }
+            Done::WentLive { result: out.t0, public: out.public, start }
         });
-        self.begin(Job::GoLive { preempt_public }, handle);
+        self.begin(Job::GoLive(start), handle);
+    }
+
+    fn golive_start(&self, preempt_public: Option<bool>) -> GoLiveStart {
+        let s = self.snap.borrow();
+        let listed_live = s.broadcast.as_ref().is_some_and(|b| b.life_cycle == "live");
+        GoLiveStart {
+            preempt_public,
+            already_public: preempt_public == Some(true) || s.stage == Stage::Live || listed_live,
+            no_broadcast: s.broadcast.is_none(),
+        }
     }
 
     fn start_recover(&mut self) {
@@ -788,9 +808,7 @@ impl Engine {
             Ok(Done::Countdown { result, public, before }) => self.finish_countdown(result, public, before),
             Ok(Done::Ended(out)) => self.finish_end(out),
             Ok(Done::Video { index, outcome }) => self.finish_video(index, outcome),
-            Ok(Done::WentLive { result, preempt_public, public, already_public }) => {
-                self.finish_golive(result, preempt_public, public, already_public)
-            }
+            Ok(Done::WentLive { result, public, start }) => self.finish_golive(result, public, start),
             Ok(Done::Recovered { ok, assessment }) => {
                 if ok {
                     self.set(|s| {
@@ -812,9 +830,9 @@ impl Engine {
                         self.finish_countdown(Err(DeviceError::Other(reason)), false, Stage::Idle)
                     }
                     // Unknown whether the stream cut happened: treated as not on air.
-                    Job::GoLive { preempt_public } => {
+                    Job::GoLive(start) => {
                         let e = T0Error { on_air: false, mics_failed: false, failures: vec![reason] };
-                        self.finish_golive(Err(e), preempt_public, None, preempt_public == Some(true))
+                        self.finish_golive(Err(e), None, start)
                     }
                     _ => set_warning(&self.snap, reason),
                 }
@@ -887,13 +905,8 @@ impl Engine {
     /// with a warning). Whenever the broadcast did not go public (the go-public failed,
     /// or there was no broadcast to make public), Go Public is offered: the window's
     /// "Retry going public".
-    fn finish_golive(
-        &mut self,
-        result: Result<(), T0Error>,
-        preempt_public: Option<bool>,
-        public: Option<devices::Result<()>>,
-        already_public: bool,
-    ) {
+    fn finish_golive(&mut self, result: Result<(), T0Error>, public: Option<devices::Result<()>>, start: GoLiveStart) {
+        let GoLiveStart { preempt_public, already_public, no_broadcast } = start;
         let mics_failed = result.as_ref().err().is_some_and(|e| e.mics_failed);
         let (on_air, warning) = match &result {
             Ok(()) => (true, None),
@@ -922,6 +935,10 @@ impl Engine {
                 } else {
                     add(&mut s.offers, Offer::GoPublic);
                 }
+            }
+            // Live with no broadcast selected: say why nothing went public.
+            if on_air && no_broadcast {
+                warn_in(s, NO_BROADCAST.into());
             }
             // The T-0 warning goes last: it is the one left showing.
             if let Some(w) = public_warning {
@@ -1843,7 +1860,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn preempt_unpublic_offers_go_public() {
+    async fn preempt_goes_public_or_offers_retry() {
         // v1.1: the pre-empt goes public alongside the cut.
         let (d, log, _h) = rig();
         let mut e = Engine::spawn(d, cfg(vec![]));
@@ -2171,7 +2188,7 @@ mod tests {
         send(&e, Command::GoLive).await;
         let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
         assert!(start.elapsed() < Duration::from_secs(15), "Go Live waited {:?}", start.elapsed());
-        assert!(s.last_warning.as_deref().is_some_and(|w| w.contains("did not finish")), "{:?}", s.last_warning);
+        assert!(s.activity.iter().any(|a| a.text.contains("did not finish")), "{:?}", texts(&s));
         assert!(log.calls().contains(&Call::StreamAuto));
 
         // A manual Refresh is bounded too, and says so.
@@ -2467,6 +2484,50 @@ mod tests {
         let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
         assert_eq!(live_transitions(&log), 5, "{:?}", log.calls());
         assert!(!s.offers.contains(&Offer::GoPublic), "{:?}", s.offers);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn go_live_without_broadcast_warns() {
+        let (d, log, h) = rig();
+        h.yt.set_upcoming(vec![]);
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::GoLive).await;
+        let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        assert_eq!(s.last_warning.as_deref(), Some(NO_BROADCAST));
+        assert!(s.offers.contains(&Offer::GoPublic), "{:?}", s.offers);
+        assert_eq!(live_transitions(&log), 0, "{:?}", log.calls());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn go_live_skips_public_when_broadcast_already_live() {
+        let (d, log, h) = rig();
+        h.yt.set_upcoming(vec![BroadcastSummary { life_cycle: "live".into(), ..summary("b1") }]);
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        until(&mut e, "b1", |s| s.broadcast.as_ref().is_some_and(|b| b.id == "b1")).await;
+        send(&e, Command::GoLive).await;
+        let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        assert_eq!(live_transitions(&log), 0, "{:?}", log.calls());
+        assert!(!s.offers.contains(&Offer::GoPublic), "{:?}", s.offers);
+        assert_eq!(stream_autos(&log), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_public_not_offered_while_go_live_goes_public() {
+        let (d, _log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        send(&e, Command::StopCountdown).await;
+        until(&mut e, "Go Public offered", |s| s.offers.contains(&Offer::GoPublic) && s.job.is_none()).await;
+        h.yt.set_transition_hangs(true);
+        send(&e, Command::GoLive).await;
+        let s = until(&mut e, "Live", |s| s.stage == Stage::Live).await;
+        assert_eq!(s.job, Some("Go Live"), "the go-public is still running");
+        assert!(!s.offers.contains(&Offer::GoPublic), "{:?}", s.offers);
+        sleep(Duration::from_secs(5)).await;
+        assert!(!snap(&e).offers.contains(&Offer::GoPublic), "{:?}", snap(&e).offers);
+        // It timed out: offered again.
+        until(&mut e, "Go Public offered", |s| s.offers.contains(&Offer::GoPublic) && s.job.is_none()).await;
     }
 
     #[tokio::test(start_paused = true)]
