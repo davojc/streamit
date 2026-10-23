@@ -8,7 +8,7 @@ use streamit_core::engine::DeviceKind;
 use tokio::time::Instant;
 
 /// A pretend mix and a pretend route both take this long at 1x.
-const PRETEND_DELAY: Duration = Duration::from_secs(1);
+pub(crate) const PRETEND_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Which {
