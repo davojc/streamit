@@ -57,8 +57,9 @@ pub struct Stage0Report {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CountdownOutcome {
-    /// T-0 is done. `public` is whether the broadcast went public (go-public settled Ok).
-    Live { public: bool },
+    /// T-0 is done. `public` is whether the broadcast went public (go-public settled Ok);
+    /// `mics_failed` is whether T-0 could not bring the mics up (I1: Recover is offered).
+    Live { public: bool, mics_failed: bool },
     Stopped,
 }
 
@@ -320,6 +321,7 @@ pub async fn countdown(
         pub_task = Some(spawn_go_public(d, bid));
     }
     let r = t0(d, c, levels).await;
+    let mics_failed = r.as_ref().err().is_some_and(|e| e.mics_failed);
     let on_air = match &r {
         Ok(()) => true,
         Err(e) => {
@@ -339,7 +341,7 @@ pub async fn countdown(
     {
         return Err(DeviceError::Other(e.to_string()));
     }
-    Ok(CountdownOutcome::Live { public: settled.unwrap_or(public) })
+    Ok(CountdownOutcome::Live { public: settled.unwrap_or(public), mics_failed })
 }
 
 /// Waits at most `GO_PUBLIC_WAIT` for an in-flight `go_public`; on timeout it is
@@ -431,6 +433,8 @@ pub(crate) async fn transition_with_retry(d: &Devices, bid: &str, to: Phase) -> 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct T0Error {
     pub on_air: bool,
+    /// The stream cut succeeded but the mic fade-up failed: the mics may still be down.
+    pub mics_failed: bool,
     /// One message per failed step, in order.
     pub failures: Vec<String>,
 }
@@ -456,9 +460,11 @@ pub async fn t0(d: &Devices, c: &Config, levels: &LiveLevels) -> std::result::Re
     }
     .await;
     let mut failures = Vec::new();
+    let mut mics_failed = false;
     match &stream_cut {
         Ok(()) => {
             if let Err(e) = fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
+                mics_failed = true;
                 failures.push(format!("Could not fade the mics up: {e}"));
             }
         }
@@ -470,7 +476,7 @@ pub async fn t0(d: &Devices, c: &Config, levels: &LiveLevels) -> std::result::Re
     if let Err(e) = d.counter.clear().await {
         failures.push(format!("Could not clear the counter: {e}"));
     }
-    if failures.is_empty() { Ok(()) } else { Err(T0Error { on_air: stream_cut.is_ok(), failures }) }
+    if failures.is_empty() { Ok(()) } else { Err(T0Error { on_air: stream_cut.is_ok(), mics_failed, failures }) }
 }
 
 #[cfg(test)]
@@ -674,7 +680,7 @@ mod tests {
         assert!(run.stages.lock().unwrap().iter().any(|s| matches!(s, Stage::Countdown { public: true, .. })));
 
         h.player.emit(PlayerEvent::Ended);
-        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: true });
+        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: true, mics_failed: false });
         assert_eq!(run.stages.lock().unwrap().last(), Some(&Stage::Live));
         assert!(log.calls().ends_with(&[Call::ScreensSetPreview(6), Call::ScreensAuto, Call::CounterClear]));
         assert!(run.warns.lock().unwrap().is_empty(), "{:?}", run.warns.lock().unwrap());
@@ -693,7 +699,7 @@ mod tests {
         assert!(pos(&calls, &Call::YtTransition(Phase::Live)) > pos(&calls, &Call::PlayerPlay));
         assert_eq!(run.warns.lock().unwrap().len(), 1);
         h.player.emit(PlayerEvent::Ended);
-        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: true });
+        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: true, mics_failed: false });
         assert_eq!(live_transitions(&log), 1);
     }
 
@@ -736,7 +742,7 @@ mod tests {
         ));
         assert!(!run.stages.lock().unwrap().iter().any(|s| matches!(s, Stage::Countdown { public: true, .. })));
         h.player.emit(PlayerEvent::Ended);
-        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: false });
+        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: false, mics_failed: false });
         assert_eq!(live_transitions(&log), 8);
     }
 
@@ -884,7 +890,7 @@ mod tests {
         assert!(log.calls().ends_with(&[Call::ScreensSetPreview(6), Call::ScreensAuto, Call::CounterClear]));
         // The hung go-public is given a bounded wait, then reported.
         let start = Instant::now();
-        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: false });
+        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: false, mics_failed: false });
         assert!(start.elapsed() <= GO_PUBLIC_WAIT);
         let warns = run.warns.lock().unwrap();
         assert!(warns.iter().any(|w| w.contains("public")), "{warns:?}");
@@ -919,7 +925,7 @@ mod tests {
         sleep(MS(300)).await;
         h.counter.fail_next("clear");
         h.player.emit(PlayerEvent::Ended);
-        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: true });
+        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { public: true, mics_failed: false });
         assert_eq!(run.stages.lock().unwrap().last(), Some(&Stage::Live));
         let warns = run.warns.lock().unwrap();
         assert!(warns.iter().any(|w| w.contains("counter")), "{warns:?}");

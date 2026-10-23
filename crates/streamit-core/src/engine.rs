@@ -658,7 +658,7 @@ impl Engine {
                     }
                     // Unknown whether the stream cut happened: treated as not on air.
                     Job::GoLive { preempt_public } => {
-                        self.finish_golive(Err(T0Error { on_air: false, failures: vec![reason] }), preempt_public)
+                        self.finish_golive(Err(T0Error { on_air: false, mics_failed: false, failures: vec![reason] }), preempt_public)
                     }
                     _ => set_warning(&self.snap, reason),
                 }
@@ -683,9 +683,12 @@ impl Engine {
         let golive = std::mem::take(&mut self.golive_pending);
         match result {
             // Reached T-0 by itself (even if Go Live was pressed meanwhile): no second t0.
-            Ok(CountdownOutcome::Live { public }) => self.set(|s| {
+            Ok(CountdownOutcome::Live { public, mics_failed }) => self.set(|s| {
                 s.stage = Stage::Live;
                 remove(&mut s.offers, Offer::GoLive);
+                if mics_failed {
+                    mics_left_down(s);
+                }
                 if public {
                     remove(&mut s.offers, Offer::GoPublic);
                 } else {
@@ -726,6 +729,7 @@ impl Engine {
     /// Live whenever the stream cut succeeded, even if later steps failed (then
     /// with a warning). After a pre-empt that did not go public, Go Public is offered.
     fn finish_golive(&mut self, result: Result<(), T0Error>, preempt_public: Option<bool>) {
+        let mics_failed = result.as_ref().err().is_some_and(|e| e.mics_failed);
         let (on_air, warning) = match &result {
             Ok(()) => (true, None),
             Err(e) if e.on_air => (true, Some(format!("Live, but some T-0 steps failed: {e}"))),
@@ -735,6 +739,9 @@ impl Engine {
             if on_air {
                 s.stage = Stage::Live;
                 remove(&mut s.offers, Offer::GoLive);
+                if mics_failed {
+                    mics_left_down(s);
+                }
                 match preempt_public {
                     Some(false) => add(&mut s.offers, Offer::GoPublic),
                     Some(true) => remove(&mut s.offers, Offer::GoPublic),
@@ -911,6 +918,13 @@ impl Engine {
             }
         });
     }
+}
+
+/// I1: T-0 went live but could not bring the mics up. Show them as down and offer
+/// Recover, the one-press way back.
+fn mics_left_down(s: &mut Snapshot) {
+    s.mics_ducked = true;
+    add(&mut s.offers, Offer::Recover);
 }
 
 /// Prepare never moves the stage off Live (Go Live may have landed meanwhile).
@@ -1808,6 +1822,32 @@ mod tests {
         let s = until(&mut e, "stopped", |s| s.job.is_none() && !matches!(s.stage, Stage::Countdown { .. })).await;
         assert!(s.offers.contains(&Offer::GoLive), "{:?}", s.offers);
         assert!(s.offers.contains(&Offer::GoPublic), "the countdown had not gone public: {:?}", s.offers);
+    }
+
+    // ---- I1 ----
+
+    #[tokio::test(start_paused = true)]
+    async fn t0_mic_fade_failure_offers_recover() {
+        // Go Live by hand.
+        let (d, _log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        until(&mut e, "startup done", |s| s.broadcast.is_some()).await;
+        h.stream.fail_next("set_audio_level");
+        send(&e, Command::GoLive).await;
+        let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        assert!(s.mics_ducked, "the mics did not come up");
+        assert!(s.offers.contains(&Offer::Recover), "{:?}", s.offers);
+
+        // The countdown's own T-0.
+        let (d, _log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        h.stream.fail_next("set_audio_level");
+        h.player.emit(PlayerEvent::Ended);
+        let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        assert!(s.mics_ducked, "the mics did not come up");
+        assert!(s.offers.contains(&Offer::Recover), "{:?}", s.offers);
     }
 
     // ---- R23 ----
