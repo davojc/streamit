@@ -175,9 +175,17 @@ type Shared = Arc<watch::Sender<Snapshot>>;
 /// stop it and wait for its return path.
 enum Job {
     Prepare,
-    Countdown { cancel: CancellationToken },
-    End { skip: Arc<Notify> },
-    Video { index: usize, stop: CancellationToken, unmute: Arc<Notify> },
+    Countdown {
+        cancel: CancellationToken,
+    },
+    End {
+        skip: Arc<Notify>,
+    },
+    Video {
+        index: usize,
+        stop: CancellationToken,
+        unmute: Arc<Notify>,
+    },
     /// Start service now by hand: T-0, going public alongside it unless already public.
     GoLive(GoLiveStart),
     Recover,
@@ -216,12 +224,26 @@ struct Running {
 /// What a finished job hands back to the engine loop.
 enum Done {
     Prepared(Readiness),
-    Countdown { result: devices::Result<CountdownOutcome>, public: bool, before: Stage },
+    Countdown {
+        result: devices::Result<CountdownOutcome>,
+        public: bool,
+        before: Stage,
+    },
     Ended(EndOutcome),
-    Video { index: usize, outcome: RollinOutcome },
+    Video {
+        index: usize,
+        outcome: RollinOutcome,
+    },
     /// `public` is the go-public's result (`None` if none ran).
-    WentLive { result: Result<(), T0Error>, public: Option<devices::Result<()>>, start: GoLiveStart },
-    Recovered { ok: bool, assessment: Assessment },
+    WentLive {
+        result: Result<(), T0Error>,
+        public: Option<devices::Result<()>>,
+        start: GoLiveStart,
+    },
+    Recovered {
+        ok: bool,
+        assessment: Assessment,
+    },
 }
 
 struct Refreshed {
@@ -566,10 +588,13 @@ impl Engine {
             Command::Refresh => {
                 let (d, c, sel, aux) = (self.d.clone(), self.config(), self.selected(), self.aux.clone());
                 let (player_active, epoch, sel_gen) = (self.player_active(), self.epoch, self.sel_gen);
-                tokio::spawn(async move {
-                    let r = refresh(d, c, sel, player_active, epoch, sel_gen).await;
-                    let _ = aux.send(Aux::Refreshed(Box::new(r)));
-                }.in_current_span());
+                tokio::spawn(
+                    async move {
+                        let r = refresh(d, c, sel, player_active, epoch, sel_gen).await;
+                        let _ = aux.send(Aux::Refreshed(Box::new(r)));
+                    }
+                    .in_current_span(),
+                );
             }
             Command::DeviceHealth(kind, health) => {
                 let (kind, health) = (*kind, health.clone());
@@ -598,10 +623,13 @@ impl Engine {
         let generation = self.flash_gen;
         self.set(|s| s.flash = Some(i));
         let aux = self.aux.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(FLASH_FOR).await;
-            let _ = aux.send(Aux::ClearFlash(generation));
-        }.in_current_span());
+        tokio::spawn(
+            async move {
+                tokio::time::sleep(FLASH_FOR).await;
+                let _ = aux.send(Aux::ClearFlash(generation));
+            }
+            .in_current_span(),
+        );
     }
 
     fn flash_key(&mut self, key: FlashKey) {
@@ -609,33 +637,40 @@ impl Engine {
         let generation = self.key_flash_gen;
         self.set(|s| s.flash_key = Some(key));
         let aux = self.aux.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(FLASH_FOR).await;
-            let _ = aux.send(Aux::ClearKeyFlash(generation));
-        }.in_current_span());
+        tokio::spawn(
+            async move {
+                tokio::time::sleep(FLASH_FOR).await;
+                let _ = aux.send(Aux::ClearKeyFlash(generation));
+            }
+            .in_current_span(),
+        );
     }
 
     // ---- jobs ----
 
     fn start_prepare(&mut self) {
-        let (d, c, snap, levels, bid) = (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone(), self.bid());
+        let (d, c, snap, levels, bid) =
+            (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone(), self.bid());
         let file = self.levels_file.clone();
-        let handle = tokio::spawn(async move {
-            let mut l = lock(&levels).clone();
-            let (p, w, n) = (snap.clone(), snap.clone(), snap);
-            let r = golive::prepare(
-                &d,
-                &c,
-                &bid,
-                &mut l,
-                move |r| p.send_modify(|s| set_prepared(s, r)),
-                move |m| set_warning(&w, m),
-                move |m| n.send_modify(|s| log(s, m)),
-            )
-            .await;
-            store_levels(&levels, l, file.as_deref());
-            Done::Prepared(r)
-        }.in_current_span());
+        let handle = tokio::spawn(
+            async move {
+                let mut l = lock(&levels).clone();
+                let (p, w, n) = (snap.clone(), snap.clone(), snap);
+                let r = golive::prepare(
+                    &d,
+                    &c,
+                    &bid,
+                    &mut l,
+                    move |r| p.send_modify(|s| set_prepared(s, r)),
+                    move |m| set_warning(&w, m),
+                    move |m| n.send_modify(|s| log(s, m)),
+                )
+                .await;
+                store_levels(&levels, l, file.as_deref());
+                Done::Prepared(r)
+            }
+            .in_current_span(),
+        );
         self.begin(Job::Prepare, handle);
     }
 
@@ -652,47 +687,53 @@ impl Engine {
         let cancel = CancellationToken::new();
         let (d, c, snap, levels, bid, tok) =
             (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone(), self.bid(), cancel.clone());
-        let handle = tokio::spawn(async move {
-            let l = lock(&levels).clone();
-            let public = Arc::new(AtomicBool::new(false));
-            let (p, w, r, pf) = (snap.clone(), snap.clone(), snap, public.clone());
-            let result = golive::countdown(
-                &d,
-                &c,
-                &bid,
-                &ready,
-                &l,
-                tok,
-                move |st| {
-                    if matches!(st, Stage::Countdown { public: true, .. }) {
-                        pf.store(true, Ordering::SeqCst);
-                    }
-                    p.send_modify(|s| set_stage(s, st));
-                },
-                move |m| set_warning(&w, m),
-                move |report| {
-                    r.send_modify(|s| match report {
-                        CountdownReport::Started(total) => {
-                            s.countdown_total = Some(total);
-                            log(s, format!("Countdown started ({})", mss(total)));
+        let handle = tokio::spawn(
+            async move {
+                let l = lock(&levels).clone();
+                let public = Arc::new(AtomicBool::new(false));
+                let (p, w, r, pf) = (snap.clone(), snap.clone(), snap, public.clone());
+                let result = golive::countdown(
+                    &d,
+                    &c,
+                    &bid,
+                    &ready,
+                    &l,
+                    tok,
+                    move |st| {
+                        if matches!(st, Stage::Countdown { public: true, .. }) {
+                            pf.store(true, Ordering::SeqCst);
                         }
-                        CountdownReport::Note(m) => log(s, m),
-                    })
-                },
-            )
-            .await;
-            Done::Countdown { result, public: public.load(Ordering::SeqCst), before }
-        }.in_current_span());
+                        p.send_modify(|s| set_stage(s, st));
+                    },
+                    move |m| set_warning(&w, m),
+                    move |report| {
+                        r.send_modify(|s| match report {
+                            CountdownReport::Started(total) => {
+                                s.countdown_total = Some(total);
+                                log(s, format!("Countdown started ({})", mss(total)));
+                            }
+                            CountdownReport::Note(m) => log(s, m),
+                        })
+                    },
+                )
+                .await;
+                Done::Countdown { result, public: public.load(Ordering::SeqCst), before }
+            }
+            .in_current_span(),
+        );
         self.begin(Job::Countdown { cancel }, handle);
     }
 
     fn start_end(&mut self) {
         let skip = Arc::new(Notify::new());
         let (d, c, snap, bid, s2) = (self.d.clone(), self.config(), self.snap.clone(), self.bid(), skip.clone());
-        let handle = tokio::spawn(async move {
-            let out = end_service(&d, &c, &bid, s2, move |st| snap.send_modify(|s| set_stage(s, st))).await;
-            Done::Ended(out)
-        }.in_current_span());
+        let handle = tokio::spawn(
+            async move {
+                let out = end_service(&d, &c, &bid, s2, move |st| snap.send_modify(|s| set_stage(s, st))).await;
+                Done::Ended(out)
+            }
+            .in_current_span(),
+        );
         self.begin(Job::End { skip }, handle);
     }
 
@@ -708,24 +749,27 @@ impl Engine {
         let (d, c, snap, levels, st, um) =
             (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone(), stop.clone(), unmute.clone());
         let file = self.levels_file.clone();
-        let handle = tokio::spawn(async move {
-            let mut l = lock(&levels).clone();
-            let name = cue.name.clone();
-            let report = move |r: RollinReport| {
-                snap.send_modify(|s| match r {
-                    RollinReport::MicsDucked(down) => s.mics_ducked = down,
-                    RollinReport::Position { position, duration } => {
-                        if s.video.is_none() {
-                            log(s, format!("Video {} · {name} · started", index + 1));
+        let handle = tokio::spawn(
+            async move {
+                let mut l = lock(&levels).clone();
+                let name = cue.name.clone();
+                let report = move |r: RollinReport| {
+                    snap.send_modify(|s| match r {
+                        RollinReport::MicsDucked(down) => s.mics_ducked = down,
+                        RollinReport::Position { position, duration } => {
+                            if s.video.is_none() {
+                                log(s, format!("Video {} · {name} · started", index + 1));
+                            }
+                            s.video = Some(VideoProgress { index, position, duration });
                         }
-                        s.video = Some(VideoProgress { index, position, duration });
-                    }
-                })
-            };
-            let outcome = rollin::play_reporting(&d, &c, &cue, &mut l, st, um, report).await;
-            store_levels(&levels, l, file.as_deref());
-            Done::Video { index, outcome }
-        }.in_current_span());
+                    })
+                };
+                let outcome = rollin::play_reporting(&d, &c, &cue, &mut l, st, um, report).await;
+                store_levels(&levels, l, file.as_deref());
+                Done::Video { index, outcome }
+            }
+            .in_current_span(),
+        );
         self.begin(Job::Video { index, stop, unmute }, handle);
     }
 
@@ -746,28 +790,31 @@ impl Engine {
             self.set(|s| remove(&mut s.offers, Offer::GoPublic));
         }
         let (d, c, levels, snap) = (self.d.clone(), self.config(), self.levels.clone(), self.snap.clone());
-        let handle = tokio::spawn(async move {
-            let l = lock(&levels).clone();
-            let live = snap.clone();
-            let out = golive::start_service_reporting(
-                &d,
-                &c,
-                bid.as_deref().unwrap_or_default(),
-                !going_public,
-                &l,
-                |m| snap.send_modify(|s| log(s, m)),
-                |r| {
-                    if r.as_ref().map_or_else(|e| e.on_air, |()| true) {
-                        live.send_modify(|s| {
-                            set_stage(s, Stage::Live);
-                            remove(&mut s.offers, Offer::GoLive);
-                        });
-                    }
-                },
-            )
-            .await;
-            Done::WentLive { result: out.t0, public: out.public, start }
-        }.in_current_span());
+        let handle = tokio::spawn(
+            async move {
+                let l = lock(&levels).clone();
+                let live = snap.clone();
+                let out = golive::start_service_reporting(
+                    &d,
+                    &c,
+                    bid.as_deref().unwrap_or_default(),
+                    !going_public,
+                    &l,
+                    |m| snap.send_modify(|s| log(s, m)),
+                    |r| {
+                        if r.as_ref().map_or_else(|e| e.on_air, |()| true) {
+                            live.send_modify(|s| {
+                                set_stage(s, Stage::Live);
+                                remove(&mut s.offers, Offer::GoLive);
+                            });
+                        }
+                    },
+                )
+                .await;
+                Done::WentLive { result: out.t0, public: out.public, start }
+            }
+            .in_current_span(),
+        );
         self.begin(Job::GoLive(start), handle);
     }
 
@@ -782,20 +829,24 @@ impl Engine {
     }
 
     fn start_recover(&mut self) {
-        let (d, c, snap, levels, bid) = (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone(), self.selected());
-        let handle = tokio::spawn(async move {
-            let l = lock(&levels).clone();
-            let ok = match recovery::recover(&d, &c, &l).await {
-                Ok(()) => true,
-                Err(e) => {
-                    set_warning(&snap, format!("Recover could not finish: {e}"));
-                    false
-                }
-            };
-            // Recover never runs alongside a video, so no player is active.
-            let assessment = recovery::assess(&d, &c, bid.as_deref(), false).await;
-            Done::Recovered { ok, assessment }
-        }.in_current_span());
+        let (d, c, snap, levels, bid) =
+            (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone(), self.selected());
+        let handle = tokio::spawn(
+            async move {
+                let l = lock(&levels).clone();
+                let ok = match recovery::recover(&d, &c, &l).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        set_warning(&snap, format!("Recover could not finish: {e}"));
+                        false
+                    }
+                };
+                // Recover never runs alongside a video, so no player is active.
+                let assessment = recovery::assess(&d, &c, bid.as_deref(), false).await;
+                Done::Recovered { ok, assessment }
+            }
+            .in_current_span(),
+        );
         self.begin(Job::Recover, handle);
     }
 
@@ -832,9 +883,7 @@ impl Engine {
                         self.finish_video(index, RollinOutcome::Failed { recover_needed: true, reason })
                     }
                     // Handled like a countdown error: back to Prepared, Go Live / Go Public offered.
-                    Job::Countdown { .. } => {
-                        self.finish_countdown(Err(DeviceError::Other(reason)), false, Stage::Idle)
-                    }
+                    Job::Countdown { .. } => self.finish_countdown(Err(DeviceError::Other(reason)), false, Stage::Idle),
                     // Unknown whether the stream cut happened: treated as not on air.
                     Job::GoLive(start) => {
                         let e = T0Error { on_air: false, mics_failed: false, failures: vec![reason] };
@@ -1010,43 +1059,52 @@ impl Engine {
 
     fn spawn_go_public(&self) {
         let (d, snap, bid) = (self.d.clone(), self.snap.clone(), self.bid());
-        tokio::spawn(async move {
-            let start = tokio::time::Instant::now();
-            match golive::go_public(&d, &bid).await {
-                Ok(()) => snap.send_modify(|s| {
-                    remove(&mut s.offers, Offer::GoPublic);
-                    log(s, golive::public_note(start.elapsed()));
-                }),
-                Err(e) => set_warning(&snap, format!("Could not make the YouTube broadcast public: {e}")),
+        tokio::spawn(
+            async move {
+                let start = tokio::time::Instant::now();
+                match golive::go_public(&d, &bid).await {
+                    Ok(()) => snap.send_modify(|s| {
+                        remove(&mut s.offers, Offer::GoPublic);
+                        log(s, golive::public_note(start.elapsed()));
+                    }),
+                    Err(e) => set_warning(&snap, format!("Could not make the YouTube broadcast public: {e}")),
+                }
             }
-        }.in_current_span());
+            .in_current_span(),
+        );
     }
 
     fn spawn_end_broadcast(&self) {
         let (d, snap, bid) = (self.d.clone(), self.snap.clone(), self.bid());
-        tokio::spawn(async move {
-            match golive::transition_with_retry(&d, &bid, Phase::Complete).await {
-                Ok(()) => snap.send_modify(|s| {
-                    remove(&mut s.offers, Offer::EndBroadcast);
-                    log(s, "YouTube broadcast ended".into());
-                }),
-                Err(e) => set_warning(&snap, format!("Could not end the YouTube broadcast: {e}")),
+        tokio::spawn(
+            async move {
+                match golive::transition_with_retry(&d, &bid, Phase::Complete).await {
+                    Ok(()) => snap.send_modify(|s| {
+                        remove(&mut s.offers, Offer::EndBroadcast);
+                        log(s, "YouTube broadcast ended".into());
+                    }),
+                    Err(e) => set_warning(&snap, format!("Could not end the YouTube broadcast: {e}")),
+                }
             }
-        }.in_current_span());
+            .in_current_span(),
+        );
     }
 
     /// Optionally apply `fix` to broadcast `id`, then re-check it.
     fn spawn_check(&self, id: String, fix: Option<Fix>) {
         let (d, snap, aux, sel_gen) = (self.d.clone(), self.snap.clone(), self.aux.clone(), self.sel_gen);
-        tokio::spawn(async move {
-            if let Some(f) = fix
-                && let Err(e) = d.yt.fix(&id, f).await
-            {
-                set_warning(&snap, format!("Could not fix the broadcast: {e}"));
+        tokio::spawn(
+            async move {
+                if let Some(f) = fix
+                    && let Err(e) = d.yt.fix(&id, f).await
+                {
+                    set_warning(&snap, format!("Could not fix the broadcast: {e}"));
+                }
+                let check = d.yt.check(&id).await.map_err(|e| e.to_string());
+                let _ = aux.send(Aux::Checked { sel_gen, check });
             }
-            let check = d.yt.check(&id).await.map_err(|e| e.to_string());
-            let _ = aux.send(Aux::Checked { sel_gen, check });
-        }.in_current_span());
+            .in_current_span(),
+        );
     }
 
     // ---- side-task results ----
@@ -1253,8 +1311,7 @@ async fn refresh(
         };
         (report, selected, check)
     };
-    let (mut report, selected, check, youtube_timed_out) = match tokio::time::timeout(REFRESH_TIMEOUT, youtube).await
-    {
+    let (mut report, selected, check, youtube_timed_out) = match tokio::time::timeout(REFRESH_TIMEOUT, youtube).await {
         Ok((report, selected, check)) => (report, selected, check, false),
         Err(_) => (Stage0Report::default(), kept, None, true),
     };
@@ -1294,11 +1351,7 @@ fn set_warning(snap: &Shared, msg: String) {
 }
 
 fn cue_rows(l: &CueList) -> Vec<(Cue, CueState)> {
-    l.cues()
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (c.clone(), l.state.get(i).cloned().unwrap_or(CueState::Cued)))
-        .collect()
+    l.cues().iter().enumerate().map(|(i, c)| (c.clone(), l.state.get(i).cloned().unwrap_or(CueState::Cued))).collect()
 }
 
 /// A new list of `cues`, all `Cued` except that a cue equal to one in `old` keeps
@@ -1330,7 +1383,7 @@ fn remove(offers: &mut Vec<Offer>, o: Offer) {
 mod tests {
     use super::*;
     use crate::config::AudioSourceId;
-    use crate::devices::{PlayerEvent, Phase};
+    use crate::devices::{Phase, PlayerEvent};
     use crate::fakes::{Call, CallLog, FakeHandles, fake_devices};
     use crate::golive::Readiness;
     use crate::rollin::Destination;
@@ -1345,7 +1398,13 @@ mod tests {
     const MS: fn(u64) -> Duration = Duration::from_millis;
 
     fn cue(name: &str, destination: Destination) -> Cue {
-        Cue { path: PathBuf::from(format!("{name}.mp4")), name: name.into(), destination, gain_db: 0.0, return_input: None }
+        Cue {
+            path: PathBuf::from(format!("{name}.mp4")),
+            name: name.into(),
+            destination,
+            gain_db: 0.0,
+            return_input: None,
+        }
     }
 
     /// Config with the VideoHub set up for input 8 and the given cues.
@@ -1663,7 +1722,12 @@ mod tests {
         h.yt.set_upcoming(vec![summary("b1"), summary("b2")]);
         let mut e = Engine::spawn(d, cfg(vec![]));
         until(&mut e, "b1", |s| s.broadcast.as_ref().is_some_and(|b| b.id == "b1")).await;
-        h.yt.set_check(BroadcastCheck { bound_to_ours: false, auto_start: false, auto_stop: true, monitor_stream: true });
+        h.yt.set_check(BroadcastCheck {
+            bound_to_ours: false,
+            auto_start: false,
+            auto_stop: true,
+            monitor_stream: true,
+        });
         send(&e, Command::SelectBroadcast("b2".into())).await;
         let s = until(&mut e, "b2", |s| s.broadcast.as_ref().is_some_and(|b| b.id == "b2")).await;
         assert_eq!(s.check.map(|c| c.bound_to_ours), Some(false));
@@ -2310,7 +2374,11 @@ mod tests {
         send(&e, Command::Refresh).await;
         let s = until(&mut e, "Recover withdrawn", |s| !s.offers.contains(&Offer::Recover)).await;
         assert!(start.elapsed() <= REFRESH_TIMEOUT + Duration::from_secs(1), "took {:?}", start.elapsed());
-        assert!(s.last_warning.as_deref().is_some_and(|w| w.contains("Refresh did not finish")), "{:?}", s.last_warning);
+        assert!(
+            s.last_warning.as_deref().is_some_and(|w| w.contains("Refresh did not finish")),
+            "{:?}",
+            s.last_warning
+        );
     }
 
     /// Live on the holding still after a restart (Go Live and End Broadcast offered). A
@@ -2412,10 +2480,8 @@ mod tests {
         until(&mut e, "b2 checked", |s| selected_id(s).as_deref() == Some("b2") && s.check.is_some()).await;
         h.yt.fail_next("upcoming");
         send(&e, Command::Refresh).await;
-        until(&mut e, "the refresh's warning", |s| {
-            s.last_warning.as_deref().is_some_and(|w| w.contains("broadcasts"))
-        })
-        .await;
+        until(&mut e, "the refresh's warning", |s| s.last_warning.as_deref().is_some_and(|w| w.contains("broadcasts")))
+            .await;
         sleep(MS(500)).await;
         let s = snap(&e);
         assert_eq!(selected_id(&s).as_deref(), Some("b2"));
@@ -2530,12 +2596,14 @@ mod tests {
         let (d, log, h) = rig();
         h.player.set_duration(Duration::from_secs(60));
         h.player.set_position(Some(Duration::ZERO));
-        let mut e = Engine::spawn(d, cfg(vec![cue("a", Destination::HallOnly), cue("Mission update", Destination::HallOnly)]));
+        let mut e =
+            Engine::spawn(d, cfg(vec![cue("a", Destination::HallOnly), cue("Mission update", Destination::HallOnly)]));
         send(&e, Command::PlayCue(1)).await;
         until_call(&log, Call::PlayerPlay).await;
         sleep(Duration::from_secs(10)).await;
         h.player.set_position(Some(Duration::from_secs(10)));
-        let s = until(&mut e, "10 s in", |s| s.video.as_ref().is_some_and(|v| v.position == Duration::from_secs(10))).await;
+        let s =
+            until(&mut e, "10 s in", |s| s.video.as_ref().is_some_and(|v| v.position == Duration::from_secs(10))).await;
         let want = VideoProgress { index: 1, position: Duration::from_secs(10), duration: Duration::from_secs(60) };
         assert_eq!(s.video, Some(want));
         assert!(has(&s, "Video 2 · Mission update · started"), "{:?}", texts(&s));

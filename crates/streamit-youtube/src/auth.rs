@@ -2,8 +2,8 @@
 //! an in-memory access-token cache.
 use oauth2::basic::BasicClient;
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
-    Scope, TokenResponse, TokenUrl,
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl, Scope,
+    TokenResponse, TokenUrl,
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -40,9 +40,7 @@ impl TokenStore for KeyringStore {
         Self::entry().ok()?.get_password().ok()
     }
     fn set(&self, token: &str) -> std::result::Result<(), String> {
-        Self::entry()
-            .and_then(|e| e.set_password(token))
-            .map_err(|e| e.to_string())
+        Self::entry().and_then(|e| e.set_password(token)).map_err(|e| e.to_string())
     }
     fn clear(&self) {
         if let Ok(e) = Self::entry() {
@@ -97,12 +95,7 @@ fn http_client() -> reqwest::Client {
 
 impl Auth {
     /// Build with an injectable token endpoint and token store.
-    pub fn new(
-        client_id: &str,
-        client_secret: &str,
-        token_url: Url,
-        store: Arc<dyn TokenStore>,
-    ) -> Auth {
+    pub fn new(client_id: &str, client_secret: &str, token_url: Url, store: Arc<dyn TokenStore>) -> Auth {
         Auth(Arc::new(Inner {
             client_id: client_id.into(),
             client_secret: client_secret.into(),
@@ -115,12 +108,7 @@ impl Auth {
 
     /// Use the stored refresh token (if any) against Google. Never blocks or prompts.
     pub fn load(client_id: &str, client_secret: &str) -> Result<Auth> {
-        Ok(Auth::new(
-            client_id,
-            client_secret,
-            Url::parse(TOKEN_URL).expect("token url"),
-            Arc::new(KeyringStore),
-        ))
+        Ok(Auth::new(client_id, client_secret, Url::parse(TOKEN_URL).expect("token url"), Arc::new(KeyringStore)))
     }
 
     /// Run the browser sign-in and store the refresh token in the Credential Manager.
@@ -168,9 +156,8 @@ impl Auth {
             .request_async(&inner.http)
             .await
             .map_err(|e| DeviceError::Refused(format!("sign-in failed: {e}")))?;
-        let refresh = token
-            .refresh_token()
-            .ok_or_else(|| DeviceError::Refused("Google returned no refresh token".into()))?;
+        let refresh =
+            token.refresh_token().ok_or_else(|| DeviceError::Refused("Google returned no refresh token".into()))?;
         inner.store.set(refresh.secret()).map_err(|e| DeviceError::Other(format!("saving sign-in: {e}")))?;
         let ttl = token.expires_in().unwrap_or(Duration::from_secs(3600));
         *inner.cache.lock().await = Some((token.access_token().secret().clone(), expiry(ttl)));
@@ -189,10 +176,7 @@ impl Auth {
             return Ok(tok.clone());
         }
         *cache = None;
-        let refresh = inner
-            .store
-            .get()
-            .ok_or_else(|| DeviceError::Refused(SIGN_IN_REQUIRED.into()))?;
+        let refresh = inner.store.get().ok_or_else(|| DeviceError::Refused(SIGN_IN_REQUIRED.into()))?;
         let resp = inner
             .http
             .post(inner.token_url.clone())
@@ -226,10 +210,7 @@ impl Auth {
         if status.is_server_error() {
             return Err(DeviceError::Other(format!("token endpoint returned {status}")));
         }
-        let why = body["error_description"]
-            .as_str()
-            .or(body["error"].as_str())
-            .unwrap_or("token refresh refused");
+        let why = body["error_description"].as_str().or(body["error"].as_str()).unwrap_or("token refresh refused");
         Err(DeviceError::Refused(why.to_string()))
     }
 
@@ -258,11 +239,7 @@ fn other(e: impl std::fmt::Display) -> DeviceError {
 }
 
 pub(crate) fn net_err(e: reqwest::Error) -> DeviceError {
-    if e.is_timeout() {
-        DeviceError::Timeout(e.to_string())
-    } else {
-        DeviceError::Other(e.to_string())
-    }
+    if e.is_timeout() { DeviceError::Timeout(e.to_string()) } else { DeviceError::Other(e.to_string()) }
 }
 
 /// Accept connections until one carries the redirect with a matching `state`.
@@ -290,10 +267,7 @@ async fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String> {
 /// `Some(result)` when this request is the real redirect (right `state`), else `None`.
 async fn handle_connection(mut sock: tokio::net::TcpStream, state: &str) -> Option<Result<String>> {
     let mut buf = vec![0u8; 8192];
-    let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
-        .await
-        .ok()?
-        .unwrap_or(0);
+    let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf)).await.ok()?.unwrap_or(0);
     let text = String::from_utf8_lossy(&buf[..n]);
     let target = text.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
     let Ok(url) = Url::parse(&format!("http://127.0.0.1{target}")) else {

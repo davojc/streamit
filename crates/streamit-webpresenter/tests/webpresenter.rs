@@ -69,14 +69,8 @@ fn parses_stream_state_status() {
         assert_eq!(parse_status(&b[0]), Some(want));
     }
     // other blocks, and a STREAM STATE without a Status line, carry no status
-    assert_eq!(
-        parse_status(&parse_blocks("IDENTITY:\nStatus: Idle\n\n")[0]),
-        None
-    );
-    assert_eq!(
-        parse_status(&parse_blocks("STREAM STATE:\nAction: Start\n\n")[0]),
-        None
-    );
+    assert_eq!(parse_status(&parse_blocks("IDENTITY:\nStatus: Idle\n\n")[0]), None);
+    assert_eq!(parse_status(&parse_blocks("STREAM STATE:\nAction: Start\n\n")[0]), None);
 }
 
 #[test]
@@ -98,9 +92,7 @@ async fn status_follows_dump_and_unsolicited_updates() {
     let wp = WebPresenter::connect_with(addr, fast()).await.unwrap();
     let mut s = accept_with_dump(&l).await;
     wait_status(&wp, EncoderStatus::Idle).await;
-    s.write_all(b"STREAM STATE:\r\nStatus: Streaming\r\n\r\n")
-        .await
-        .unwrap();
+    s.write_all(b"STREAM STATE:\r\nStatus: Streaming\r\n\r\n").await.unwrap();
     wait_status(&wp, EncoderStatus::Streaming).await;
 }
 
@@ -114,9 +106,7 @@ async fn start_and_stop_wait_for_ack() {
     let w = wp.clone();
     let t = tokio::spawn(async move { w.start().await });
     assert_eq!(read_msg(&mut s).await, "STREAM STATE:\nAction: Start\n\n");
-    s.write_all(b"ACK\n\nSTREAM STATE:\nStatus: Connecting\n\n")
-        .await
-        .unwrap();
+    s.write_all(b"ACK\n\nSTREAM STATE:\nStatus: Connecting\n\n").await.unwrap();
     assert_eq!(t.await.unwrap(), Ok(()));
     wait_status(&wp, EncoderStatus::Connecting).await;
 
@@ -152,9 +142,8 @@ async fn start_times_out_then_resyncs() {
     read_msg(&mut s).await;
     assert!(matches!(t.await.unwrap(), Err(DeviceError::Timeout(_))));
     // the link is dropped and re-established; a stale reply cannot leak into the next command
-    let mut s2 = tokio::time::timeout(Duration::from_secs(3), accept_with_dump(&l))
-        .await
-        .expect("no reconnect after timeout");
+    let mut s2 =
+        tokio::time::timeout(Duration::from_secs(3), accept_with_dump(&l)).await.expect("no reconnect after timeout");
     wait_status(&wp, EncoderStatus::Idle).await;
     let w = wp.clone();
     let t = tokio::spawn(async move { w.stop().await });
@@ -169,14 +158,8 @@ async fn disconnected_before_state_block_and_when_peer_closes() {
     let wp = WebPresenter::connect_with(addr, fast()).await.unwrap();
     let (mut s, _) = l.accept().await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        wp.status().await,
-        Err(DeviceError::Disconnected("not synced".into()))
-    );
-    assert!(matches!(
-        wp.start().await,
-        Err(DeviceError::Disconnected(_))
-    ));
+    assert_eq!(wp.status().await, Err(DeviceError::Disconnected("not synced".into())));
+    assert!(matches!(wp.start().await, Err(DeviceError::Disconnected(_))));
     s.write_all(DUMP.as_bytes()).await.unwrap();
     wait_status(&wp, EncoderStatus::Idle).await;
     drop(s);

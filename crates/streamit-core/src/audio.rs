@@ -46,9 +46,7 @@ impl LiveLevels {
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
         let f: LevelsFile = toml::from_str(&text).with_context(|| format!("reading {}", path.display()))?;
-        Ok(LiveLevels(
-            f.mic.into_iter().map(|m| (AudioSourceId { input: m.input, source: m.source }, m.db)).collect(),
-        ))
+        Ok(LiveLevels(f.mic.into_iter().map(|m| (AudioSourceId { input: m.input, source: m.source }, m.db)).collect()))
     }
 
     /// Save atomically (temp file, then rename), sorted so the file is stable.
@@ -144,7 +142,7 @@ pub async fn fade(sw: &dyn StreamSwitcher, srcs: &[AudioSourceId], to: Target<'_
 mod tests {
     use super::*;
     use crate::config::AudioSourceId;
-    use crate::fakes::{fake_devices, Call};
+    use crate::fakes::{Call, fake_devices};
     use std::time::Duration;
 
     const MIC: AudioSourceId = AudioSourceId { input: 1001, source: -65280 };

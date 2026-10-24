@@ -548,12 +548,18 @@ pub struct SwitchState {
 }
 
 /// Mirrors `Sessions::switch`: allowed only at Idle or Ended with no sequence running.
+/// Nothing is happening: no service under way and no sequence running. Switching to or
+/// from simulation and installing an update wait for this.
+pub fn between_services(s: &Snapshot) -> bool {
+    matches!(s.stage, Stage::Idle | Stage::Ended) && s.job.is_none()
+}
+
 pub fn switch_state(s: &Snapshot, mode: Mode) -> SwitchState {
     let label = match mode {
         Mode::Real => "Switch to simulation",
         Mode::Simulation => "Leave simulation",
     };
-    let enabled = matches!(s.stage, Stage::Idle | Stage::Ended) && s.job.is_none();
+    let enabled = between_services(s);
     SwitchState { label, enabled, reason: (!enabled).then_some(REFUSED) }
 }
 

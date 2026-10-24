@@ -252,10 +252,18 @@ pub fn appearance(key: u8, snap: &Snapshot, blink_phase: bool) -> KeyLook {
             l
         }
         STOP_VIDEO => {
-            if snap.playing.is_some() { look("STOP\nVIDEO", RED, WHITE) } else { dim("STOP\nVIDEO") }
+            if snap.playing.is_some() {
+                look("STOP\nVIDEO", RED, WHITE)
+            } else {
+                dim("STOP\nVIDEO")
+            }
         }
         UNMUTE => {
-            if unmute_pressable(snap) { look("UNMUTE\nMICS", AMBER, BLACK) } else { dim("UNMUTE\nMICS") }
+            if unmute_pressable(snap) {
+                look("UNMUTE\nMICS", AMBER, BLACK)
+            } else {
+                dim("UNMUTE\nMICS")
+            }
         }
         _ => look("", BLACK, BLACK),
     }
@@ -278,10 +286,7 @@ mod tests {
     }
 
     fn snap_with_cues(n: usize) -> Snapshot {
-        Snapshot {
-            cues: (0..n).map(|i| (cue(&format!("Video {i}")), CueState::Cued)).collect(),
-            ..Snapshot::default()
-        }
+        Snapshot { cues: (0..n).map(|i| (cue(&format!("Video {i}")), CueState::Cued)).collect(), ..Snapshot::default() }
     }
 
     #[test]

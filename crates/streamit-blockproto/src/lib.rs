@@ -45,16 +45,10 @@ impl BlockParser {
             }
             None => match line.trim().strip_suffix(':') {
                 Some(name) => {
-                    self.cur = Some(Block {
-                        name: name.to_string(),
-                        lines: vec![],
-                    });
+                    self.cur = Some(Block { name: name.to_string(), lines: vec![] });
                     None
                 }
-                None => Some(Block {
-                    name: line.trim().to_string(),
-                    lines: vec![],
-                }),
+                None => Some(Block { name: line.trim().to_string(), lines: vec![] }),
             },
         }
     }
@@ -180,14 +174,7 @@ impl Link {
             on_reset,
         };
         let task = tokio::spawn(run(ctx, rx));
-        Link {
-            name,
-            state,
-            cmds: tx,
-            timings,
-            reset,
-            task,
-        }
+        Link { name, state, cmds: tx, timings, reset, task }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, LinkState> {
@@ -221,10 +208,7 @@ impl Link {
     pub async fn command(&self, text: String, what: &str) -> Result<()> {
         let epoch = self.usable()?;
         let (reply, rx) = oneshot::channel();
-        self.cmds
-            .send(Cmd { text, reply })
-            .await
-            .map_err(|_| self.down())?;
+        self.cmds.send(Cmd { text, reply }).await.map_err(|_| self.down())?;
         match tokio::time::timeout(self.timings.command_timeout, rx).await {
             Err(_) => {
                 // A lost reply would skew the ACK/NAK queue: drop the link and resync.
@@ -235,10 +219,7 @@ impl Link {
             }
             Ok(Err(_)) => Err(self.down()),
             Ok(Ok(true)) => Ok(()),
-            Ok(Ok(false)) => Err(DeviceError::Refused(format!(
-                "{} refused {what}",
-                self.name
-            ))),
+            Ok(Ok(false)) => Err(DeviceError::Refused(format!("{} refused {what}", self.name))),
         }
     }
 }
@@ -256,11 +237,7 @@ struct Ctx {
 
 async fn run(ctx: Ctx, mut cmds: mpsc::Receiver<Cmd>) {
     let (name, addr) = (ctx.name, ctx.addr);
-    let backoff = if ctx.t.backoff.is_empty() {
-        vec![Duration::from_secs(1)]
-    } else {
-        ctx.t.backoff.clone()
-    };
+    let backoff = if ctx.t.backoff.is_empty() { vec![Duration::from_secs(1)] } else { ctx.t.backoff.clone() };
     let mut attempt = 0usize;
     loop {
         match tokio::time::timeout(ctx.t.connect_timeout, TcpStream::connect(addr)).await {

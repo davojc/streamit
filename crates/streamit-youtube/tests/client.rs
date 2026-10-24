@@ -9,26 +9,18 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 async fn token_ok(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            json!({"access_token":"at","expires_in":3600,"token_type":"Bearer"}),
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"access_token":"at","expires_in":3600,"token_type":"Bearer"})),
+        )
         .mount(server)
         .await;
 }
 
 fn client(server: &MockServer, stream: Option<&str>) -> YouTubeClient {
     let store = Arc::new(MemoryStore::with_token("refresh"));
-    let auth = Auth::new(
-        "cid",
-        "sec",
-        Url::parse(&format!("{}/token", server.uri())).unwrap(),
-        store,
-    );
-    YouTubeClient::new(
-        Url::parse(&format!("{}/youtube/v3", server.uri())).unwrap(),
-        auth,
-        stream.map(String::from),
-    )
+    let auth = Auth::new("cid", "sec", Url::parse(&format!("{}/token", server.uri())).unwrap(), store);
+    YouTubeClient::new(Url::parse(&format!("{}/youtube/v3", server.uri())).unwrap(), auth, stream.map(String::from))
 }
 
 fn broadcast(id: &str, start: Option<&str>, bound: Option<&str>) -> serde_json::Value {
@@ -158,10 +150,7 @@ async fn check_missing_fields_default_and_unknown_id_is_not_found() {
         .await;
     let c = client(&s, None).check("x").await.unwrap();
     assert!(!c.bound_to_ours && !c.auto_start && !c.auto_stop && !c.monitor_stream);
-    assert_eq!(
-        client(&s, None).check("gone").await,
-        Err(DeviceError::Refused("broadcast not found".into()))
-    );
+    assert_eq!(client(&s, None).check("gone").await, Err(DeviceError::Refused("broadcast not found".into())));
 }
 
 #[tokio::test]
@@ -174,9 +163,7 @@ async fn fix_auto_start_sends_full_content_details() {
     Mock::given(method("GET"))
         .and(path("/youtube/v3/liveBroadcasts"))
         .and(query_param("id", "x"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({"items":[{"id":"x","contentDetails":cd}]})),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[{"id":"x","contentDetails":cd}]})))
         .mount(&s)
         .await;
     let mut want = cd.clone();
@@ -203,9 +190,7 @@ async fn fix_monitor_on_and_auto_stop_on() {
         .mount(&s)
         .await;
     Mock::given(method("PUT"))
-        .and(body_partial_json(
-            json!({"contentDetails":{"enableAutoStop":true,"enableDvr":true}}),
-        ))
+        .and(body_partial_json(json!({"contentDetails":{"enableAutoStop":true,"enableDvr":true}})))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&s)
@@ -236,10 +221,7 @@ async fn fix_bind_posts_bind() {
         .mount(&s)
         .await;
     client(&s, Some("s1")).fix("x", Fix::Bind).await.unwrap();
-    assert_eq!(
-        client(&s, None).fix("x", Fix::Bind).await,
-        Err(DeviceError::Refused("no stream selected".into()))
-    );
+    assert_eq!(client(&s, None).fix("x", Fix::Bind).await, Err(DeviceError::Refused("no stream selected".into())));
 }
 
 async fn health_for(status: serde_json::Value, stream: Option<&str>) -> Result<Health, DeviceError> {
@@ -249,9 +231,7 @@ async fn health_for(status: serde_json::Value, stream: Option<&str>) -> Result<H
         .and(path("/youtube/v3/liveStreams"))
         .and(query_param("part", "status"))
         .and(query_param("id", "s1"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({"items":[{"status":status}]})),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[{"status":status}]})))
         .mount(&s)
         .await;
     client(&s, stream).health().await
@@ -268,14 +248,8 @@ async fn health_maps_status() {
         health_for(json!({"streamStatus":"active","healthStatus":{"status":"ok"}}), some).await,
         Ok(Health::Good)
     );
-    assert_eq!(
-        health_for(json!({"streamStatus":"inactive"}), some).await,
-        Ok(Health::NotReceiving)
-    );
-    assert_eq!(
-        health_for(json!({"streamStatus":"ready"}), some).await,
-        Ok(Health::NotReceiving)
-    );
+    assert_eq!(health_for(json!({"streamStatus":"inactive"}), some).await, Ok(Health::NotReceiving));
+    assert_eq!(health_for(json!({"streamStatus":"ready"}), some).await, Ok(Health::NotReceiving));
     assert!(matches!(
         health_for(json!({"streamStatus":"active","healthStatus":{"status":"bad"}}), some).await,
         Ok(Health::Bad(_))
@@ -285,10 +259,7 @@ async fn health_maps_status() {
         Ok(Health::Bad(_))
     ));
     assert!(matches!(health_for(json!({}), some).await, Ok(Health::Bad(_))));
-    assert_eq!(
-        health_for(json!({}), None).await,
-        Err(DeviceError::Refused("no stream selected".into()))
-    );
+    assert_eq!(health_for(json!({}), None).await, Err(DeviceError::Refused("no stream selected".into())));
 }
 
 #[tokio::test]
@@ -298,9 +269,9 @@ async fn life_cycle_reads_status() {
     Mock::given(method("GET"))
         .and(query_param("part", "status"))
         .and(query_param("id", "x"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            json!({"items":[{"status":{"lifeCycleStatus":"testing"}}]}),
-        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"items":[{"status":{"lifeCycleStatus":"testing"}}]})),
+        )
         .mount(&s)
         .await;
     assert_eq!(client(&s, None).life_cycle("x").await.unwrap(), "testing");
@@ -310,11 +281,7 @@ async fn life_cycle_reads_status() {
 async fn transition_posts_expected_query() {
     let s = MockServer::start().await;
     token_ok(&s).await;
-    for (phase, name) in [
-        (Phase::Testing, "testing"),
-        (Phase::Live, "live"),
-        (Phase::Complete, "complete"),
-    ] {
+    for (phase, name) in [(Phase::Testing, "testing"), (Phase::Live, "live"), (Phase::Complete, "complete")] {
         Mock::given(method("POST"))
             .and(path("/youtube/v3/liveBroadcasts/transition"))
             .and(query_param("broadcastStatus", name))
@@ -347,9 +314,9 @@ async fn http_errors_map() {
     token_ok(&s).await;
     Mock::given(method("GET"))
         .and(query_param("id", "forbidden"))
-        .respond_with(ResponseTemplate::new(403).set_body_json(
-            json!({"error":{"errors":[{"reason":"quotaExceeded"}]}}),
-        ))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_json(json!({"error":{"errors":[{"reason":"quotaExceeded"}]}})),
+        )
         .mount(&s)
         .await;
     Mock::given(method("GET"))
@@ -379,9 +346,10 @@ async fn unauthorized_refreshes_token_once_and_retries() {
     let s = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            json!({"access_token":"at","expires_in":3600,"token_type":"Bearer"}),
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"access_token":"at","expires_in":3600,"token_type":"Bearer"})),
+        )
         .expect(2)
         .mount(&s)
         .await;
@@ -409,17 +377,8 @@ async fn expired_token_reports_signin_required() {
         .mount(&s)
         .await;
     let store = Arc::new(MemoryStore::with_token("refresh"));
-    let auth = Auth::new(
-        "cid",
-        "sec",
-        Url::parse(&format!("{}/token", s.uri())).unwrap(),
-        store.clone(),
-    );
-    let c = YouTubeClient::new(
-        Url::parse(&format!("{}/youtube/v3", s.uri())).unwrap(),
-        auth,
-        Some("s1".into()),
-    );
+    let auth = Auth::new("cid", "sec", Url::parse(&format!("{}/token", s.uri())).unwrap(), store.clone());
+    let c = YouTubeClient::new(Url::parse(&format!("{}/youtube/v3", s.uri())).unwrap(), auth, Some("s1".into()));
     assert_eq!(c.signed_in().await, Ok(false));
     assert!(streamit_youtube::TokenStore::get(&*store).is_none());
     assert_eq!(c.upcoming().await, Err(DeviceError::Refused("sign-in required".into())));
@@ -430,12 +389,8 @@ async fn expired_token_reports_signin_required() {
 async fn no_stored_token_is_signed_out_and_working_token_is_signed_in() {
     let s = MockServer::start().await;
     token_ok(&s).await;
-    let auth = Auth::new(
-        "c",
-        "s",
-        Url::parse(&format!("{}/token", s.uri())).unwrap(),
-        Arc::new(MemoryStore::default()),
-    );
+    let auth =
+        Auth::new("c", "s", Url::parse(&format!("{}/token", s.uri())).unwrap(), Arc::new(MemoryStore::default()));
     let c = YouTubeClient::new(Url::parse(&s.uri()).unwrap(), auth, None);
     assert_eq!(c.signed_in().await, Ok(false));
     assert_eq!(client(&s, None).signed_in().await, Ok(true));
@@ -466,11 +421,7 @@ async fn list_streams_reads_mine_with_masked_key_names() {
                 title: "Default stream key".into(),
                 key_name: "…wxyz".into(),
             },
-            streamit_youtube::StreamSummary {
-                id: "s2".into(),
-                title: "Church 1080p".into(),
-                key_name: String::new(),
-            },
+            streamit_youtube::StreamSummary { id: "s2".into(), title: "Church 1080p".into(), key_name: String::new() },
         ]
     );
 }
@@ -478,12 +429,8 @@ async fn list_streams_reads_mine_with_masked_key_names() {
 #[tokio::test]
 async fn list_streams_without_sign_in_is_refused() {
     let s = MockServer::start().await;
-    let auth = Auth::new(
-        "c",
-        "s",
-        Url::parse(&format!("{}/token", s.uri())).unwrap(),
-        Arc::new(MemoryStore::default()),
-    );
+    let auth =
+        Auth::new("c", "s", Url::parse(&format!("{}/token", s.uri())).unwrap(), Arc::new(MemoryStore::default()));
     let c = YouTubeClient::new(Url::parse(&s.uri()).unwrap(), auth, None);
     assert_eq!(c.list_streams().await, Err(DeviceError::Refused("sign-in required".into())));
 }

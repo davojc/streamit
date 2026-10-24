@@ -30,19 +30,17 @@ impl BusWatch {
         let failed = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let (f, s) = (failed.clone(), stop.clone());
-        std::thread::Builder::new()
-            .name(format!("{what}-bus"))
-            .spawn(move || {
-                while !s.load(Ordering::SeqCst) {
-                    let Some(msg) = bus.timed_pop(BUS_POLL) else {
-                        continue;
-                    };
-                    if let gst::MessageView::Error(e) = msg.view() {
-                        tracing::warn!(pipeline = what, error = %describe(e), "pipeline error");
-                        f.store(true, Ordering::SeqCst);
-                    }
+        std::thread::Builder::new().name(format!("{what}-bus")).spawn(move || {
+            while !s.load(Ordering::SeqCst) {
+                let Some(msg) = bus.timed_pop(BUS_POLL) else {
+                    continue;
+                };
+                if let gst::MessageView::Error(e) = msg.view() {
+                    tracing::warn!(pipeline = what, error = %describe(e), "pipeline error");
+                    f.store(true, Ordering::SeqCst);
                 }
-            })?;
+            }
+        })?;
         Ok(BusWatch { failed, stop })
     }
 

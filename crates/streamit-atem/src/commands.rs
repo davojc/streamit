@@ -26,10 +26,7 @@ pub fn split_commands(payload: &[u8]) -> Vec<RawCommand<'_>> {
         if len < COMMAND_HEADER_LEN || len > rest.len() {
             break;
         }
-        cmds.push(RawCommand {
-            name: [rest[4], rest[5], rest[6], rest[7]],
-            body: &rest[COMMAND_HEADER_LEN..len],
-        });
+        cmds.push(RawCommand { name: [rest[4], rest[5], rest[6], rest[7]], body: &rest[COMMAND_HEADER_LEN..len] });
         rest = &rest[len..];
     }
     cmds
@@ -152,24 +149,12 @@ pub struct Cfsp {
 impl Cfsp {
     /// Sets only the fader gain of one source.
     pub fn fader_gain(index: u16, source: i64, hundredths_db: i32) -> Cfsp {
-        Cfsp {
-            mask: cfsp_mask::FADER_GAIN,
-            index,
-            source,
-            fader_gain: hundredths_db,
-            ..Cfsp::default()
-        }
+        Cfsp { mask: cfsp_mask::FADER_GAIN, index, source, fader_gain: hundredths_db, ..Cfsp::default() }
     }
 
     /// Sets only the mix option (On / Off / AFV) of one source.
     pub fn mix_option(index: u16, source: i64, option: u8) -> Cfsp {
-        Cfsp {
-            mask: cfsp_mask::MIX_OPTION,
-            index,
-            source,
-            mix_option: option,
-            ..Cfsp::default()
-        }
+        Cfsp { mask: cfsp_mask::MIX_OPTION, index, source, mix_option: option, ..Cfsp::default() }
     }
 
     // Upstream: src/commands/Fairlight/FairlightMixerSourceCommand.ts (`FairlightMixerSourceCommand.serialize`).
@@ -215,39 +200,13 @@ impl Reader<'_> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decoded {
     Version(u32),
-    Topology {
-        mix_effects: u8,
-        sources: u8,
-        media_players: u8,
-    },
+    Topology { mix_effects: u8, sources: u8, media_players: u8 },
     InitComplete,
-    ProgramInput {
-        mix_effect: u8,
-        source: u16,
-    },
-    PreviewInput {
-        mix_effect: u8,
-        source: u16,
-    },
-    TransitionPosition {
-        mix_effect: u8,
-        in_transition: bool,
-        remaining_frames: u8,
-        handle_position: u16,
-    },
-    MediaPlayerSource {
-        player: u8,
-        source_type: u8,
-        still_index: u8,
-        clip_index: u8,
-    },
-    FairlightSource {
-        index: u16,
-        source: i64,
-        fader_gain: i32,
-        supported_mix_options: u8,
-        mix_option: u8,
-    },
+    ProgramInput { mix_effect: u8, source: u16 },
+    PreviewInput { mix_effect: u8, source: u16 },
+    TransitionPosition { mix_effect: u8, in_transition: bool, remaining_frames: u8, handle_position: u16 },
+    MediaPlayerSource { player: u8, source_type: u8, still_index: u8, clip_index: u8 },
+    FairlightSource { index: u16, source: i64, fader_gain: i32, supported_mix_options: u8, mix_option: u8 },
 }
 
 /// Decodes one command, or `None` for one StreamIt ignores (or one too short to read).
@@ -258,23 +217,13 @@ pub fn decode(cmd: &RawCommand<'_>) -> Option<Decoded> {
         b"_ver" => Some(Decoded::Version(r.u32(0)?)),
         // Upstream: src/commands/DeviceProfile/topologyCommand.ts (`TopologyCommand.deserialize`).
         // Only the first six bytes are read; they do not move between protocol versions.
-        b"_top" => Some(Decoded::Topology {
-            mix_effects: r.u8(0)?,
-            sources: r.u8(1)?,
-            media_players: r.u8(5)?,
-        }),
+        b"_top" => Some(Decoded::Topology { mix_effects: r.u8(0)?, sources: r.u8(1)?, media_players: r.u8(5)? }),
         // Upstream: src/commands/InitCompleteCommand.ts (reads nothing).
         b"InCm" => Some(Decoded::InitComplete),
         // Upstream: src/commands/MixEffects/ProgramInputCommand.ts (`ProgramInputUpdateCommand.deserialize`).
-        b"PrgI" => Some(Decoded::ProgramInput {
-            mix_effect: r.u8(0)?,
-            source: r.u16(2)?,
-        }),
+        b"PrgI" => Some(Decoded::ProgramInput { mix_effect: r.u8(0)?, source: r.u16(2)? }),
         // Upstream: src/commands/MixEffects/PreviewInputCommand.ts (`PreviewInputUpdateCommand.deserialize`).
-        b"PrvI" => Some(Decoded::PreviewInput {
-            mix_effect: r.u8(0)?,
-            source: r.u16(2)?,
-        }),
+        b"PrvI" => Some(Decoded::PreviewInput { mix_effect: r.u8(0)?, source: r.u16(2)? }),
         // Upstream: src/commands/MixEffects/Transition/TransitionPositionCommand.ts
         // (`TransitionPositionUpdateCommand.deserialize`).
         b"TrPs" => Some(Decoded::TransitionPosition {
@@ -309,10 +258,7 @@ mod tests {
 
     /// Parses a libatem-data.json `bytes` string ("00-0C-00-00-...").
     fn hex(s: &str) -> Vec<u8> {
-        s.split(['-', ' ', '\n'])
-            .filter(|x| !x.is_empty())
-            .map(|x| u8::from_str_radix(x, 16).unwrap())
-            .collect()
+        s.split(['-', ' ', '\n']).filter(|x| !x.is_empty()).map(|x| u8::from_str_radix(x, 16).unwrap()).collect()
     }
 
     fn decode_bytes(b: &[u8]) -> Option<Decoded> {
@@ -345,35 +291,14 @@ mod tests {
     #[test]
     fn encode_mpss() {
         // libatem-data.json MPSS {"Mask": 2, "Index": 2, "SourceType": 2, "StillIndex": 197, "ClipIndex": 214}
-        let m = Mpss {
-            mask: 2,
-            player: 2,
-            source_type: 2,
-            still_index: 197,
-            clip_index: 214,
-        };
-        assert_eq!(
-            m.encode(),
-            hex("00-10-00-00-4D-50-53-53-02-02-02-C5-D6-00-00-00")
-        );
+        let m = Mpss { mask: 2, player: 2, source_type: 2, still_index: 197, clip_index: 214 };
+        assert_eq!(m.encode(), hex("00-10-00-00-4D-50-53-53-02-02-02-C5-D6-00-00-00"));
         // MPSS {"Mask": 1, "Index": 3, "SourceType": 1, "StillIndex": 211, "ClipIndex": 25}
-        let m = Mpss {
-            mask: 1,
-            player: 3,
-            source_type: 1,
-            still_index: 211,
-            clip_index: 25,
-        };
-        assert_eq!(
-            m.encode(),
-            hex("00-10-00-00-4D-50-53-53-01-03-01-D3-19-00-00-00")
-        );
+        let m = Mpss { mask: 1, player: 3, source_type: 1, still_index: 211, clip_index: 25 };
+        assert_eq!(m.encode(), hex("00-10-00-00-4D-50-53-53-01-03-01-D3-19-00-00-00"));
         // What set_media_player_still sends for player 1 (wire 0), still 5: mask = type | still,
         // as upstream's serializer writes it when only sourceType and stillIndex are set.
-        assert_eq!(
-            Mpss::still(0, 5).encode(),
-            hex("00-10-00-00-4D-50-53-53-03-00-01-05-00-00-00-00")
-        );
+        assert_eq!(Mpss::still(0, 5).encode(), hex("00-10-00-00-4D-50-53-53-03-00-01-05-00-00-00-00"));
     }
 
     #[test]
@@ -432,8 +357,7 @@ mod tests {
     fn encode_cfsp_gain_only() {
         // Upstream serializer with only faderGain set: flag 0x0080, index, source, every other
         // field zero, faderGain as i32 BE at body offset 40. Input 1001, source -65280, -10 dB.
-        let mut want =
-            hex("00-38-00-00-43-46-53-50-00-80-03-E9-00-00-00-00-FF-FF-FF-FF-FF-FF-01-00");
+        let mut want = hex("00-38-00-00-43-46-53-50-00-80-03-E9-00-00-00-00-FF-FF-FF-FF-FF-FF-01-00");
         want.extend_from_slice(&[0; 24]);
         want.extend_from_slice(&hex("FF-FF-FC-18-00-00-00-00"));
         assert_eq!(want.len(), 56);
@@ -442,14 +366,10 @@ mod tests {
 
     #[test]
     fn encode_cfsp_mix_option_only() {
-        let mut want =
-            hex("00-38-00-00-43-46-53-50-01-00-03-E9-00-00-00-00-FF-FF-FF-FF-FF-FF-01-00");
+        let mut want = hex("00-38-00-00-43-46-53-50-01-00-03-E9-00-00-00-00-FF-FF-FF-FF-FF-FF-01-00");
         want.extend_from_slice(&[0; 28]);
         want.extend_from_slice(&hex("02-00-00-00"));
-        assert_eq!(
-            Cfsp::mix_option(1001, -65280, mix_option::ON).encode(),
-            want
-        );
+        assert_eq!(Cfsp::mix_option(1001, -65280, mix_option::ON).encode(), want);
     }
 
     #[test]
@@ -457,18 +377,12 @@ mod tests {
         // libatem-data.json PrgI {"Index": 3, "Source": 3020}
         assert_eq!(
             decode_bytes(&hex("00-0C-00-00-50-72-67-49-03-00-0B-CC")),
-            Some(Decoded::ProgramInput {
-                mix_effect: 3,
-                source: 3020
-            })
+            Some(Decoded::ProgramInput { mix_effect: 3, source: 3020 })
         );
         // PrvI {"Index": 0, "Source": 8009} (8-byte body on newer protocol versions)
         assert_eq!(
             decode_bytes(&hex("00-10-00-00-50-72-76-49-00-00-1F-49-00-0A-13-01")),
-            Some(Decoded::PreviewInput {
-                mix_effect: 0,
-                source: 8009
-            })
+            Some(Decoded::PreviewInput { mix_effect: 0, source: 8009 })
         );
     }
 
@@ -535,42 +449,22 @@ mod tests {
         // libatem-data.json MPCE {"Index": 0, "SourceType": 1, "SourceIndex": 57}
         assert_eq!(
             decode_bytes(&hex("00-0C-00-00-4D-50-43-45-00-01-39-00")),
-            Some(Decoded::MediaPlayerSource {
-                player: 0,
-                source_type: 1,
-                still_index: 57,
-                clip_index: 0
-            })
+            Some(Decoded::MediaPlayerSource { player: 0, source_type: 1, still_index: 57, clip_index: 0 })
         );
         // _ver {"ProtocolVersion": 131100}
-        assert_eq!(
-            decode_bytes(&hex("00-0C-00-00-5F-76-65-72-00-02-00-1C")),
-            Some(Decoded::Version(131100))
-        );
+        assert_eq!(decode_bytes(&hex("00-0C-00-00-5F-76-65-72-00-02-00-1C")), Some(Decoded::Version(131100)));
         // _top {"MixEffectBlocks": 71, "VideoSources": 49, …, "MediaPlayers": 190, …}
         assert_eq!(
-            decode_bytes(&hex(
-                "00-1C-00-00-5F-74-6F-70-47-31-0F-C4-D6-BE-AB-16-80-3A-D9-00-00-00-00-00-00-00-00-00"
-            )),
-            Some(Decoded::Topology {
-                mix_effects: 71,
-                sources: 49,
-                media_players: 190
-            })
+            decode_bytes(&hex("00-1C-00-00-5F-74-6F-70-47-31-0F-C4-D6-BE-AB-16-80-3A-D9-00-00-00-00-00-00-00-00-00")),
+            Some(Decoded::Topology { mix_effects: 71, sources: 49, media_players: 190 })
         );
         // InCm has no fixture upstream (its deserializer reads nothing); TODO(capture).
-        assert_eq!(
-            decode_bytes(&hex("00-0C-00-00-49-6E-43-6D-01-00-00-00")),
-            Some(Decoded::InitComplete)
-        );
+        assert_eq!(decode_bytes(&hex("00-0C-00-00-49-6E-43-6D-01-00-00-00")), Some(Decoded::InitComplete));
     }
 
     #[test]
     fn ignores_unknown_and_short_commands() {
-        assert_eq!(
-            decode_bytes(&hex("00-0C-00-00-58-58-58-58-00-00-00-00")),
-            None
-        );
+        assert_eq!(decode_bytes(&hex("00-0C-00-00-58-58-58-58-00-00-00-00")), None);
         // A PrgI too short to hold a source is ignored, not misread.
         assert_eq!(decode_bytes(&hex("00-0A-00-00-50-72-67-49-00-00")), None);
     }

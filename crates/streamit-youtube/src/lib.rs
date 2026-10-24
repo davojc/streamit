@@ -8,9 +8,7 @@ use async_trait::async_trait;
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use std::time::Duration;
-use streamit_core::devices::{
-    BroadcastCheck, BroadcastSummary, Broadcasts, DeviceError, Fix, Health, Phase, Result,
-};
+use streamit_core::devices::{BroadcastCheck, BroadcastSummary, Broadcasts, DeviceError, Fix, Health, Phase, Result};
 use url::Url;
 
 pub const API_BASE: &str = "https://www.googleapis.com/youtube/v3";
@@ -50,21 +48,12 @@ impl YouTubeClient {
             let p = format!("{}/", base.path());
             base.set_path(&p);
         }
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .expect("http client");
+        let http = reqwest::Client::builder().timeout(Duration::from_secs(15)).build().expect("http client");
         Self { base, auth, stream_id, http }
     }
 
     /// One API call. A 401 refreshes the access token and retries once.
-    async fn call(
-        &self,
-        method: Method,
-        path: &str,
-        query: &[(&str, &str)],
-        body: Option<&Value>,
-    ) -> Result<Value> {
+    async fn call(&self, method: Method, path: &str, query: &[(&str, &str)], body: Option<&Value>) -> Result<Value> {
         for attempt in 0..2 {
             let token = self.auth.access_token().await?;
             let mut url = self.base.join(path).map_err(|e| DeviceError::Other(e.to_string()))?;
@@ -124,11 +113,7 @@ impl YouTubeClient {
             .call(
                 Method::GET,
                 "liveBroadcasts",
-                &[
-                    ("part", "id,snippet,contentDetails,status"),
-                    ("broadcastStatus", status),
-                    ("maxResults", "25"),
-                ],
+                &[("part", "id,snippet,contentDetails,status"), ("broadcastStatus", status), ("maxResults", "25")],
                 None,
             )
             .await?;
@@ -150,21 +135,13 @@ impl YouTubeClient {
     }
 
     async fn broadcast(&self, id: &str, part: &str) -> Result<Value> {
-        let v = self
-            .call(Method::GET, "liveBroadcasts", &[("part", part), ("id", id)], None)
-            .await?;
-        v["items"]
-            .get(0)
-            .cloned()
-            .ok_or_else(|| DeviceError::Refused("broadcast not found".into()))
+        let v = self.call(Method::GET, "liveBroadcasts", &[("part", part), ("id", id)], None).await?;
+        v["items"].get(0).cloned().ok_or_else(|| DeviceError::Refused("broadcast not found".into()))
     }
 }
 
 fn map_error(status: StatusCode, body: &Value) -> DeviceError {
-    let reason = body["error"]["errors"][0]["reason"]
-        .as_str()
-        .or(body["error"]["message"].as_str())
-        .map(String::from);
+    let reason = body["error"]["errors"][0]["reason"].as_str().or(body["error"]["message"].as_str()).map(String::from);
     match status.as_u16() {
         404 => DeviceError::Refused("broadcast not found".into()),
         401 | 403 => DeviceError::Refused(reason.unwrap_or_else(|| format!("HTTP {status}"))),
@@ -197,7 +174,9 @@ impl Broadcasts for YouTubeClient {
         }
         // RFC 3339 UTC strings sort chronologically; unscheduled broadcasts go last.
         list.sort_by(|a, b| {
-            a.scheduled_start.is_none().cmp(&b.scheduled_start.is_none())
+            a.scheduled_start
+                .is_none()
+                .cmp(&b.scheduled_start.is_none())
                 .then_with(|| a.scheduled_start.cmp(&b.scheduled_start))
         });
         Ok(list)
@@ -217,10 +196,7 @@ impl Broadcasts for YouTubeClient {
 
     async fn fix(&self, id: &str, fix: Fix) -> Result<()> {
         if fix == Fix::Bind {
-            let stream = self
-                .stream_id
-                .as_deref()
-                .ok_or_else(|| DeviceError::Refused("no stream selected".into()))?;
+            let stream = self.stream_id.as_deref().ok_or_else(|| DeviceError::Refused("no stream selected".into()))?;
             self.call(
                 Method::POST,
                 "liveBroadcasts/bind",
@@ -258,13 +234,8 @@ impl Broadcasts for YouTubeClient {
     }
 
     async fn health(&self) -> Result<Health> {
-        let stream = self
-            .stream_id
-            .as_deref()
-            .ok_or_else(|| DeviceError::Refused("no stream selected".into()))?;
-        let v = self
-            .call(Method::GET, "liveStreams", &[("part", "status"), ("id", stream)], None)
-            .await?;
+        let stream = self.stream_id.as_deref().ok_or_else(|| DeviceError::Refused("no stream selected".into()))?;
+        let v = self.call(Method::GET, "liveStreams", &[("part", "status"), ("id", stream)], None).await?;
         let Some(item) = v["items"].get(0) else {
             return Err(DeviceError::Refused("stream not found".into()));
         };

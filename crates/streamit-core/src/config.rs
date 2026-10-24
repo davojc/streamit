@@ -148,11 +148,7 @@ pub struct PlayoutConfig {
 
 impl Default for PlayoutConfig {
     fn default() -> Self {
-        Self {
-            decklink_device: 0,
-            video_mode: "1080p2997".into(),
-            countdown_file: PathBuf::from("countdown.mp4"),
-        }
+        Self { decklink_device: 0, video_mode: "1080p2997".into(), countdown_file: PathBuf::from("countdown.mp4") }
     }
 }
 

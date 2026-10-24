@@ -13,9 +13,7 @@ use streamit_core::devices::{DeviceError, Player, PlayerEvent, Result};
 use tokio::sync::broadcast;
 
 use crate::bus::{BUS_POLL, BusWatch, describe};
-use crate::pipeline::{
-    AudioSource, SinkKind, VideoMode, black_pipeline, file_uri, player_pipeline_full,
-};
+use crate::pipeline::{AudioSource, SinkKind, VideoMode, black_pipeline, file_uri, player_pipeline_full};
 
 /// How long the Discoverer may take to probe a file.
 const DISCOVER_TIMEOUT: gst::ClockTime = gst::ClockTime::from_seconds(10);
@@ -86,11 +84,7 @@ impl GstPlayer {
             ))
         })?;
         let (events, _) = broadcast::channel(16);
-        let outputs = Outputs {
-            clip: None,
-            black: None,
-            gate: Arc::new(Mutex::new(0)),
-        };
+        let outputs = Outputs { clip: None, black: None, gate: Arc::new(Mutex::new(0)) };
         Ok(Arc::new(GstPlayer {
             sink,
             device: cfg.decklink_device,
@@ -117,16 +111,13 @@ fn prepare(
 ) -> Result<(gst::Pipeline, gst::Bus, Duration)> {
     let uri = file_uri(path);
     let discoverer = pbutils::Discoverer::new(DISCOVER_TIMEOUT).map_err(other)?;
-    let info = discoverer
-        .discover_uri(&uri)
-        .map_err(|e| other(format!("cannot read {}: {e}", path.display())))?;
+    let info = discoverer.discover_uri(&uri).map_err(|e| other(format!("cannot read {}: {e}", path.display())))?;
     if info.video_streams().is_empty() {
         return Err(other(format!("{} has no video", path.display())));
     }
     let probed = info.duration().map(to_duration);
     let audio = if info.audio_streams().is_empty() {
-        let duration = probed
-            .ok_or_else(|| other(format!("{} has no audio and no duration", path.display())))?;
+        let duration = probed.ok_or_else(|| other(format!("{} has no audio and no duration", path.display())))?;
         AudioSource::Silence { duration }
     } else {
         AudioSource::File
@@ -147,10 +138,7 @@ fn prepare(
         let _ = pipeline.set_state(gst::State::Null);
         return Err(e);
     }
-    let duration = pipeline
-        .query_duration::<gst::ClockTime>()
-        .map(to_duration)
-        .or(probed);
+    let duration = pipeline.query_duration::<gst::ClockTime>().map(to_duration).or(probed);
     match duration {
         Some(d) => Ok((pipeline, bus, d)),
         None => {
@@ -163,22 +151,12 @@ fn prepare(
 /// Sets PAUSED and waits for AsyncDone (the first frame is up) or an error.
 fn preroll(pipeline: &gst::Pipeline, bus: &gst::Bus) -> Result<()> {
     let change = pipeline.set_state(gst::State::Paused);
-    if matches!(
-        change,
-        Ok(gst::StateChangeSuccess::Success | gst::StateChangeSuccess::NoPreroll)
-    ) {
+    if matches!(change, Ok(gst::StateChangeSuccess::Success | gst::StateChangeSuccess::NoPreroll)) {
         return Ok(());
     }
     // Async, or a failure whose reason is on the bus.
-    let timeout = if change.is_ok() {
-        PREROLL_TIMEOUT
-    } else {
-        gst::ClockTime::ZERO
-    };
-    match bus.timed_pop_filtered(
-        timeout,
-        &[gst::MessageType::AsyncDone, gst::MessageType::Error],
-    ) {
+    let timeout = if change.is_ok() { PREROLL_TIMEOUT } else { gst::ClockTime::ZERO };
+    match bus.timed_pop_filtered(timeout, &[gst::MessageType::AsyncDone, gst::MessageType::Error]) {
         Some(msg) => match msg.view() {
             gst::MessageView::Error(e) => Err(other(describe(e))),
             _ => Ok(()),
@@ -196,28 +174,23 @@ fn watch(
     generation: u64,
     tx: broadcast::Sender<PlayerEvent>,
 ) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("playout-bus".into())
-        .spawn(move || {
-            while *lock(&gate) == generation {
-                let Some(msg) = bus.timed_pop_filtered(
-                    BUS_POLL,
-                    &[gst::MessageType::Eos, gst::MessageType::Error],
-                ) else {
-                    continue;
-                };
-                let event = match msg.view() {
-                    gst::MessageView::Eos(_) => PlayerEvent::Ended,
-                    gst::MessageView::Error(e) => PlayerEvent::Error(describe(e)),
-                    _ => continue,
-                };
-                let live = lock(&gate);
-                if *live == generation {
-                    let _ = tx.send(event);
-                }
-                break;
+    std::thread::Builder::new().name("playout-bus".into()).spawn(move || {
+        while *lock(&gate) == generation {
+            let Some(msg) = bus.timed_pop_filtered(BUS_POLL, &[gst::MessageType::Eos, gst::MessageType::Error]) else {
+                continue;
+            };
+            let event = match msg.view() {
+                gst::MessageView::Eos(_) => PlayerEvent::Ended,
+                gst::MessageView::Error(e) => PlayerEvent::Error(describe(e)),
+                _ => continue,
+            };
+            let live = lock(&gate);
+            if *live == generation {
+                let _ = tx.send(event);
             }
-        })?;
+            break;
+        }
+    })?;
     Ok(())
 }
 
@@ -251,10 +224,7 @@ impl Player for GstPlayer {
         let outputs = self.outputs.clone();
         blocking(move || {
             let outputs = lock(&outputs);
-            let clip = outputs
-                .clip
-                .as_ref()
-                .ok_or_else(|| DeviceError::Refused("nothing loaded".into()))?;
+            let clip = outputs.clip.as_ref().ok_or_else(|| DeviceError::Refused("nothing loaded".into()))?;
             clip.set_state(gst::State::Playing).map_err(other)?;
             Ok(())
         })
@@ -262,8 +232,7 @@ impl Player for GstPlayer {
     }
 
     async fn stop(&self) -> Result<()> {
-        let (outputs, sink, device, mode) =
-            (self.outputs.clone(), self.sink, self.device, self.mode);
+        let (outputs, sink, device, mode) = (self.outputs.clone(), self.sink, self.device, self.mode);
         blocking(move || {
             let mut outputs = lock(&outputs);
             outputs.release();
@@ -274,10 +243,7 @@ impl Player for GstPlayer {
                 .map_err(other)?
                 .downcast::<gst::Pipeline>()
                 .map_err(|_| other("black description did not yield a pipeline"))?;
-            let watch = match pipeline
-                .bus()
-                .map(|bus| BusWatch::spawn(bus, "decklink-black"))
-            {
+            let watch = match pipeline.bus().map(|bus| BusWatch::spawn(bus, "decklink-black")) {
                 Some(Ok(watch)) => watch,
                 Some(Err(e)) => return Err(other(e)),
                 None => return Err(other("black pipeline has no bus")),
@@ -286,10 +252,7 @@ impl Player for GstPlayer {
                 let _ = pipeline.set_state(gst::State::Null);
                 return Err(other(format!("cannot output black: {e}")));
             }
-            outputs.black = Some(Black {
-                pipeline,
-                _watch: watch,
-            });
+            outputs.black = Some(Black { pipeline, _watch: watch });
             Ok(())
         })
         .await

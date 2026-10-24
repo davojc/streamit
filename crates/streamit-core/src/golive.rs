@@ -69,7 +69,10 @@ pub enum CountdownReport {
 pub enum CountdownOutcome {
     /// T-0 is done. `public` is whether the broadcast went public (go-public settled Ok);
     /// `mics_failed` is whether T-0 could not bring the mics up (I1: Recover is offered).
-    Live { public: bool, mics_failed: bool },
+    Live {
+        public: bool,
+        mics_failed: bool,
+    },
     Stopped,
 }
 
@@ -79,12 +82,9 @@ pub enum CountdownOutcome {
 /// else's, so it is never the default.
 pub fn preferred_broadcast(list: &[BroadcastSummary], stream_id: Option<&str>) -> Option<String> {
     // testStarting/liveStarting are YouTube's in-flight forms of testing/live.
-    let active = |b: &BroadcastSummary| {
-        matches!(b.life_cycle.as_str(), "testing" | "live" | "testStarting" | "liveStarting")
-    };
-    let ours = |b: &&BroadcastSummary| {
-        active(b) && stream_id.is_some() && b.bound_stream_id.as_deref() == stream_id
-    };
+    let active =
+        |b: &BroadcastSummary| matches!(b.life_cycle.as_str(), "testing" | "live" | "testStarting" | "liveStarting");
+    let ours = |b: &&BroadcastSummary| active(b) && stream_id.is_some() && b.bound_stream_id.as_deref() == stream_id;
     list.iter().find(ours).or_else(|| list.iter().find(|b| !active(b))).map(|b| b.id.clone())
 }
 
@@ -265,10 +265,13 @@ fn joined(r: std::result::Result<Result<Duration>, JoinError>) -> Result<Duratio
 
 fn spawn_go_public(d: &Devices, bid: &str) -> GoPublicTask {
     let (d, bid) = (d.clone(), bid.to_string());
-    GoPublicTask(tokio::spawn(async move {
-        let start = Instant::now();
-        go_public(&d, &bid).await.map(|()| start.elapsed())
-    }.in_current_span()))
+    GoPublicTask(tokio::spawn(
+        async move {
+            let start = Instant::now();
+            go_public(&d, &bid).await.map(|()| start.elapsed())
+        }
+        .in_current_span(),
+    ))
 }
 
 /// The activity line for a go-public that worked after `took`.
@@ -530,7 +533,13 @@ pub struct StartOutcome {
 /// Start service now: T-0 and, unless the broadcast is already public, `go_public`
 /// alongside it. The cut never waits for YouTube; the go-public gets at most
 /// `GO_PUBLIC_WAIT` (then it is dropped, never left detached, and counts as failed).
-pub async fn start_service(d: &Devices, c: &Config, bid: &str, already_public: bool, levels: &LiveLevels) -> StartOutcome {
+pub async fn start_service(
+    d: &Devices,
+    c: &Config,
+    bid: &str,
+    already_public: bool,
+    levels: &LiveLevels,
+) -> StartOutcome {
     start_service_reporting(d, c, bid, already_public, levels, |_| {}, |_| {}).await
 }
 
@@ -809,9 +818,8 @@ mod tests {
         // The whole fade sits between the cut to the still and the encoder start.
         let auto = pos(&calls, &Call::StreamAuto);
         let enc = pos(&calls, &Call::EncoderStart);
-        let fades: Vec<usize> = (0..calls.len())
-            .filter(|&i| matches!(calls[i], Call::StreamSetAudioLevel(..)))
-            .collect();
+        let fades: Vec<usize> =
+            (0..calls.len()).filter(|&i| matches!(calls[i], Call::StreamSetAudioLevel(..))).collect();
         assert_eq!(fades.len(), 20);
         assert!(fades.iter().all(|&i| i > auto && i < enc));
         assert_eq!(calls[*fades.last().unwrap()], Call::StreamSetAudioLevel(MIC, FLOOR_DB));
@@ -971,10 +979,7 @@ mod tests {
         sleep(Duration::from_secs(4)).await;
         assert_eq!(live_transitions(&log), 8);
         assert!(run.warns.lock().unwrap().len() >= 2); // short countdown + go public failed
-        assert!(matches!(
-            run.stages.lock().unwrap().last(),
-            Some(Stage::Countdown { public: false, .. })
-        ));
+        assert!(matches!(run.stages.lock().unwrap().last(), Some(Stage::Countdown { public: false, .. })));
         assert!(!run.stages.lock().unwrap().iter().any(|s| matches!(s, Stage::Countdown { public: true, .. })));
         // T-0 retries going public alongside the cut (v1.1); that fails too.
         h.yt.fail_times("transition", 4);
@@ -1075,8 +1080,7 @@ mod tests {
         calls[play + 1..].iter().filter(|c| !matches!(c, Call::CounterShow(_))).cloned().collect()
     }
 
-    const RECOVER: [Call; 4] =
-        [Call::ScreensSetPreview(6), Call::ScreensAuto, Call::CounterClear, Call::PlayerStop];
+    const RECOVER: [Call; 4] = [Call::ScreensSetPreview(6), Call::ScreensAuto, Call::CounterClear, Call::PlayerStop];
 
     #[tokio::test(start_paused = true)]
     async fn video_error_returns_hall_to_t0() {
@@ -1101,12 +1105,15 @@ mod tests {
         let run = spawn_countdown(&d, &Config::default(), Readiness::Ready, LiveLevels::default());
         assert!(run.task.await.unwrap().is_err());
         let calls = log.calls();
-        assert_eq!(calls[..4], [
-            Call::PlayerLoad(PathBuf::from("countdown.mp4"), 0.0),
-            Call::ScreensSetPreview(8),
-            Call::ScreensAuto,
-            Call::PlayerPlay,
-        ]);
+        assert_eq!(
+            calls[..4],
+            [
+                Call::PlayerLoad(PathBuf::from("countdown.mp4"), 0.0),
+                Call::ScreensSetPreview(8),
+                Call::ScreensAuto,
+                Call::PlayerPlay,
+            ]
+        );
         assert_eq!(calls[4..], RECOVER);
         assert!(run.warns.lock().unwrap().iter().any(|w| w.contains("Go Live")));
     }
@@ -1127,7 +1134,14 @@ mod tests {
         assert!(start.elapsed() >= Duration::from_secs(3), "returned before go public finished");
         assert_eq!(live_transitions(&log), 3);
         assert!(matches!(run.stages.lock().unwrap().last(), Some(Stage::Countdown { public: true, .. })));
-        assert_eq!(after_play(&log.calls()).iter().filter(|c| !matches!(c, Call::YtTransition(_))).cloned().collect::<Vec<_>>(), RECOVER);
+        assert_eq!(
+            after_play(&log.calls())
+                .iter()
+                .filter(|c| !matches!(c, Call::YtTransition(_)))
+                .cloned()
+                .collect::<Vec<_>>(),
+            RECOVER
+        );
         sleep(Duration::from_secs(10)).await;
         assert_eq!(live_transitions(&log), 3);
     }
@@ -1212,17 +1226,29 @@ mod tests {
         let start = Instant::now();
         let cut_at: Rec<Duration> = Arc::default();
         let c2 = cut_at.clone();
-        let out = start_service_reporting(&d, &Config::default(), "b", false, &LiveLevels::default(), |_| {}, |r| {
-            assert_eq!(*r, Ok(()));
-            c2.lock().unwrap().push(start.elapsed());
-        })
+        let out = start_service_reporting(
+            &d,
+            &Config::default(),
+            "b",
+            false,
+            &LiveLevels::default(),
+            |_| {},
+            |r| {
+                assert_eq!(*r, Ok(()));
+                c2.lock().unwrap().push(start.elapsed());
+            },
+        )
         .await;
         let cut = cut_at.lock().unwrap()[0];
         assert!(cut < Duration::from_secs(2), "T-0 waited for YouTube: {cut:?}");
         assert_eq!(out.t0, Ok(()));
         // The hung go-public is bounded by GO_PUBLIC_WAIT and reported as a failure.
         assert!(matches!(out.public, Some(Err(_))), "{:?}", out.public);
-        assert!(start.elapsed() >= GO_PUBLIC_WAIT && start.elapsed() < GO_PUBLIC_WAIT + MS(500), "{:?}", start.elapsed());
+        assert!(
+            start.elapsed() >= GO_PUBLIC_WAIT && start.elapsed() < GO_PUBLIC_WAIT + MS(500),
+            "{:?}",
+            start.elapsed()
+        );
         assert_eq!(live_transitions(&log), 1);
     }
 

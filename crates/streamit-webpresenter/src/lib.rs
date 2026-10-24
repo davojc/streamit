@@ -17,10 +17,7 @@ const STREAM_STATE: &str = "STREAM STATE";
 
 /// The wire form of a start/stop command.
 pub fn format_action(start: bool) -> String {
-    format!(
-        "{STREAM_STATE}:\nAction: {}\n\n",
-        if start { "Start" } else { "Stop" }
-    )
+    format!("{STREAM_STATE}:\nAction: {}\n\n", if start { "Start" } else { "Stop" })
 }
 
 /// The status carried by a `STREAM STATE` block, if any. Unknown values are kept verbatim.
@@ -66,14 +63,7 @@ impl WebPresenter {
             *s.lock().unwrap_or_else(|e| e.into_inner()) = None;
         });
         // Synced once the first STREAM STATE block has arrived.
-        let link = Link::spawn(
-            "webpresenter",
-            STREAM_STATE,
-            addr,
-            timings,
-            on_block,
-            on_reset,
-        );
+        let link = Link::spawn("webpresenter", STREAM_STATE, addr, timings, on_block, on_reset);
         Ok(Arc::new(WebPresenter { status, link }))
     }
 }
@@ -90,11 +80,7 @@ impl Encoder for WebPresenter {
 
     async fn status(&self) -> Result<EncoderStatus> {
         self.link.ensure_usable()?;
-        let st = self
-            .status
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let st = self.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
         // Synced means a STREAM STATE block arrived, but it may have lacked a Status line.
         Ok(st.unwrap_or_else(|| EncoderStatus::Unknown("no status reported".into())))
     }

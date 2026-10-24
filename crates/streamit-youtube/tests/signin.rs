@@ -18,12 +18,7 @@ async fn loopback_sign_in_exchanges_code_with_pkce_and_stores_refresh_token() {
         .mount(&s)
         .await;
     let store = Arc::new(MemoryStore::default());
-    let auth = Auth::new(
-        "cid",
-        "sec",
-        Url::parse(&format!("{}/token", s.uri())).unwrap(),
-        store.clone(),
-    );
+    let auth = Auth::new("cid", "sec", Url::parse(&format!("{}/token", s.uri())).unwrap(), store.clone());
     let seen = Arc::new(std::sync::Mutex::new(None::<Url>));
     let seen2 = seen.clone();
     let open = move |url: &Url| {
@@ -109,8 +104,6 @@ async fn error_with_wrong_state_is_ignored() {
             let _ = reqwest::get(format!("{redirect}/?code=c&state={state}")).await;
         });
     };
-    auth.run_sign_in(Url::parse("https://accounts.example/auth").unwrap(), &open)
-        .await
-        .unwrap();
+    auth.run_sign_in(Url::parse("https://accounts.example/auth").unwrap(), &open).await.unwrap();
     assert_eq!(store.get().as_deref(), Some("rt"));
 }

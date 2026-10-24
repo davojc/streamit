@@ -26,6 +26,19 @@ cargo build -p streamit-app --release --features gst
 
 Without `--features gst` the app wires a stand-in player and counter that report as down.
 
+## Install and update
+
+Each release on the [releases page](https://github.com/davojc/streamit/releases) has two programs:
+
+- **`streamit-windows-x64-playout.exe`**: for the playout PC. It plays the videos on the DeckLink and sends the NDI counter, so it needs GStreamer 1.24+ (runtime, **Complete**), the NDI 6 Runtime and Desktop Video installed, with GStreamer's `bin` folder on `PATH` (see [Building with GStreamer](#building-with-gstreamer-playout-pc)). Without GStreamer it does not start.
+- **`streamit-windows-x64.exe`**: for any other PC, for example to practise in simulation. The DeckLink and NDI counter show as down.
+
+To install, download the right one into a folder you can write to, such as `%LOCALAPPDATA%\StreamIt` (not Program Files, or updates cannot replace it), and rename it `streamit.exe` if you like. The settings live in `%APPDATA%\StreamIt`, not beside the program.
+
+**Updating:** StreamIt checks for a new release each time it starts. When one is out, an **Update ready** button shows in the header. It opens **Settings › Updates**, where **Install update** downloads the same kind of program (playout or not), checks it, and replaces the one you are running. Then **Restart StreamIt** starts the new version. Installing and restarting are only allowed between services (stage Idle or Ended, nothing running). **Check now** asks GitHub again.
+
+**Making a release** (developers): every push to `main` runs the Build and release workflow. It checks formatting, clippy and the tests first; only if they pass, and only when the `version` in the root `Cargo.toml` has not been released yet, does it build both programs and publish them as release `v<version>`, usually within 10–15 minutes (the first build takes longer). So to release, raise the version and push to main; a push that keeps the version only runs the checks. The compiled crates are cached between runs.
+
 ## Run StreamIt
 
 ```

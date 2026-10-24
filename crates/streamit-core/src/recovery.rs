@@ -58,10 +58,8 @@ pub async fn assess(d: &Devices, c: &Config, bid: Option<&str>, player_active: b
         }
     }
 
-    let recover_needed = on_decklink
-        || screens_prog == Some(c.screens_atem.decklink_input)
-        || route_on_decklink
-        || mic_muted;
+    let recover_needed =
+        on_decklink || screens_prog == Some(c.screens_atem.decklink_input) || route_on_decklink || mic_muted;
 
     let life_cycle = match bid {
         Some(id) => tokio::time::timeout(LIFE_CYCLE_TIMEOUT, d.yt.life_cycle(id)).await.ok().and_then(|r| r.ok()),
@@ -165,7 +163,9 @@ pub async fn recover(d: &Devices, c: &Config, levels: &LiveLevels) -> Result<()>
         match d.stream.program().await {
             Ok(p) if p != sa.decklink_input => {
                 if hub.fallback_normal_input == 0 {
-                    failures.push("No normal input is configured for input 8, so its VideoHub route was not restored".into());
+                    failures.push(
+                        "No normal input is configured for input 8, so its VideoHub route was not restored".into(),
+                    );
                 } else if let Err(e) = d.hub.route(hub.input8_output, hub.fallback_normal_input).await {
                     fail("Could not restore the VideoHub route for input 8", e);
                 }

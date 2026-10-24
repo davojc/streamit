@@ -126,11 +126,8 @@ mod tests {
         assert_eq!(calls[yt + 1..], [Call::EncoderStop]);
 
         let seen = seen.lock().unwrap();
-        let want: Vec<Stage> = (1..=10)
-            .rev()
-            .map(|s| Stage::Ending { remaining: Duration::from_secs(s) })
-            .chain([Stage::Ended])
-            .collect();
+        let want: Vec<Stage> =
+            (1..=10).rev().map(|s| Stage::Ending { remaining: Duration::from_secs(s) }).chain([Stage::Ended]).collect();
         assert_eq!(*seen, want);
     }
 

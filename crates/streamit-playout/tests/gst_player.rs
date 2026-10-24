@@ -30,24 +30,15 @@ fn have(factory: &str) -> bool {
 /// Runs an encoding pipeline (with a `filesink name=out`) to EOS, writing `name` in temp.
 fn encode(desc: &str, name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(name);
-    let pipeline = gst::parse::launch(desc)
-        .unwrap()
-        .downcast::<gst::Pipeline>()
-        .unwrap();
+    let pipeline = gst::parse::launch(desc).unwrap().downcast::<gst::Pipeline>().unwrap();
     let out = pipeline.by_name("out").unwrap();
     out.set_property("location", path.to_str().unwrap());
     pipeline.set_state(gst::State::Playing).unwrap();
     let bus = pipeline.bus().unwrap();
     let msg = bus
-        .timed_pop_filtered(
-            gst::ClockTime::from_seconds(30),
-            &[gst::MessageType::Eos, gst::MessageType::Error],
-        )
+        .timed_pop_filtered(gst::ClockTime::from_seconds(30), &[gst::MessageType::Eos, gst::MessageType::Error])
         .expect("clip encoding finished");
-    assert!(
-        matches!(msg.view(), gst::MessageView::Eos(_)),
-        "encoding failed: {msg:?}"
-    );
+    assert!(matches!(msg.view(), gst::MessageView::Eos(_)), "encoding failed: {msg:?}");
     pipeline.set_state(gst::State::Null).unwrap();
     path
 }
@@ -98,10 +89,7 @@ async fn plays_to_end(clip: &Path) {
     let player = GstPlayer::new(&PlayoutConfig::default(), SinkKind::Fake).unwrap();
 
     let duration = player.load(clip, -6.0).await.unwrap();
-    assert!(
-        duration > Duration::from_millis(1900) && duration < Duration::from_millis(2100),
-        "{duration:?}"
-    );
+    assert!(duration > Duration::from_millis(1900) && duration < Duration::from_millis(2100), "{duration:?}");
 
     let mut events = player.events();
     player.play().await.unwrap();
@@ -151,10 +139,7 @@ async fn missing_file_errors_on_load() {
     let player = GstPlayer::new(&PlayoutConfig::default(), SinkKind::Fake).unwrap();
     let missing = Path::new("definitely-not-here-streamit.mp4");
     assert!(player.load(missing, 0.0).await.is_err());
-    assert!(
-        player.play().await.is_err(),
-        "nothing is loaded after a failed load"
-    );
+    assert!(player.play().await.is_err(), "nothing is loaded after a failed load");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -167,19 +152,12 @@ async fn empty_or_corrupt_file_errors_on_load() {
     let empty = dir.join("streamit-playout-empty.mp4");
     let corrupt = dir.join("streamit-playout-corrupt.mp4");
     std::fs::write(&empty, b"").unwrap();
-    std::fs::write(
-        &corrupt,
-        b"this is not a video file, just some text".repeat(100),
-    )
-    .unwrap();
+    std::fs::write(&corrupt, b"this is not a video file, just some text".repeat(100)).unwrap();
     for file in [&empty, &corrupt] {
         let result = tokio::time::timeout(Duration::from_secs(30), player.load(file, 0.0)).await;
         let result = result.expect("load gives up rather than hanging");
         assert!(result.is_err(), "{} should not load", file.display());
-        assert!(
-            player.play().await.is_err(),
-            "nothing is loaded after a failed load"
-        );
+        assert!(player.play().await.is_err(), "nothing is loaded after a failed load");
     }
     let _ = std::fs::remove_file(empty);
     let _ = std::fs::remove_file(corrupt);

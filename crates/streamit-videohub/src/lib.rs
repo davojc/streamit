@@ -72,16 +72,9 @@ impl Router for VideoHub {
 
     async fn route(&self, output: u16, input: u16) -> Result<()> {
         if output == 0 || input == 0 {
-            return Err(DeviceError::Other(
-                "outputs and inputs are numbered from 1".into(),
-            ));
+            return Err(DeviceError::Other("outputs and inputs are numbered from 1".into()));
         }
-        self.link
-            .command(
-                format_route(output, input),
-                &format!("route {output} <- {input}"),
-            )
-            .await
+        self.link.command(format_route(output, input), &format!("route {output} <- {input}")).await
     }
 }
 
