@@ -18,10 +18,10 @@ use streamit_core::devices::{
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
 use streamit_core::golive::Stage;
 use tokio::sync::{broadcast, mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use crate::logged::Logged;
 use std::collections::BTreeSet;
-use tracing::{info, warn};
+use tracing::{Instrument, info, warn};
 
 /// How often every device is polled.
 pub const POLL_EVERY: Duration = Duration::from_secs(2);
@@ -304,9 +304,10 @@ impl Counter for Late<dyn Counter> {
 }
 
 /// Builds the device off the async threads (GStreamer init and the NDI sink block), and
-/// keeps retrying every `PLAYOUT_RETRY` while it fails. Returns after the first attempt.
+/// keeps retrying every `PLAYOUT_RETRY` while it fails. Returns after the first attempt,
+/// with the retry task if one is needed (the session stops it when it ends).
 #[cfg_attr(not(feature = "gst"), allow(dead_code))]
-async fn keep_building<T, F>(slot: Arc<Late<T>>, what: &'static str, build: F)
+async fn keep_building<T, F>(slot: Arc<Late<T>>, what: &'static str, build: F) -> Option<AbortHandle>
 where
     T: ?Sized + Send + Sync + 'static,
     F: Fn() -> devices::Result<Arc<T>> + Send + Sync + 'static,
@@ -338,16 +339,20 @@ where
         }
     };
     if attempt().await {
-        return;
+        return None;
     }
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(PLAYOUT_RETRY).await;
-            if attempt().await {
-                return;
+    let retry = tokio::spawn(
+        async move {
+            loop {
+                tokio::time::sleep(PLAYOUT_RETRY).await;
+                if attempt().await {
+                    return;
+                }
             }
         }
-    });
+        .in_current_span(),
+    );
+    Some(retry.abort_handle())
 }
 
 // ---- building ----
@@ -376,6 +381,22 @@ pub struct Wired {
     /// The first poll, so the window and deck show health straight away.
     pub health: Vec<(DeviceKind, DeviceHealth)>,
     pub probes: Probes,
+    /// Background tasks besides the clients' own (the playout build retries). The
+    /// network clients stop their reconnect loops when their last handle is dropped.
+    pub tasks: Vec<AbortHandle>,
+}
+
+/// Wraps every device so its action calls are logged; reads are not (see logged.rs).
+pub fn logged(d: Devices) -> Devices {
+    Devices {
+        stream: Logged::wrap("Stream ATEM", d.stream),
+        screens: Logged::wrap("Screens ATEM", d.screens),
+        hub: Logged::wrap("VideoHub", d.hub),
+        encoder: Logged::wrap("Web Presenter", d.encoder),
+        yt: Logged::wrap("YouTube", d.yt),
+        player: Logged::wrap("DeckLink", d.player),
+        counter: Logged::wrap("NDI", d.counter),
+    }
 }
 
 /// Builds every device from `c`. Never fails: a device that cannot be built is a Down
@@ -418,17 +439,16 @@ pub async fn build(c: &Config) -> Wired {
         Ok(y) => y,
         Err(why) => stand_in(DeviceKind::YouTube, "YouTube", why),
     };
-    let (player, counter) = playout(c).await;
-    // Every action call is logged; reads are not (see logged.rs).
-    let devices = Devices {
-        stream: Logged::wrap("Stream ATEM", stream),
-        screens: Logged::wrap("Screens ATEM", screens),
-        hub: Logged::wrap("VideoHub", hub),
-        encoder: Logged::wrap("Web Presenter", encoder),
-        yt: Logged::wrap("YouTube", yt),
-        player: Logged::wrap("DeckLink", player.clone() as Arc<dyn Player>),
-        counter: Logged::wrap("NDI", counter.clone() as Arc<dyn Counter>),
-    };
+    let (player, counter, tasks) = playout(c).await;
+    let devices = logged(Devices {
+        stream,
+        screens,
+        hub,
+        encoder,
+        yt,
+        player: player.clone() as Arc<dyn Player>,
+        counter: counter.clone() as Arc<dyn Counter>,
+    });
     let probes = Probes { devices: devices.clone(), player, counter };
     // Stand-ins never come up, so only wait for the devices that were really built.
     let real: Vec<DeviceKind> = NETWORK.iter().copied().filter(|k| !stand_ins.contains(k)).collect();
@@ -437,7 +457,7 @@ pub async fn build(c: &Config) -> Wired {
     for (k, h) in &health {
         log_health(*k, h);
     }
-    Wired { devices, health, probes }
+    Wired { devices, health, probes, tasks }
 }
 
 fn absent(what: &str, why: String) -> Arc<Absent> {
@@ -456,7 +476,7 @@ fn youtube(c: &Config) -> Result<Arc<dyn Broadcasts>, String> {
 }
 
 #[cfg(feature = "gst")]
-async fn playout(c: &Config) -> (Arc<Late<dyn Player>>, Arc<Late<dyn Counter>>) {
+async fn playout(c: &Config) -> (Arc<Late<dyn Player>>, Arc<Late<dyn Counter>>, Vec<AbortHandle>) {
     let player: Arc<Late<dyn Player>> = Late::new("DeckLink player starting");
     let counter: Arc<Late<dyn Counter>> = Late::new("NDI counter starting");
     let pc = c.playout.clone();
@@ -468,14 +488,14 @@ async fn playout(c: &Config) -> (Arc<Late<dyn Player>>, Arc<Late<dyn Counter>>) 
     let n = keep_building(counter.clone(), "NDI counter", move || {
         streamit_playout::NdiCounter::new(&nc).map(|n| n as Arc<dyn Counter>)
     });
-    tokio::join!(p, n);
-    (player, counter)
+    let (p, n) = tokio::join!(p, n);
+    (player, counter, p.into_iter().chain(n).collect())
 }
 
 #[cfg(not(feature = "gst"))]
-async fn playout(_c: &Config) -> (Arc<Late<dyn Player>>, Arc<Late<dyn Counter>>) {
+async fn playout(_c: &Config) -> (Arc<Late<dyn Player>>, Arc<Late<dyn Counter>>, Vec<AbortHandle>) {
     warn!("DeckLink player and NDI counter: {NO_GST}");
-    (Late::new(NO_GST), Late::new(NO_GST))
+    (Late::new(NO_GST), Late::new(NO_GST), Vec::new())
 }
 
 // ---- health ----
@@ -488,6 +508,15 @@ async fn probe<T>(f: impl Future<Output = devices::Result<T>>) -> DeviceHealth {
 }
 
 impl Probes {
+    /// Probes for devices that are all there from the start (the pretend ones): the
+    /// player and counter are installed at once.
+    pub fn ready(devices: Devices) -> Probes {
+        let (player, counter) = (Late::new(""), Late::new(""));
+        player.install(devices.player.clone());
+        counter.install(devices.counter.clone());
+        Probes { devices, player, counter }
+    }
+
     #[cfg(test)]
     fn new(devices: Devices, player: Arc<Late<dyn Player>>, counter: Arc<Late<dyn Counter>>) -> Probes {
         Probes { devices, player, counter }
@@ -584,6 +613,7 @@ pub fn spawn_health_poll(
     tracker.changes(seed);
     let mut ever_ok: BTreeSet<DeviceKind> =
         seed.iter().filter(|(_, h)| *h == DeviceHealth::Ok).map(|(k, _)| *k).collect();
+    // Runs in the caller's span, so a simulation's polls log to the simulation log.
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(POLL_EVERY).await;
@@ -615,7 +645,7 @@ pub fn spawn_health_poll(
                 }
             }
         }
-    })
+    }.in_current_span())
 }
 
 #[cfg(test)]

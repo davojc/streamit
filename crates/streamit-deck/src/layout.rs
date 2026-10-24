@@ -217,7 +217,15 @@ pub fn appearance(key: u8, snap: &Snapshot, blink_phase: bool) -> KeyLook {
                 None => dim(label),
             }
         }
-        PHASE_KEY => phase_look(&snap.stage),
+        PHASE_KEY => {
+            let mut l = phase_look(&snap.stage);
+            if snap.simulation {
+                // Simulation is always visible: SIM under the stage, colours unchanged.
+                l.text.push_str("
+SIM");
+            }
+            l
+        }
         PREPARE => look("PREPARE", SLATE, WHITE),
         COUNTDOWN => look("COUNT\nDOWN", SLATE, WHITE),
         STOP_COUNTDOWN => look("STOP\nCOUNT", SLATE, WHITE),
@@ -421,6 +429,17 @@ mod tests {
         assert_eq!(appearance(7, &s, true).text, "END 7");
         s.stage = Stage::Ended;
         assert_eq!(appearance(7, &s, true).text, "ENDED");
+    }
+
+    #[test]
+    fn deck_phase_key_shows_sim() {
+        let mut s = Snapshot { simulation: true, ..Snapshot::default() };
+        assert_eq!(appearance(7, &s, true).text, "IDLE\nSIM");
+        s.stage = Stage::Countdown { remaining: Duration::from_secs(42), public: false };
+        let l = appearance(7, &s, true);
+        assert_eq!((l.text.as_str(), l.bg), ("T-0:42\nSIM", AMBER), "the stage colours stay");
+        s.simulation = false;
+        assert_eq!(appearance(7, &s, true).text, "T-0:42", "real mode shows no SIM");
     }
 
     #[test]

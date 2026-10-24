@@ -31,7 +31,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{Instrument, info, warn};
 
 /// How long an ignored cue key flashes.
 pub const FLASH_FOR: Duration = Duration::from_secs(1);
@@ -319,7 +319,7 @@ impl Engine {
             key_flash_gen: 0,
             aux,
         };
-        tokio::spawn(engine.run(rx, aux_rx));
+        tokio::spawn(engine.run(rx, aux_rx).in_current_span());
         EngineHandle { tx, rx: srx }
     }
 
@@ -553,7 +553,7 @@ impl Engine {
                 tokio::spawn(async move {
                     let r = refresh(d, c, sel, player_active, epoch, sel_gen).await;
                     let _ = aux.send(Aux::Refreshed(Box::new(r)));
-                });
+                }.in_current_span());
             }
             Command::DeviceHealth(kind, health) => {
                 let (kind, health) = (*kind, health.clone());
@@ -585,7 +585,7 @@ impl Engine {
         tokio::spawn(async move {
             tokio::time::sleep(FLASH_FOR).await;
             let _ = aux.send(Aux::ClearFlash(generation));
-        });
+        }.in_current_span());
     }
 
     fn flash_key(&mut self, key: FlashKey) {
@@ -596,7 +596,7 @@ impl Engine {
         tokio::spawn(async move {
             tokio::time::sleep(FLASH_FOR).await;
             let _ = aux.send(Aux::ClearKeyFlash(generation));
-        });
+        }.in_current_span());
     }
 
     // ---- jobs ----
@@ -619,7 +619,7 @@ impl Engine {
             .await;
             store_levels(&levels, l, file.as_deref());
             Done::Prepared(r)
-        });
+        }.in_current_span());
         self.begin(Job::Prepare, handle);
     }
 
@@ -661,7 +661,7 @@ impl Engine {
             )
             .await;
             Done::Countdown { result, public: public.load(Ordering::SeqCst), before }
-        });
+        }.in_current_span());
         self.begin(Job::Countdown { cancel }, handle);
     }
 
@@ -671,7 +671,7 @@ impl Engine {
         let handle = tokio::spawn(async move {
             let out = end_service(&d, &c, &bid, s2, move |st| snap.send_modify(|s| set_stage(s, st))).await;
             Done::Ended(out)
-        });
+        }.in_current_span());
         self.begin(Job::End { skip }, handle);
     }
 
@@ -704,7 +704,7 @@ impl Engine {
             let outcome = rollin::play_reporting(&d, &c, &cue, &mut l, st, um, report).await;
             store_levels(&levels, l, file.as_deref());
             Done::Video { index, outcome }
-        });
+        }.in_current_span());
         self.begin(Job::Video { index, stop, unmute }, handle);
     }
 
@@ -746,7 +746,7 @@ impl Engine {
             )
             .await;
             Done::WentLive { result: out.t0, public: out.public, start }
-        });
+        }.in_current_span());
         self.begin(Job::GoLive(start), handle);
     }
 
@@ -774,7 +774,7 @@ impl Engine {
             // Recover never runs alongside a video, so no player is active.
             let assessment = recovery::assess(&d, &c, bid.as_deref(), false).await;
             Done::Recovered { ok, assessment }
-        });
+        }.in_current_span());
         self.begin(Job::Recover, handle);
     }
 
@@ -998,7 +998,7 @@ impl Engine {
                 }),
                 Err(e) => set_warning(&snap, format!("Could not make the YouTube broadcast public: {e}")),
             }
-        });
+        }.in_current_span());
     }
 
     fn spawn_end_broadcast(&self) {
@@ -1011,7 +1011,7 @@ impl Engine {
                 }),
                 Err(e) => set_warning(&snap, format!("Could not end the YouTube broadcast: {e}")),
             }
-        });
+        }.in_current_span());
     }
 
     /// Optionally apply `fix` to broadcast `id`, then re-check it.
@@ -1025,7 +1025,7 @@ impl Engine {
             }
             let check = d.yt.check(&id).await.map_err(|e| e.to_string());
             let _ = aux.send(Aux::Checked { sel_gen, check });
-        });
+        }.in_current_span());
     }
 
     // ---- side-task results ----

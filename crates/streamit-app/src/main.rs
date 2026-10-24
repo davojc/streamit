@@ -8,15 +8,17 @@
 //! logging). The window logs to files only. Probes attach to the terminal they were
 //! started from, or open a console of their own.
 //!
-//! Startup never changes a device: it builds the devices (which only connect and listen),
-//! spawns the engine (which runs its read-only Stage 0 / assessment), starts the deck and
-//! opens the window. The egui loop runs on the main thread; tokio runs on worker threads.
+//! Startup never changes a device: it opens the real session (which builds the devices,
+//! which only connect and listen, and spawns the engine, which runs its read-only Stage 0
+//! / assessment), starts the deck and opens the window. The deck and the window hold the
+//! session's `Front`, so a switch to simulation and back keeps them working. The egui loop runs on the main thread; tokio runs on worker threads.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod discovery;
 mod logged;
 mod logging;
 mod probe;
+mod session;
 mod ui;
 mod wiring;
 
@@ -25,12 +27,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use streamit_core::audio::LiveLevels;
-use streamit_core::config::{Config, config_path, levels_path};
-use streamit_core::engine::{Command, Engine, EngineHandle, Snapshot};
-use streamit_core::golive::Stage;
+use session::{Paths, RealFactory, Sessions, SimFactory};
+use streamit_core::config::{Config, config_path};
+use streamit_core::engine::EngineHandle;
 use streamit_deck::DeckSurface;
-use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 /// Probes and the usage text write to a terminal; the window does not.
@@ -83,30 +83,23 @@ fn run_app() -> anyhow::Result<()> {
     let Loaded { config, notice: load_error, writable } = load_config(&path);
     info!(path = %path.display(), writable, "config loaded");
     let shared = Arc::new(RwLock::new(config.clone()));
-    // The mics' live levels from the last run, so Go Live and Recover after a restart
-    // fade up to them rather than to 0 dB.
-    let levels_file = levels_path(&path);
-    let levels = LiveLevels::load(&levels_file).unwrap_or_else(|e| {
-        warn!("{e:#}; starting without saved mic levels");
-        LiveLevels::default()
-    });
-    info!(path = %levels_file.display(), mics = levels.0.len(), "mic levels loaded");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("streamit-rt")
         .build()?;
-    let started = rt.block_on(async {
-        let wired = wiring::build(&config).await;
-        let engine = Engine::spawn_with(wired.devices.clone(), shared.clone(), levels, Some(levels_file), false);
-        let tx = spawn_command_log(engine.tx.clone());
-        for (kind, health) in &wired.health {
-            let _ = tx.send(Command::DeviceHealth(*kind, health.clone())).await;
-        }
-        wiring::spawn_health_poll(wired.probes, shared.clone(), tx.clone(), engine.rx.clone(), &wired.health);
-        spawn_snapshot_log(engine.rx.clone());
-        DeckSurface::run(EngineHandle { tx: tx.clone(), rx: engine.rx.clone() });
-        ui::Started { tx, snap: engine.rx, yt: wired.devices.yt.clone() }
+    // Always real mode first: the normal read-only startup.
+    let (sessions, front) = rt.block_on(async {
+        let (sessions, front) = Sessions::start(
+            Arc::new(RealFactory),
+            Arc::new(SimFactory),
+            shared.clone(),
+            Paths::beside(&path),
+        )
+        .await;
+        // The deck holds the front, so it keeps working across a mode switch.
+        DeckSurface::run(EngineHandle { tx: front.tx.clone(), rx: front.rx.clone() });
+        (sessions, front)
     });
 
     let options = eframe::NativeOptions {
@@ -121,10 +114,11 @@ fn run_app() -> anyhow::Result<()> {
         options,
         Box::new(move |cc| {
             let file = ui::ConfigFile { path, writable };
-            Ok(Box::new(ui::StreamItApp::new(&cc.egui_ctx, handle, started, shared, file, config, load_error)))
+            Ok(Box::new(ui::StreamItApp::new(&cc.egui_ctx, handle, front, shared, file, config, load_error)))
         }),
     );
     info!("window closed; StreamIt stopping");
+    drop(sessions);
     rt.shutdown_timeout(Duration::from_secs(2));
     result.map_err(|e| anyhow!("the window failed: {e}"))
 }
@@ -182,64 +176,6 @@ fn backup_bad(path: &Path) -> std::io::Result<Option<PathBuf>> {
         .ok_or_else(|| std::io::Error::other("too many .bad copies"))?;
     std::fs::copy(path, &bad)?;
     Ok(Some(bad))
-}
-
-/// Every command from the window, the deck and the health poll passes through here and
-/// is logged before it reaches the engine.
-fn spawn_command_log(engine: mpsc::Sender<Command>) -> mpsc::Sender<Command> {
-    let (tx, mut rx) = mpsc::channel::<Command>(64);
-    tokio::spawn(async move {
-        while let Some(cmd) = rx.recv().await {
-            match &cmd {
-                // Health changes are logged by the poll with their reason.
-                Command::DeviceHealth(..) => {}
-                Command::SetCues(cues) => {
-                    let names: Vec<&str> = cues.iter().map(|c| c.name.as_str()).collect();
-                    info!(cues = ?names, "command SetCues");
-                }
-                other => info!(command = ?other, "command"),
-            }
-            if engine.send(cmd).await.is_err() {
-                warn!("the engine has stopped; dropping commands");
-                return;
-            }
-        }
-    });
-    tx
-}
-
-/// The stage without its ticking clock, so the log has one line per real change.
-fn stage_label(s: &Stage) -> String {
-    match s {
-        Stage::Countdown { public, .. } => format!("Countdown (public: {public})"),
-        Stage::Ending { .. } => "Ending".into(),
-        other => format!("{other:?}"),
-    }
-}
-
-/// Logs stage changes, offers and every new engine warning.
-fn spawn_snapshot_log(mut rx: watch::Receiver<Snapshot>) {
-    tokio::spawn(async move {
-        let mut last = rx.borrow().clone();
-        while rx.changed().await.is_ok() {
-            let s = rx.borrow_and_update().clone();
-            if stage_label(&s.stage) != stage_label(&last.stage) {
-                info!(stage = %stage_label(&s.stage), "stage");
-            }
-            if s.last_warning != last.last_warning
-                && let Some(w) = &s.last_warning
-            {
-                warn!(warning = %w, "engine warning");
-            }
-            if s.offers != last.offers {
-                info!(offers = ?s.offers, "offers");
-            }
-            if s.playing != last.playing {
-                info!(playing = ?s.playing, "video");
-            }
-            last = s;
-        }
-    });
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ use std::time::Duration;
 use streamit_core::devices::*;
 use streamit_core::engine::DeviceKind;
 use tokio::time::Instant;
+use tracing::Instrument;
 
 /// Connecting becomes Streaming after this long at 1x.
 const CONNECT: Duration = Duration::from_secs(3);
@@ -96,7 +97,7 @@ impl SimPlayer {
                 };
                 tokio::time::sleep(wait).await;
             }
-        });
+        }.in_current_span());
     }
 }
 

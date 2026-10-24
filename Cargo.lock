@@ -4264,6 +4264,7 @@ dependencies = [
  "streamit-core",
  "streamit-deck",
  "streamit-playout",
+ "streamit-sim",
  "streamit-videohub",
  "streamit-webpresenter",
  "streamit-youtube",

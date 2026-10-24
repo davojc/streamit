@@ -1,6 +1,7 @@
 //! The window: a Run tab (what the operator uses during a service) and a Settings tab.
 //! Plain egui; every press becomes the same `Command` the Stream Deck would send.
 use crate::discovery::{self, BmdKind, DiscoveredDevice};
+use crate::session::Front;
 use eframe::egui::{self, Color32, RichText, Ui, vec2};
 use std::future::Future;
 use std::net::IpAddr;
@@ -24,12 +25,6 @@ const CUE_DEBOUNCE: Duration = Duration::from_millis(400);
 const CUE_SETTLE: Duration = Duration::from_secs(1);
 const SCAN_FOR: Duration = Duration::from_secs(4);
 const RESTART_NOTE: &str = "Restart StreamIt to apply device changes";
-
-pub struct Started {
-    pub tx: mpsc::Sender<Command>,
-    pub snap: watch::Receiver<Snapshot>,
-    pub yt: Arc<dyn Broadcasts>,
-}
 
 /// A background job whose result the UI picks up on a later frame.
 struct Pending<T> {
@@ -139,7 +134,8 @@ pub struct StreamItApp {
     rt: Handle,
     tx: mpsc::Sender<Command>,
     snap: watch::Receiver<Snapshot>,
-    yt: Arc<dyn Broadcasts>,
+    /// The current session's YouTube (real or pretend).
+    yt: watch::Receiver<Arc<dyn Broadcasts>>,
     config: Arc<RwLock<Config>>,
     file: ConfigFile,
     ctx: egui::Context,
@@ -181,7 +177,7 @@ impl StreamItApp {
     pub fn new(
         ctx: &egui::Context,
         rt: Handle,
-        s: Started,
+        s: Front,
         config: Arc<RwLock<Config>>,
         file: ConfigFile,
         startup: Config,
@@ -191,7 +187,7 @@ impl StreamItApp {
         let mut app = StreamItApp {
             rt,
             tx: s.tx,
-            snap: s.snap,
+            snap: s.rx,
             yt: s.yt,
             config,
             file,
@@ -234,7 +230,7 @@ impl StreamItApp {
     }
 
     fn load_broadcasts(&mut self) {
-        let yt = self.yt.clone();
+        let yt = self.yt.borrow().clone();
         self.broadcasts_job
             .start(&self.rt, &self.ctx, async move { yt.upcoming().await.map_err(|e| e.to_string()) });
     }

@@ -13,6 +13,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 /// How often `prepare` polls YouTube stream health.
 pub const HEALTH_POLL: Duration = Duration::from_secs(2);
@@ -253,7 +254,7 @@ fn spawn_go_public(d: &Devices, bid: &str) -> GoPublicTask {
     tokio::spawn(async move {
         let start = Instant::now();
         go_public(&d, &bid).await.map(|()| start.elapsed())
-    })
+    }.in_current_span())
 }
 
 /// The activity line for a go-public that worked after `took`.

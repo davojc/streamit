@@ -19,6 +19,7 @@ streamit-webpresenter = { path = "../streamit-webpresenter" }
 streamit-youtube = { path = "../streamit-youtube" }
 streamit-playout = { path = "../streamit-playout" }
 streamit-deck = { path = "../streamit-deck" }
+streamit-sim = { path = "../streamit-sim" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
