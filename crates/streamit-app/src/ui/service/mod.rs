@@ -46,7 +46,7 @@ impl StreamItApp {
     }
 
     /// The main column and the side column; stacked when the window is narrow.
-    fn columns(
+    pub(super) fn columns(
         &mut self,
         ui: &mut Ui,
         aside_w: f32,

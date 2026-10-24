@@ -1,8 +1,9 @@
 //! The window: the header (stage badge, broadcast, equipment, tabs), the simulation
 //! banner, and the tabs: Service (`service.rs`), Videos, Settings and, in simulation
 //! only, Simulation. Every press becomes the same `Command` the Stream Deck would send.
-//! The Videos and Settings tabs are v1's, restyled later.
+//! The Settings tab is v1's, restyled later.
 mod service;
+mod videos;
 
 use crate::discovery::{self, BmdKind, DiscoveredDevice};
 use crate::session::{Front, Mode};
@@ -18,7 +19,7 @@ use streamit_core::config::{AudioSourceId, Config};
 use streamit_core::devices::{BroadcastSummary, Broadcasts};
 use streamit_core::engine::{Command, Snapshot};
 use streamit_core::golive::Stage;
-use streamit_core::rollin::{Cue, CueState, Destination, MAX_CUES};
+use streamit_core::rollin::{Cue, Destination, MAX_CUES};
 use streamit_youtube::{API_BASE, Auth, StreamSummary, YouTubeClient};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, watch};
@@ -200,6 +201,11 @@ pub struct StreamItApp {
     /// File dialogs run on the runtime (they would block the window); results land here.
     add_files_job: Pending<Vec<PathBuf>>,
     countdown_job: Pending<Option<PathBuf>>,
+    /// The Videos tab's "Change…" for the countdown video: saved as soon as it is picked.
+    countdown_pick_job: Pending<Option<PathBuf>>,
+    /// The video selected on the Videos tab.
+    selected: usize,
+    lengths: videos::Lengths,
 }
 
 impl StreamItApp {
@@ -250,6 +256,9 @@ impl StreamItApp {
             streams_status: String::new(),
             add_files_job: Pending::default(),
             countdown_job: Pending::default(),
+            countdown_pick_job: Pending::default(),
+            selected: 0,
+            lengths: videos::Lengths::default(),
         };
         app.load_broadcasts();
         app.scan();
@@ -341,6 +350,9 @@ impl StreamItApp {
         if let Some(f) = self.countdown_job.take().flatten() {
             self.draft.playout.countdown_file = f;
         }
+        if let Some(f) = self.countdown_pick_job.take().flatten() {
+            self.save_countdown(f);
+        }
     }
 
     /// Adds the files the dialog returned, unless a video started meanwhile.
@@ -406,6 +418,25 @@ impl StreamItApp {
         if let Err(e) = c.save(&self.file.path) {
             warn!("saving the cue list: {e:#}");
             self.notice = Some(format!("Could not save the cue list: {e:#}"));
+        }
+    }
+
+    /// Writes the countdown video choice to the shared settings and the file, leaving the
+    /// Settings tab's unsaved edits alone.
+    fn save_countdown(&mut self, file: PathBuf) {
+        let c = {
+            let mut shared = self.config.write().unwrap_or_else(|e| e.into_inner());
+            shared.playout.countdown_file = file.clone();
+            shared.clone()
+        };
+        self.draft.playout.countdown_file = file;
+        if !self.file.writable {
+            self.notice = Some("Not saved: the settings file could not be backed up (see the log).".into());
+            return;
+        }
+        if let Err(e) = c.save(&self.file.path) {
+            warn!("saving the countdown video: {e:#}");
+            self.notice = Some(format!("Could not save the countdown video: {e:#}"));
         }
     }
 
@@ -549,7 +580,7 @@ impl eframe::App for StreamItApp {
                 let viewport = ui.available_height();
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
                     Tab::Service => self.service_tab(ui, &snap, &config, viewport),
-                    Tab::Videos => theme::panel().show(ui, |ui| self.cue_editor(ui, &snap)).inner,
+                    Tab::Videos => self.videos_tab(ui, &snap, &config),
                     Tab::Settings => theme::panel().show(ui, |ui| self.settings_tab(ui)).inner,
                     Tab::Simulation => simulation_tab(ui),
                 });
@@ -622,123 +653,7 @@ fn simulation_tab(ui: &mut Ui) {
     });
 }
 
-// ---------------------------------------------------------------- Videos tab (v1, restyled later)
-
-fn dest_name(d: Destination) -> &'static str {
-    match d {
-        Destination::HallAndOnline => "Hall and online",
-        Destination::HallOnly => "Hall only",
-        Destination::OnlineOnly => "Online only",
-        Destination::AudioOnly => "Audio only (online)",
-    }
-}
-
-const DESTINATIONS: [Destination; 4] =
-    [Destination::HallAndOnline, Destination::HallOnly, Destination::OnlineOnly, Destination::AudioOnly];
-
-impl StreamItApp {
-    fn cue_editor(&mut self, ui: &mut Ui, snap: &Snapshot) {
-        ui.heading(format!("Cue list ({}/{MAX_CUES})", self.cues.len()));
-        let locked = snap.playing.is_some();
-        if locked {
-            ui.label(
-                RichText::new("The cue list is locked while a video plays.").color(Color32::from_rgb(220, 150, 0)),
-            );
-        }
-        let mut changed = false;
-        ui.add_enabled_ui(!locked, |ui| {
-            let can_add = self.cues.len() < MAX_CUES && !self.add_files_job.running;
-            if ui.add_enabled(can_add, egui::Button::new("Add videos...")).clicked() {
-                self.add_files_job.start(&self.rt, &self.ctx, async {
-                    rfd::AsyncFileDialog::new()
-                        .add_filter("Video", &["mp4", "mov", "m4v", "mkv", "mxf", "avi", "ts"])
-                        .add_filter("All files", &["*"])
-                        .pick_files()
-                        .await
-                        .map(|v| v.iter().map(|f| f.path().to_path_buf()).collect())
-                        .unwrap_or_default()
-                });
-            }
-            let mut action: Option<(usize, i8)> = None; // -1 up, 1 down, 0 remove
-            egui::Grid::new("cues").striped(true).show(ui, |ui| {
-                ui.label("#");
-                ui.label("Name");
-                ui.label("Destination");
-                ui.label("Level");
-                ui.label("Return to input");
-                ui.label("State");
-                ui.label("");
-                ui.end_row();
-                let n = self.cues.len();
-                for (i, cue) in self.cues.iter_mut().enumerate() {
-                    ui.label(format!("{}", i + 1));
-                    changed |= ui
-                        .add(egui::TextEdit::singleline(&mut cue.name).desired_width(200.0))
-                        .on_hover_text(cue.path.display().to_string())
-                        .changed();
-                    egui::ComboBox::from_id_salt(("dest", i)).selected_text(dest_name(cue.destination)).show_ui(
-                        ui,
-                        |ui| {
-                            for d in DESTINATIONS {
-                                changed |= ui.selectable_value(&mut cue.destination, d, dest_name(d)).changed();
-                            }
-                        },
-                    );
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut cue.gain_db).range(-60.0..=12.0).speed(0.1).suffix(" dB"))
-                        .changed();
-                    ui.horizontal(|ui| {
-                        let mut on = cue.return_input.is_some();
-                        if ui.checkbox(&mut on, "").changed() {
-                            cue.return_input = on.then_some(1);
-                            changed = true;
-                        }
-                        match &mut cue.return_input {
-                            Some(input) => {
-                                changed |= ui.add(egui::DragValue::new(input).range(1..=40)).changed();
-                            }
-                            None => {
-                                ui.label("Preview");
-                            }
-                        }
-                    });
-                    let state = snap.cues.get(i).filter(|(c, _)| c == cue).map(|(_, s)| s.clone());
-                    ui.label(match state {
-                        Some(CueState::Cued) => "cued".to_string(),
-                        Some(CueState::Playing) => "PLAYING".to_string(),
-                        Some(CueState::Played) => "played".to_string(),
-                        Some(CueState::Error(e)) => format!("error: {e}"),
-                        None => "...".to_string(),
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(i > 0, egui::Button::new("Up")).clicked() {
-                            action = Some((i, -1));
-                        }
-                        if ui.add_enabled(i + 1 < n, egui::Button::new("Down")).clicked() {
-                            action = Some((i, 1));
-                        }
-                        if ui.button("Remove").clicked() {
-                            action = Some((i, 0));
-                        }
-                    });
-                    ui.end_row();
-                }
-            });
-            match action {
-                Some((i, -1)) => self.cues.swap(i - 1, i),
-                Some((i, 1)) => self.cues.swap(i, i + 1),
-                Some((i, _)) => {
-                    self.cues.remove(i);
-                }
-                None => {}
-            }
-            changed |= action.is_some();
-        });
-        if changed {
-            self.cues_dirty_at = Some(Instant::now());
-        }
-    }
-}
+// ---------------------------------------------------------------- Videos tab (videos.rs)
 
 fn new_cue(path: &Path) -> Cue {
     Cue {

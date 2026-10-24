@@ -1,11 +1,13 @@
 //! What the screens show, worked out from the snapshot and the settings. No egui here:
 //! the drawing lives in `ui/`, so these choices can be tested.
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use streamit_core::config::Config;
 use streamit_core::engine::{DeviceHealth, DeviceKind, FlashKey, Snapshot};
 use streamit_core::golive::{Readiness, Stage};
 use streamit_core::recovery::Offer;
-use streamit_core::rollin::{CueState, Destination};
+use streamit_core::rollin::{Cue, CueState, Destination};
 
 /// The colour family of a badge, a dot or a step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +265,70 @@ pub fn fmt_db(db: f32) -> String {
     }
 }
 
+/// What a length shows until the file has been read.
+pub const LENGTH_UNKNOWN: &str = "–:––";
+
+/// The Stream Deck key of video `number` (1-based): keys 17–23 for 1–7, then 25–31 for
+/// 8–14, because key 24 is Stop video.
+pub fn deck_key(number: usize) -> u8 {
+    let n = number as u8;
+    if number <= 7 { 16 + n } else { 17 + n }
+}
+
+/// `M:SS` of a clip, or "–:––" while its length is not known.
+pub fn length_text(d: Option<Duration>) -> String {
+    d.map(fmt_mmss).unwrap_or_else(|| LENGTH_UNKNOWN.into())
+}
+
+/// The file's own name, for the small line under a video's name.
+pub fn file_name(p: &std::path::Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string())
+}
+
+/// One line of the Videos list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CueRow {
+    /// 1-based, as the operator counts.
+    pub number: usize,
+    pub deck_key: u8,
+    pub name: String,
+    pub file_name: String,
+    pub length_text: String,
+    pub destination_text: String,
+    pub level_text: String,
+}
+
+/// The row for the cue at `index` (0-based).
+pub fn cue_row(index: usize, cue: &Cue, lengths: &HashMap<PathBuf, Duration>) -> CueRow {
+    CueRow {
+        number: index + 1,
+        deck_key: deck_key(index + 1),
+        name: cue.name.clone(),
+        file_name: file_name(&cue.path),
+        length_text: length_text(lengths.get(&cue.path).copied()),
+        destination_text: dest_short(cue.destination).into(),
+        level_text: fmt_db(cue.gain_db),
+    }
+}
+
+/// The Videos list for these cues (the window's copy while it is being edited). `lengths` are
+/// the clip lengths read so far.
+pub fn cue_rows(cues: &[Cue], lengths: &HashMap<PathBuf, Duration>) -> Vec<CueRow> {
+    cues.iter().enumerate().map(|(i, c)| cue_row(i, c, lengths)).collect()
+}
+
+/// What each place a video can play does, shown under the four buttons.
+pub fn destination_help(d: Destination) -> &'static str {
+    match d {
+        Destination::HallAndOnline => {
+            "Hall screens and the stream both switch to the video. Stream mics fade down and come back after."
+        }
+        Destination::HallOnly => "Only the hall screens switch. The stream stays on the cameras with the mics up.",
+        Destination::OnlineOnly => "Only the stream switches to the video. Stream mics fade down and come back after.",
+        Destination::AudioOnly => "No picture changes. The video's sound plays and the stream mics fade down.",
+    }
+}
+
 /// The first video not yet played: its Play button is the blue one.
 pub fn next_cue(s: &Snapshot) -> Option<usize> {
     s.cues.iter().position(|(_, st)| *st == CueState::Cued)
@@ -277,8 +343,62 @@ pub fn fmt_hhmmss(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use streamit_core::devices::BroadcastSummary;
+
+    fn cue_at(name: &str, path: &str, gain: f32) -> streamit_core::rollin::Cue {
+        streamit_core::rollin::Cue {
+            path: PathBuf::from(path),
+            name: name.into(),
+            destination: Destination::HallAndOnline,
+            gain_db: gain,
+            return_input: None,
+        }
+    }
+
+    #[test]
+    fn deck_keys_skip_the_stop_video_key() {
+        assert_eq!(deck_key(1), 17);
+        assert_eq!(deck_key(7), 23);
+        assert_eq!(deck_key(8), 25);
+        assert_eq!(deck_key(14), 31);
+    }
+
+    #[test]
+    fn cue_row_texts() {
+        let cues = [cue_at("Notices", r"C:\v\Notices 26-10.mp4", -2.0), cue_at("Mission", r"C:\v\Mission.mov", 0.0)];
+        let lengths = HashMap::from([(PathBuf::from(r"C:\v\Notices 26-10.mp4"), Duration::from_secs(150))]);
+        let rows = cue_rows(&cues, &lengths);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].number, 1);
+        assert_eq!(rows[0].deck_key, 17);
+        assert_eq!(rows[0].name, "Notices");
+        assert_eq!(rows[0].file_name, "Notices 26-10.mp4");
+        assert_eq!(rows[0].length_text, "2:30");
+        assert_eq!(rows[0].destination_text, "Hall + Online");
+        assert_eq!(rows[0].level_text, "−2 dB");
+        assert_eq!(rows[1].level_text, "0 dB");
+        assert_eq!(rows[1].length_text, "–:––", "unknown until read");
+    }
+
+    #[test]
+    fn destination_help_texts_match_spec() {
+        assert_eq!(
+            destination_help(Destination::HallAndOnline),
+            "Hall screens and the stream both switch to the video. Stream mics fade down and come back after."
+        );
+        assert_eq!(
+            destination_help(Destination::HallOnly),
+            "Only the hall screens switch. The stream stays on the cameras with the mics up."
+        );
+        assert_eq!(
+            destination_help(Destination::OnlineOnly),
+            "Only the stream switches to the video. Stream mics fade down and come back after."
+        );
+        assert_eq!(
+            destination_help(Destination::AudioOnly),
+            "No picture changes. The video's sound plays and the stream mics fade down."
+        );
+    }
 
     fn countdown_at(secs: u64) -> Snapshot {
         Snapshot {
