@@ -379,11 +379,10 @@ pub fn fmt_db(db: f32) -> String {
 /// What a length shows until the file has been read.
 pub const LENGTH_UNKNOWN: &str = "–:––";
 
-/// The Stream Deck key of video `number` (1-based): keys 17–23 for 1–7, then 25–31 for
-/// 8–14, because key 24 is Stop video.
+/// The Stream Deck key of video `number` (1-based) on the deck's Videos page: keys 9–15
+/// for 1–7, then 17–23 for 8–14, because key 16 is Stop video.
 pub fn deck_key(number: usize) -> u8 {
-    let n = number as u8;
-    if number <= 7 { 16 + n } else { 17 + n }
+    streamit_deck::layout::cue_key_number(number.saturating_sub(1))
 }
 
 /// What reading a clip's length found.
@@ -685,10 +684,10 @@ mod tests {
 
     #[test]
     fn deck_keys_skip_the_stop_video_key() {
-        assert_eq!(deck_key(1), 17);
-        assert_eq!(deck_key(7), 23);
-        assert_eq!(deck_key(8), 25);
-        assert_eq!(deck_key(14), 31);
+        assert_eq!(deck_key(1), 9);
+        assert_eq!(deck_key(7), 15);
+        assert_eq!(deck_key(8), 17);
+        assert_eq!(deck_key(14), 23);
     }
 
     #[test]

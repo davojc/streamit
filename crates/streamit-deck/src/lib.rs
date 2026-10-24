@@ -12,7 +12,7 @@ pub mod render;
 
 use elgato_streamdeck::info::Kind;
 use elgato_streamdeck::{AsyncStreamDeck, DeviceStateUpdate, StreamDeckError, list_devices, new_hidapi};
-use layout::{KEYS, KeyLook, appearance, command_for};
+use layout::{KEYS, KeyLook, Page, Press, appearance, press_for};
 use std::time::Duration;
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind, EngineHandle, Snapshot};
 use tokio::sync::{mpsc, watch};
@@ -95,21 +95,22 @@ async fn report(handle: &EngineHandle, last: &mut Option<bool>, up: bool) {
     let _ = handle.tx.send(Command::DeviceHealth(DeviceKind::StreamDeck, health)).await;
 }
 
-/// The command for a press, decided from the latest published snapshot (not a cached copy).
-fn decide_press(key: u8, rx: &watch::Receiver<Snapshot>) -> Option<Command> {
-    command_for(key, &rx.borrow())
+/// What a press on `page` does, decided from the latest published snapshot (not a cached copy).
+fn decide_press(page: Page, key: u8, rx: &watch::Receiver<Snapshot>) -> Option<Press> {
+    press_for(page, key, &rx.borrow())
 }
 
 /// Redraws the keys whose look changed since `cache`, then flushes.
 async fn draw(
     dev: &AsyncStreamDeck,
+    page: Page,
     snap: &Snapshot,
     phase: bool,
     cache: &mut [Option<KeyLook>],
 ) -> Result<(), SessionError> {
     let mut changed = false;
     for key in 0..KEYS {
-        let look = appearance(key, snap, phase);
+        let look = appearance(page, key, snap, phase);
         if cache[key as usize].as_ref() == Some(&look) {
             continue;
         }
@@ -155,11 +156,13 @@ async fn session(dev: &AsyncStreamDeck, handle: &mut EngineHandle) -> Result<(),
 
     let result = async {
         let mut cache: Vec<Option<KeyLook>> = vec![None; KEYS as usize];
+        // Each connection starts on Home; the deck changes page only when a key says so.
+        let mut page = Page::Home;
         let mut phase = true;
         let mut ticker = interval(BLINK_TOGGLE);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut snap = handle.rx.borrow_and_update().clone();
-        draw(dev, &snap, phase, &mut cache).await?;
+        draw(dev, page, &snap, phase, &mut cache).await?;
         loop {
             tokio::select! {
                 changed = handle.rx.changed() => {
@@ -167,20 +170,25 @@ async fn session(dev: &AsyncStreamDeck, handle: &mut EngineHandle) -> Result<(),
                         return Ok(());
                     }
                     snap = handle.rx.borrow_and_update().clone();
-                    draw(dev, &snap, phase, &mut cache).await?;
+                    draw(dev, page, &snap, phase, &mut cache).await?;
                 }
                 _ = ticker.tick() => {
                     phase = !phase;
-                    draw(dev, &snap, phase, &mut cache).await?;
+                    draw(dev, page, &snap, phase, &mut cache).await?;
                 }
                 press = key_rx.recv() => match press {
-                    Some(Ok(key)) => {
-                        if let Some(cmd) = decide_press(key, &handle.rx)
-                            && handle.tx.send(cmd).await.is_err()
-                        {
-                            return Ok(());
+                    Some(Ok(key)) => match decide_press(page, key, &handle.rx) {
+                        Some(Press::Go(to)) => {
+                            page = to;
+                            draw(dev, page, &snap, phase, &mut cache).await?;
                         }
-                    }
+                        Some(Press::Command(cmd)) => {
+                            if handle.tx.send(cmd).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                        None => {}
+                    },
                     Some(Err(e)) => return Err(e.into()),
                     None => return Err(SessionError("key reader stopped".into())),
                 },
@@ -201,9 +209,9 @@ mod tests {
     #[test]
     fn press_uses_latest_snapshot() {
         let (tx, rx) = watch::channel(Snapshot { offers: vec![Offer::Recover], ..Snapshot::default() });
-        assert_eq!(decide_press(15, &rx), Some(Command::Recover));
+        assert_eq!(decide_press(Page::Stream, 15, &rx), Some(Press::Command(Command::Recover)));
         // The offer is withdrawn; the receiver never polled changed().
         tx.send(Snapshot::default()).unwrap();
-        assert_eq!(decide_press(15, &rx), None);
+        assert_eq!(decide_press(Page::Stream, 15, &rx), None);
     }
 }
