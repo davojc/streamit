@@ -2,7 +2,7 @@
 //! the drawing lives in `ui/`, so these choices can be tested.
 use std::time::{Duration, SystemTime};
 use streamit_core::config::Config;
-use streamit_core::engine::{DeviceHealth, DeviceKind, Snapshot};
+use streamit_core::engine::{DeviceHealth, DeviceKind, FlashKey, Snapshot};
 use streamit_core::golive::{Readiness, Stage};
 use streamit_core::recovery::Offer;
 use streamit_core::rollin::{CueState, Destination};
@@ -120,12 +120,57 @@ pub fn header(s: &Snapshot, _c: &Config) -> HeaderView {
         .filter(|_| matches!(s.stage, Stage::Live | Stage::Ending { .. }))
         .map(|t| fmt_hhmmss(SystemTime::now().duration_since(t).unwrap_or_default()));
     let broadcast = s.broadcast.as_ref().map(|b| b.title.clone()).unwrap_or_else(|| "No broadcast selected".into());
-    let problem = ALL_KINDS.iter().find_map(|&k| match device_state(s, k) {
-        (tone, Some(why)) => Some((format!("{} · {why}", kind_name(k)), tone)),
-        _ => None,
-    });
-    let (equipment, equipment_tone) = problem.unwrap_or_else(|| ("All equipment OK".into(), Tone::Green));
+    // The worst problem first (red before amber, then list order), and how many more.
+    let problems: Vec<(DeviceKind, Tone, String)> = ALL_KINDS
+        .iter()
+        .filter_map(|&k| match device_state(s, k) {
+            (tone, Some(why)) => Some((k, tone, why)),
+            _ => None,
+        })
+        .collect();
+    let worst = problems.iter().find(|p| p.1 == Tone::Red).or_else(|| problems.first());
+    let (equipment, equipment_tone) = match worst {
+        None => ("All equipment OK".to_string(), Tone::Green),
+        Some((k, tone, why)) => {
+            let more = match problems.len() - 1 {
+                0 => String::new(),
+                n => format!(" (+{n} more)"),
+            };
+            (format!("{} · {why}{more}", kind_name(*k)), *tone)
+        }
+    };
     HeaderView { badge, badge_tone, timer, broadcast, equipment, equipment_tone, simulation: s.simulation }
+}
+
+/// What the Service tab's More menu may send now (the rest is always enabled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoreMenu {
+    pub start_now: bool,
+    pub end_service: bool,
+}
+
+/// Mirrors the engine: Start service now runs from Idle or Prepared when nothing else
+/// runs (the countdown has its own button); End Service starts when nothing runs, stops
+/// a video first, and a second press during End Service skips the closing hold.
+pub fn more_menu(s: &Snapshot) -> MoreMenu {
+    MoreMenu {
+        start_now: matches!(s.stage, Stage::Idle | Stage::Prepared(_)) && s.job.is_none(),
+        end_service: s.playing.is_some() || matches!(s.job, None | Some("End Service") | Some("a video")),
+    }
+}
+
+/// The label of the online panel while a video plays, and whether it is on air.
+pub fn online_panel(s: &Snapshot) -> (&'static str, bool) {
+    if s.stage == Stage::Live { ("Online · on air", true) } else { ("Online · not live yet", false) }
+}
+
+/// What to say when the engine ignored a key press.
+pub fn flash_key_text(k: FlashKey) -> String {
+    let name = match k {
+        FlashKey::GoLive => "Start service now",
+        FlashKey::Recover => "Recover",
+    };
+    format!("{name} is not available right now")
 }
 
 /// Prepare → Countdown → Live → End service.
@@ -335,13 +380,64 @@ mod tests {
         }
         let h = header(&s, &Config::default());
         assert_eq!((h.equipment.as_str(), h.equipment_tone), ("All equipment OK", Tone::Green));
-        s.device_status.insert(DeviceKind::StreamDeck, DeviceHealth::Down("unplugged".into()));
         s.device_status.insert(DeviceKind::VideoHub, DeviceHealth::Warning("slow to answer".into()));
         let h = header(&s, &Config::default());
         assert_eq!((h.equipment.as_str(), h.equipment_tone), ("VideoHub · slow to answer", Tone::Amber));
-        s.device_status.insert(DeviceKind::VideoHub, DeviceHealth::Ok);
+        s.device_status.insert(DeviceKind::ScreensAtem, DeviceHealth::Warning("late".into()));
         let h = header(&s, &Config::default());
-        assert_eq!((h.equipment.as_str(), h.equipment_tone), ("Stream Deck · unplugged", Tone::Red));
+        assert_eq!((h.equipment.as_str(), h.equipment_tone), ("Screens ATEM · late (+1 more)", Tone::Amber));
+    }
+
+    #[test]
+    fn equipment_summary_red_wins_over_amber() {
+        let mut s = Snapshot::default();
+        for k in ALL_KINDS {
+            s.device_status.insert(k, DeviceHealth::Ok);
+        }
+        s.device_status.insert(DeviceKind::StreamAtem, DeviceHealth::Warning("slow".into()));
+        s.device_status.insert(DeviceKind::StreamDeck, DeviceHealth::Down("unplugged".into()));
+        s.device_status.insert(DeviceKind::Ndi, DeviceHealth::Down("stopped".into()));
+        let h = header(&s, &Config::default());
+        assert_eq!((h.equipment.as_str(), h.equipment_tone), ("NDI counter · stopped (+2 more)", Tone::Red));
+    }
+
+    #[test]
+    fn online_panel_is_on_air_only_when_live() {
+        let idle_video = Snapshot { playing: Some(0), ..Snapshot::default() };
+        assert_eq!(service_screen(&idle_video), ServiceScreen::VideoPlaying);
+        assert_eq!(online_panel(&idle_video), ("Online · not live yet", false));
+        let live_video = Snapshot { stage: Stage::Live, playing: Some(0), ..Snapshot::default() };
+        assert_eq!(online_panel(&live_video), ("Online · on air", true));
+        let prepared = Snapshot { stage: Stage::Prepared(Readiness::Ready), ..idle_video };
+        assert!(!online_panel(&prepared).1);
+    }
+
+    #[test]
+    fn more_menu_enables_what_the_engine_accepts() {
+        let idle = more_menu(&Snapshot::default());
+        assert!(idle.start_now && idle.end_service);
+        let prepared = more_menu(&Snapshot { stage: Stage::Prepared(Readiness::Ready), ..Snapshot::default() });
+        assert!(prepared.start_now);
+        let live = Snapshot { stage: Stage::Live, ..Snapshot::default() };
+        assert!(!more_menu(&live).start_now && more_menu(&live).end_service);
+        let video = Snapshot { playing: Some(1), job: Some("a video"), ..live.clone() };
+        assert!(more_menu(&video).end_service, "End Service stops the video first");
+        let ending = Snapshot {
+            stage: Stage::Ending { remaining: Duration::from_secs(3) },
+            job: Some("End Service"),
+            ..live.clone()
+        };
+        assert!(more_menu(&ending).end_service, "a second press skips the closing hold");
+        let preparing = Snapshot { job: Some("Prepare"), ..Snapshot::default() };
+        assert!(!more_menu(&preparing).start_now && !more_menu(&preparing).end_service);
+        let ended = more_menu(&Snapshot { stage: Stage::Ended, ..Snapshot::default() });
+        assert!(!ended.start_now);
+    }
+
+    #[test]
+    fn ignored_keys_use_the_operator_words() {
+        assert_eq!(flash_key_text(FlashKey::GoLive), "Start service now is not available right now");
+        assert_eq!(flash_key_text(FlashKey::Recover), "Recover is not available right now");
     }
 
     #[test]

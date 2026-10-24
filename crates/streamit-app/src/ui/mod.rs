@@ -30,8 +30,21 @@ const CUE_DEBOUNCE: Duration = Duration::from_millis(400);
 const CUE_SETTLE: Duration = Duration::from_secs(1);
 const SCAN_FOR: Duration = Duration::from_secs(4);
 const RESTART_NOTE: &str = "Restart StreamIt to apply device changes";
+const SIM_UNAVAILABLE: &str = "Not available in simulation";
 
-/// A background job whose result the UI picks up on a later frame.
+/// Says why a control that would touch real equipment or YouTube is off in simulation.
+trait SimTip {
+    fn sim_tip(self, simulating: bool) -> Self;
+}
+
+impl SimTip for egui::Response {
+    fn sim_tip(self, simulating: bool) -> Self {
+        if simulating { self.on_disabled_hover_text(SIM_UNAVAILABLE) } else { self }
+    }
+}
+
+/// A background job whose result the UI picks up on a later frame. Each `start` gets a
+/// fresh slot, so a job started earlier can never overwrite the latest one's result.
 struct Pending<T> {
     slot: Arc<Mutex<Option<T>>>,
     running: bool,
@@ -46,6 +59,7 @@ impl<T> Default for Pending<T> {
 impl<T: Send + 'static> Pending<T> {
     fn start(&mut self, rt: &Handle, ctx: &egui::Context, fut: impl Future<Output = T> + Send + 'static) {
         self.running = true;
+        self.slot = Arc::default();
         let (slot, ctx) = (self.slot.clone(), ctx.clone());
         rt.spawn(async move {
             let v = fut.await;
@@ -163,12 +177,8 @@ pub struct StreamItApp {
     notice: Option<String>,
 
     broadcasts: Vec<BroadcastSummary>,
-    /// Each result carries the list's generation: one from before the YouTube changed
-    /// (the other mode) is dropped.
-    broadcasts_job: Pending<(u64, Result<Vec<BroadcastSummary>, String>)>,
-    broadcasts_gen: u64,
-    /// A load for the current generation is under way.
-    broadcasts_loading: bool,
+    /// Restarting it (after a mode switch) drops the old session's result unseen.
+    broadcasts_job: Pending<Result<Vec<BroadcastSummary>, String>>,
     broadcasts_error: Option<String>,
 
     /// The window's copy of the cue list; edits go to the engine with SetCues.
@@ -226,8 +236,6 @@ impl StreamItApp {
             notice: load_error,
             broadcasts: Vec::new(),
             broadcasts_job: Pending::default(),
-            broadcasts_gen: 0,
-            broadcasts_loading: false,
             broadcasts_error: None,
             cues_dirty_at: None,
             cues_sent_at: None,
@@ -256,17 +264,13 @@ impl StreamItApp {
 
     fn load_broadcasts(&mut self) {
         let yt = self.yt.borrow_and_update().clone();
-        let generation = self.broadcasts_gen;
-        self.broadcasts_loading = true;
-        self.broadcasts_job
-            .start(&self.rt, &self.ctx, async move { (generation, yt.upcoming().await.map_err(|e| e.to_string())) });
+        self.broadcasts_job.start(&self.rt, &self.ctx, async move { yt.upcoming().await.map_err(|e| e.to_string()) });
     }
 
     /// A mode switch brings another YouTube: forget the old list and load the new one.
     fn follow_youtube(&mut self) {
         if self.yt.has_changed().unwrap_or(false) {
             info!("the session's YouTube changed; reloading the broadcast list");
-            self.broadcasts_gen += 1;
             self.broadcasts.clear();
             self.broadcasts_error = None;
             self.load_broadcasts();
@@ -293,20 +297,13 @@ impl StreamItApp {
     }
 
     fn poll_jobs(&mut self) {
-        if let Some((generation, r)) = self.broadcasts_job.take() {
+        if let Some(r) = self.broadcasts_job.take() {
             match r {
-                _ if generation != self.broadcasts_gen => {
-                    info!("dropping a broadcast list from before the mode switch");
-                }
                 Ok(list) => {
-                    self.broadcasts_loading = false;
                     self.broadcasts = list;
                     self.broadcasts_error = None;
                 }
-                Err(e) => {
-                    self.broadcasts_loading = false;
-                    self.broadcasts_error = Some(e);
-                }
+                Err(e) => self.broadcasts_error = Some(e),
             }
         }
         if let Some(found) = self.scan_job.take() {
@@ -537,7 +534,14 @@ impl eframe::App for StreamItApp {
         if self.tab == Tab::Service {
             egui::Panel::top("steps")
                 .frame(egui::Frame::new().fill(theme::GROUND).inner_margin(Margin::symmetric(28, 14)))
-                .show(ui, |ui| theme::step_strip(ui, view::steps(&snap)));
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        theme::step_strip(ui, view::steps(&snap));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            self.more_menu(ui, &snap)
+                        });
+                    });
+                });
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::GROUND).inner_margin(Margin::symmetric(28, 24)))
@@ -820,7 +824,7 @@ impl StreamItApp {
             let busy = self.scan_job.running;
             // Simulation never touches the network: no mDNS scan.
             let simulating = *self.mode.borrow() == Mode::Simulation;
-            if ui.add_enabled(!busy && !simulating, egui::Button::new("Scan")).clicked() {
+            if ui.add_enabled(!busy && !simulating, egui::Button::new("Scan")).sim_tip(simulating).clicked() {
                 self.scan();
             }
             if busy {
@@ -922,9 +926,15 @@ impl StreamItApp {
         });
         let (id, secret) = (self.draft.youtube.client_id.clone(), self.draft.youtube.client_secret.clone());
         let have_client = !id.trim().is_empty() && !secret.trim().is_empty();
+        // Both build a real YouTube client: never in simulation.
+        let simulating = *self.mode.borrow() == Mode::Simulation;
         ui.horizontal(|ui| {
             let busy = self.signin_job.running;
-            if ui.add_enabled(have_client && !busy, egui::Button::new("Sign in")).clicked() {
+            if ui
+                .add_enabled(have_client && !busy && !simulating, egui::Button::new("Sign in"))
+                .sim_tip(simulating)
+                .clicked()
+            {
                 let (id, secret, ctx) = (id.clone(), secret.clone(), ui.ctx().clone());
                 self.signin_status = "Waiting for you to approve in the browser...".into();
                 self.signin_job.start(&self.rt, &ctx, async move {
@@ -938,7 +948,11 @@ impl StreamItApp {
         });
         ui.horizontal(|ui| {
             let busy = self.streams_job.running;
-            if ui.add_enabled(have_client && !busy, egui::Button::new("Load stream keys")).clicked() {
+            if ui
+                .add_enabled(have_client && !busy && !simulating, egui::Button::new("Load stream keys"))
+                .sim_tip(simulating)
+                .clicked()
+            {
                 let (id, secret, ctx) = (id.clone(), secret.clone(), ui.ctx().clone());
                 self.streams_job.start(&self.rt, &ctx, async move {
                     let auth = Auth::load(&id, &secret).map_err(|e| e.to_string())?;
@@ -1105,5 +1119,34 @@ mod tests {
         assert!(service_at_risk(&Snapshot { stage: Stage::Live, ..Snapshot::default() }));
         assert!(service_at_risk(&Snapshot { job: Some("Prepare"), ..Snapshot::default() }));
         assert!(service_at_risk(&Snapshot { playing: Some(0), ..Snapshot::default() }));
+    }
+
+    #[test]
+    fn a_restarted_job_ignores_the_earlier_result() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let ctx = egui::Context::default();
+        let mut job: Pending<&'static str> = Pending::default();
+        let (release_old, old_gate) = std::sync::mpsc::channel::<()>();
+        // The old session's load hangs until released; the new one finishes at once.
+        job.start(rt.handle(), &ctx, async move {
+            tokio::task::spawn_blocking(move || old_gate.recv()).await.ok();
+            "old"
+        });
+        job.start(rt.handle(), &ctx, async { "new" });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let first = loop {
+            if let Some(v) = job.take() {
+                break v;
+            }
+            assert!(Instant::now() < deadline, "the new result never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(first, "new");
+        assert!(!job.running, "the picker is not left loading");
+        release_old.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(job.take(), None, "the old result never lands");
+        assert!(!job.running);
+        rt.shutdown_timeout(Duration::from_secs(1));
     }
 }
