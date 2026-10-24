@@ -543,6 +543,7 @@ impl Inner {
         if let Some(probes) = probes {
             let _in = span.enter();
             tasks.push(wiring::spawn_health_poll(probes, config, tx.clone(), engine.clone(), &health));
+            tasks.push(wiring::spawn_chat_poll(kit.devices.yt.clone(), tx.clone(), engine.clone()));
         }
         let out = &inner.out;
         tasks.push(spawn_forward(engine.clone(), out.snap.clone()));

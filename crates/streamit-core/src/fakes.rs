@@ -24,6 +24,7 @@ pub enum Call {
     EncoderStop,
     YtFix(Fix),
     YtTransition(Phase),
+    YtSendChat(String, String),
     PlayerLoad(PathBuf, f32),
     PlayerPlay,
     PlayerStop,
@@ -333,6 +334,7 @@ struct YtState {
     health: Health,
     life_cycle: String,
     live: LiveDetails,
+    chat: Vec<ChatMessage>,
 }
 
 #[derive(Clone)]
@@ -380,6 +382,10 @@ impl FakeBroadcasts {
     pub fn set_transition_hangs(&self, v: bool) {
         self.hang_transition.store(v, std::sync::atomic::Ordering::SeqCst);
     }
+    /// Adds a chat message; `chat_messages` pages through them by index.
+    pub fn push_chat(&self, m: ChatMessage) {
+        self.st.lock().unwrap().chat.push(m);
+    }
     pub fn set_live_details(&self, d: LiveDetails) {
         self.st.lock().unwrap().live = d;
     }
@@ -420,6 +426,20 @@ impl Broadcasts for FakeBroadcasts {
     async fn live_details(&self, _id: &str) -> Result<LiveDetails> {
         self.fails.check("live_details")?;
         Ok(self.st.lock().unwrap().live.clone())
+    }
+    async fn chat_messages(&self, _chat_id: &str, page: Option<&str>) -> Result<ChatPage> {
+        self.fails.check("chat_messages")?;
+        let chat = &self.st.lock().unwrap().chat;
+        let from = page.and_then(|p| p.parse::<usize>().ok()).unwrap_or(0).min(chat.len());
+        Ok(ChatPage {
+            messages: chat[from..].to_vec(),
+            next_page: Some(chat.len().to_string()),
+            wait: Duration::from_secs(5),
+        })
+    }
+    async fn send_chat(&self, chat_id: &str, text: &str) -> Result<()> {
+        self.log.push(Call::YtSendChat(chat_id.into(), text.into()));
+        self.fails.check("send_chat")
     }
     async fn transition(&self, _id: &str, to: Phase) -> Result<()> {
         self.log.push(Call::YtTransition(to));
@@ -577,6 +597,7 @@ pub fn fake_devices() -> (Devices, CallLog, FakeHandles) {
             health: Health::Good,
             life_cycle: "ready".into(),
             live: LiveDetails::default(),
+            chat: Vec::new(),
         })),
         hang_transition: Default::default(),
         delays: Default::default(),

@@ -177,6 +177,35 @@ pub struct LiveDetails {
     pub chat_id: Option<String>,
 }
 
+/// Who wrote a chat message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatRole {
+    Viewer,
+    Moderator,
+    /// The channel itself (replies sent from StreamIt come back as these).
+    Owner,
+}
+
+/// One live chat message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessage {
+    pub id: String,
+    pub author: String,
+    pub role: ChatRole,
+    pub text: String,
+    /// When it was sent, as YouTube says it (RFC 3339).
+    pub published: String,
+}
+
+/// One read of a live chat: the messages since the last read, where to read from next,
+/// and how long YouTube asks to wait before then.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChatPage {
+    pub messages: Vec<ChatMessage>,
+    pub next_page: Option<String>,
+    pub wait: Duration,
+}
+
 #[async_trait]
 pub trait Broadcasts: Send + Sync {
     async fn signed_in(&self) -> Result<bool>;
@@ -191,6 +220,16 @@ pub trait Broadcasts: Send + Sync {
     async fn live_details(&self, id: &str) -> Result<LiveDetails> {
         let _ = id;
         Ok(LiveDetails::default())
+    }
+    /// The chat messages after `page` (from the start when `None`).
+    async fn chat_messages(&self, chat_id: &str, page: Option<&str>) -> Result<ChatPage> {
+        let _ = (chat_id, page);
+        Err(DeviceError::Refused("no live chat".into()))
+    }
+    /// Posts `text` to the chat as the signed-in channel.
+    async fn send_chat(&self, chat_id: &str, text: &str) -> Result<()> {
+        let _ = (chat_id, text);
+        Err(DeviceError::Refused("no live chat".into()))
     }
 }
 

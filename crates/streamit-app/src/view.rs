@@ -735,6 +735,18 @@ pub fn audio_tag(input: Option<AudioInput>) -> (&'static str, Tone) {
     }
 }
 
+/// A chat message's time as the window shows it: local hours and minutes.
+pub fn chat_time(published: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(published)
+        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_default()
+}
+
+/// The broadcast's live chat on YouTube, in its own window.
+pub fn chat_url(broadcast_id: &str) -> String {
+    format!("https://www.youtube.com/live_chat?is_popout=1&v={broadcast_id}")
+}
+
 /// The YouTube Studio page for running a live broadcast.
 pub fn studio_url(broadcast_id: &str) -> String {
     format!("https://studio.youtube.com/video/{broadcast_id}/livestreaming")
@@ -1300,5 +1312,8 @@ mod tests {
         assert_eq!(audio_tag(at(AudioMix::Off)).0, "OFF");
         assert_eq!(audio_tag(None).0, "—");
         assert_eq!(studio_url("abc"), "https://studio.youtube.com/video/abc/livestreaming");
+        assert_eq!(chat_url("abc"), "https://www.youtube.com/live_chat?is_popout=1&v=abc");
+        assert_eq!(chat_time("not a time"), "");
+        assert_eq!(chat_time("2026-10-25T10:31:00Z").len(), 5);
     }
 }

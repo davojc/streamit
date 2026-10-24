@@ -19,8 +19,8 @@
 use crate::audio::LiveLevels;
 use crate::config::{AudioSourceId, Config};
 use crate::devices::{
-    self, AudioInput, BroadcastCheck, BroadcastSummary, DeviceError, Devices, Fix, Health, LabelKind, LightingStatus,
-    LiveDetails, Phase,
+    self, AudioInput, BroadcastCheck, BroadcastSummary, ChatMessage, DeviceError, Devices, Fix, Health, LabelKind,
+    LightingStatus, LiveDetails, Phase,
 };
 use crate::end::{EndOutcome, end_service};
 use crate::golive::{self, CountdownOutcome, CountdownReport, Readiness, Stage, Stage0Report, T0Error};
@@ -47,6 +47,10 @@ pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 pub const NO_BROADCAST: &str = "No broadcast selected";
 /// Most entries the activity list keeps.
 pub const ACTIVITY_MAX: usize = 50;
+/// Most live chat messages kept.
+pub const CHAT_MAX: usize = 300;
+/// The longest chat reply YouTube takes.
+pub const CHAT_REPLY_MAX: usize = 200;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -103,6 +107,15 @@ pub enum Command {
     /// The viewer count and chat of the selected broadcast, from the poll while a service
     /// is under way (`None`: not being checked).
     LiveDetailsRead(Option<LiveDetails>),
+    /// New live chat messages from the chat poll (`reset`: a different chat, so the old
+    /// messages go), or why it could not read.
+    ChatRead {
+        reset: bool,
+        messages: Vec<ChatMessage>,
+        error: Option<String>,
+    },
+    /// Post a reply to the live chat as the channel.
+    SendChat(String),
 }
 
 /// One shown audio input: its name and what the switcher says (`None`: no answer).
@@ -172,6 +185,10 @@ pub struct Snapshot {
     pub audio: Vec<AudioReading>,
     /// The selected broadcast's viewer count and chat, while a service is under way.
     pub live: Option<LiveDetails>,
+    /// The live chat, oldest first, at most `CHAT_MAX` messages.
+    pub chat: Vec<ChatMessage>,
+    /// Why the chat could not be read last time, until a read works.
+    pub chat_error: Option<String>,
 }
 
 /// How far the playing roll-in is.
@@ -216,6 +233,8 @@ impl Default for Snapshot {
             stream_alarm: false,
             audio: Vec::new(),
             live: None,
+            chat: Vec::new(),
+            chat_error: None,
         }
     }
 }
@@ -767,6 +786,40 @@ impl Engine {
             Command::AudioRead(audio) => {
                 let audio = audio.clone();
                 self.set(|s| s.audio = audio);
+            }
+            Command::ChatRead { reset, messages, error } => {
+                let (reset, messages, error) = (*reset, messages.clone(), error.clone());
+                self.set(|s| {
+                    if reset {
+                        s.chat.clear();
+                    }
+                    if error.is_none() {
+                        for m in messages {
+                            if !s.chat.iter().any(|x| x.id == m.id) {
+                                s.chat.push(m);
+                            }
+                        }
+                        let over = s.chat.len().saturating_sub(CHAT_MAX);
+                        s.chat.drain(..over);
+                    }
+                    s.chat_error = error;
+                });
+            }
+            Command::SendChat(text) => {
+                let text: String = text.trim().chars().take(CHAT_REPLY_MAX).collect();
+                let chat = self.snap.borrow().live.as_ref().and_then(|l| l.chat_id.clone());
+                let Some(chat) = chat.filter(|_| !text.is_empty()) else {
+                    return self.ignore(&cmd, "no live chat to reply to");
+                };
+                let (yt, snap) = (self.d.yt.clone(), self.snap.clone());
+                tokio::spawn(
+                    async move {
+                        if let Err(e) = yt.send_chat(&chat, &text).await {
+                            set_warning(&snap, format!("Live chat: could not send the reply: {e}"));
+                        }
+                    }
+                    .in_current_span(),
+                );
             }
             Command::LiveDetailsRead(live) => {
                 let live = live.clone();
@@ -3319,6 +3372,53 @@ mod tests {
         until(&mut e, "the details", |s| s.live == Some(live.clone())).await;
         send(&e, Command::LiveDetailsRead(None)).await;
         until(&mut e, "no details", |s| s.live.is_none()).await;
+    }
+
+    fn chat_msg(id: &str, text: &str) -> ChatMessage {
+        ChatMessage {
+            id: id.into(),
+            author: "Ruth".into(),
+            role: devices::ChatRole::Viewer,
+            text: text.into(),
+            published: "2026-10-25T10:31:00Z".into(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_reads_append_once_and_a_new_chat_starts_afresh() {
+        let (d, _log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        let read = |reset, messages| Command::ChatRead { reset, messages, error: None };
+        send(&e, read(false, vec![chat_msg("a", "Morning"), chat_msg("b", "Hello")])).await;
+        send(&e, read(false, vec![chat_msg("b", "Hello"), chat_msg("c", "Lovely")])).await;
+        let s = until(&mut e, "three messages", |s| s.chat.len() == 3).await;
+        assert_eq!(s.chat.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+        let error = Command::ChatRead { reset: false, messages: vec![], error: Some("quotaExceeded".into()) };
+        send(&e, error).await;
+        let s = until(&mut e, "the error", |s| s.chat_error.is_some()).await;
+        assert_eq!(s.chat.len(), 3, "an error keeps the messages");
+        send(&e, read(true, vec![])).await;
+        until(&mut e, "a fresh chat", |s| s.chat.is_empty() && s.chat_error.is_none()).await;
+        let many: Vec<ChatMessage> = (0..CHAT_MAX + 5).map(|i| chat_msg(&i.to_string(), "x")).collect();
+        send(&e, read(false, many)).await;
+        let s = until(&mut e, "the newest kept", |s| s.chat.len() == CHAT_MAX).await;
+        assert_eq!(s.chat[0].id, "5");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_chat_reply_posts_to_the_chat_and_a_failure_warns() {
+        let (d, log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::SendChat("ignored: no chat yet".into())).await;
+        let live = LiveDetails { viewers: None, chat_id: Some("chat-1".into()) };
+        send(&e, Command::LiveDetailsRead(Some(live))).await;
+        until(&mut e, "the chat", |s| s.live.is_some()).await;
+        send(&e, Command::SendChat("  Welcome everyone!  ".into())).await;
+        until_call(&log, Call::YtSendChat("chat-1".into(), "Welcome everyone!".into())).await;
+        assert!(!log.calls().iter().any(|c| matches!(c, Call::YtSendChat(_, t) if t.starts_with("ignored"))));
+        h.yt.fail_next("send_chat");
+        send(&e, Command::SendChat("Again".into())).await;
+        until(&mut e, "a warning", |s| s.last_warning.as_deref().is_some_and(|w| w.contains("could not send"))).await;
     }
 
     // ---- stream health

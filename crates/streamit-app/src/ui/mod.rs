@@ -171,6 +171,8 @@ pub struct StreamItApp {
     confirm_start_now: bool,
     /// End service was pressed: the window asks before ending.
     confirm_end: bool,
+    /// The reply typed in the live chat panel.
+    chat_reply: String,
     /// The config the devices were built from.
     startup: Config,
     draft: Config,
@@ -268,6 +270,7 @@ impl StreamItApp {
             unsaved_ok: false,
             confirm_start_now: false,
             confirm_end: false,
+            chat_reply: String::new(),
             live_inputs_text: join_inputs(&draft.stream_atem.live_inputs),
             cues: startup.cues.clone(),
             engine_cues: startup.cues.clone(),

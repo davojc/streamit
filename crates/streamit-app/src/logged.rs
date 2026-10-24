@@ -1,7 +1,7 @@
 //! Logging decorators for the device traits. Every action call is logged at `info` with
 //! its arguments and result (`warn` when it fails); read getters (program, route_of,
 //! status, signed_in, upcoming, check, health, life_cycle, live_details, audio_level,
-//! audio_input, position) are
+//! audio_input, chat_messages, position) are
 //! not logged, because the health poll calls them every 2 s. The countdown counter's
 //! `show`, called ten times a second, is logged at `debug` (a failure still at `warn`). Arguments are numbers,
 //! file paths and broadcast ids only: no tokens or secrets pass through these traits.
@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use streamit_core::config::AudioSourceId;
 use streamit_core::devices::{
-    AudioInput, BroadcastCheck, BroadcastSummary, Broadcasts, Counter, Encoder, EncoderStatus, Fix, Health, LabelKind,
-    Lighting, LightingStatus, LiveDetails, Phase, Player, PlayerEvent, Result, Router, StreamSwitcher, Switcher,
+    AudioInput, BroadcastCheck, BroadcastSummary, Broadcasts, ChatPage, Counter, Encoder, EncoderStatus, Fix, Health,
+    LabelKind, Lighting, LightingStatus, LiveDetails, Phase, Player, PlayerEvent, Result, Router, StreamSwitcher,
+    Switcher,
 };
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -176,6 +177,17 @@ impl<T: Broadcasts + ?Sized> Broadcasts for Logged<T> {
     }
     async fn live_details(&self, id: &str) -> Result<LiveDetails> {
         self.inner.live_details(id).await
+    }
+    async fn chat_messages(&self, chat_id: &str, page: Option<&str>) -> Result<ChatPage> {
+        self.inner.chat_messages(chat_id, page).await
+    }
+    async fn send_chat(&self, chat_id: &str, text: &str) -> Result<()> {
+        // The message itself is the viewers' to read, not the log's: only its length.
+        done(
+            self.device,
+            format!("send_chat({chat_id}, {} chars)", text.chars().count()),
+            self.inner.send_chat(chat_id, text).await,
+        )
     }
     async fn transition(&self, id: &str, to: Phase) -> Result<()> {
         done(self.device, format!("transition({id}, {to:?})"), self.inner.transition(id, to).await)

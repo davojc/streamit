@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 use streamit_core::config::{AudioSourceId, Config};
 use streamit_core::devices::{
-    BroadcastCheck, BroadcastSummary, DeviceError, Devices, EncoderStatus, Health, Phase, PlayerEvent,
+    BroadcastCheck, BroadcastSummary, ChatMessage, DeviceError, Devices, EncoderStatus, Health, Phase, PlayerEvent,
 };
 use streamit_core::engine::DeviceKind;
 use tokio::sync::broadcast;
@@ -148,6 +148,9 @@ pub struct SimWorld {
     pub counter: Option<Duration>,
     /// The pretend lighting console's active cue ("list/cue").
     pub lighting_cue: Option<String>,
+    /// The pretend live chat, oldest first, and how much of the script has arrived.
+    pub chat: Vec<ChatMessage>,
+    pub chat_script_sent: usize,
     pub faults: HashSet<Fault>,
 }
 
@@ -193,6 +196,8 @@ impl SimWorld {
             player_events: broadcast::channel(16).0,
             counter: None,
             lighting_cue: None,
+            chat: Vec::new(),
+            chat_script_sent: 0,
             faults: HashSet::new(),
         }
     }
@@ -905,6 +910,26 @@ mod tests {
         std::fs::write(&f, clip::test_support::mp4_bytes_with_timescale(u32::MAX, 1)).unwrap();
         let d = clip_length(&f);
         assert!(d == Duration::from_secs(30) || d == Duration::from_secs(u32::MAX as u64), "{d:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_pretend_chat_fills_once_streaming_and_takes_replies() {
+        let c = SimControl::new(&cfg(), Speed::X1);
+        let d = c.devices();
+        let live = d.yt.live_details(SEED_BROADCAST).await.unwrap();
+        assert_eq!((live.viewers, live.chat_id.as_deref()), (None, Some(youtube::SIM_CHAT)));
+        assert!(d.yt.chat_messages(youtube::SIM_CHAT, None).await.unwrap().messages.is_empty());
+        d.encoder.start().await.unwrap();
+        ms(40_000).await;
+        let page = d.yt.chat_messages(youtube::SIM_CHAT, None).await.unwrap();
+        assert!(page.messages.len() >= 2, "{page:?}");
+        assert!(page.messages[0].published.ends_with('Z') && page.messages[0].published.len() == 20);
+        assert!(d.yt.live_details(SEED_BROADCAST).await.unwrap().viewers.is_some());
+        d.yt.send_chat(youtube::SIM_CHAT, "Welcome!").await.unwrap();
+        let next = d.yt.chat_messages(youtube::SIM_CHAT, page.next_page.as_deref()).await.unwrap();
+        let reply = next.messages.last().unwrap();
+        assert_eq!((reply.text.as_str(), reply.role), ("Welcome!", streamit_core::devices::ChatRole::Owner));
+        assert!(d.yt.chat_messages("other", None).await.is_err());
     }
 
     async fn live_broadcast(yt: &SimBroadcasts) {

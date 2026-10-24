@@ -1,6 +1,6 @@
 use serde_json::json;
 use std::sync::Arc;
-use streamit_core::devices::{Broadcasts, DeviceError, Fix, Health, LiveDetails, Phase};
+use streamit_core::devices::{Broadcasts, ChatRole, DeviceError, Fix, Health, LiveDetails, Phase};
 use streamit_youtube::{Auth, MemoryStore, YouTubeClient};
 use url::Url;
 use wiremock::matchers::{body_partial_json, header, method, path, query_param};
@@ -485,4 +485,48 @@ async fn live_details_reads_viewers_and_the_chat() {
     let c = client(&s, None);
     assert_eq!(c.live_details("b1").await.unwrap(), LiveDetails { viewers: Some(37), chat_id: Some("chat-1".into()) });
     assert_eq!(c.live_details("b2").await.unwrap(), LiveDetails::default());
+}
+
+#[tokio::test]
+async fn chat_messages_read_authors_roles_and_the_next_page() {
+    let s = MockServer::start().await;
+    token_ok(&s).await;
+    Mock::given(method("GET"))
+        .and(path("/youtube/v3/liveChat/messages"))
+        .and(query_param("liveChatId", "chat-1"))
+        .and(query_param("pageToken", "p1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        "nextPageToken": "p2", "pollingIntervalMillis": 7000,
+        "items": [
+            {"id": "m1", "snippet": {"displayMessage": "Morning!", "publishedAt": "2026-10-25T10:31:00Z"},
+             "authorDetails": {"displayName": "Ruth"}},
+            {"id": "m2", "snippet": {"displayMessage": "Welcome", "publishedAt": "2026-10-25T10:32:00Z"},
+             "authorDetails": {"displayName": "Church", "isChatOwner": true}},
+            {"id": "m3", "snippet": {"displayMessage": "Hi"},
+             "authorDetails": {"displayName": "Sam", "isChatModerator": true}}
+        ]})))
+        .mount(&s)
+        .await;
+    let page = client(&s, None).chat_messages("chat-1", Some("p1")).await.unwrap();
+    assert_eq!(page.next_page.as_deref(), Some("p2"));
+    assert_eq!(page.wait, std::time::Duration::from_secs(7));
+    let roles: Vec<_> = page.messages.iter().map(|m| (m.author.as_str(), m.role)).collect();
+    assert_eq!(roles, [("Ruth", ChatRole::Viewer), ("Church", ChatRole::Owner), ("Sam", ChatRole::Moderator)]);
+    assert_eq!(page.messages[0].text, "Morning!");
+}
+
+#[tokio::test]
+async fn send_chat_posts_a_text_message() {
+    let s = MockServer::start().await;
+    token_ok(&s).await;
+    Mock::given(method("POST"))
+        .and(path("/youtube/v3/liveChat/messages"))
+        .and(query_param("part", "snippet"))
+        .and(body_partial_json(json!({"snippet": {"liveChatId": "chat-1", "type": "textMessageEvent",
+            "textMessageDetails": {"messageText": "Welcome everyone"}}})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "new"})))
+        .expect(1)
+        .mount(&s)
+        .await;
+    client(&s, None).send_chat("chat-1", "Welcome everyone").await.unwrap();
 }

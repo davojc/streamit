@@ -9,7 +9,8 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use std::time::Duration;
 use streamit_core::devices::{
-    BroadcastCheck, BroadcastSummary, Broadcasts, DeviceError, Fix, Health, LiveDetails, Phase, Result,
+    BroadcastCheck, BroadcastSummary, Broadcasts, ChatMessage, ChatPage, ChatRole, DeviceError, Fix, Health,
+    LiveDetails, Phase, Result,
 };
 use url::Url;
 
@@ -272,6 +273,54 @@ impl Broadcasts for YouTubeClient {
             n => n.as_u64(),
         };
         Ok(LiveDetails { viewers, chat_id: d["activeLiveChatId"].as_str().map(String::from) })
+    }
+
+    /// `liveChatMessages.list` (5 quota units).
+    async fn chat_messages(&self, chat_id: &str, page: Option<&str>) -> Result<ChatPage> {
+        let mut q = vec![("liveChatId", chat_id), ("part", "snippet,authorDetails"), ("maxResults", "200")];
+        if let Some(p) = page {
+            q.push(("pageToken", p));
+        }
+        let v = self.call(Method::GET, "liveChat/messages", &q, None).await?;
+        let messages = v["items"]
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|m| {
+                let a = &m["authorDetails"];
+                let role = if flag(&a["isChatOwner"]) {
+                    ChatRole::Owner
+                } else if flag(&a["isChatModerator"]) {
+                    ChatRole::Moderator
+                } else {
+                    ChatRole::Viewer
+                };
+                Some(ChatMessage {
+                    id: m["id"].as_str()?.to_string(),
+                    author: a["displayName"].as_str().unwrap_or("").to_string(),
+                    role,
+                    text: m["snippet"]["displayMessage"].as_str().unwrap_or("").to_string(),
+                    published: m["snippet"]["publishedAt"].as_str().unwrap_or("").to_string(),
+                })
+            })
+            .collect();
+        Ok(ChatPage {
+            messages,
+            next_page: v["nextPageToken"].as_str().map(String::from),
+            wait: Duration::from_millis(v["pollingIntervalMillis"].as_u64().unwrap_or(5000)),
+        })
+    }
+
+    /// `liveChatMessages.insert` (about 50 quota units), as the signed-in channel.
+    async fn send_chat(&self, chat_id: &str, text: &str) -> Result<()> {
+        let body = json!({"snippet": {
+            "liveChatId": chat_id,
+            "type": "textMessageEvent",
+            "textMessageDetails": {"messageText": text},
+        }});
+        self.call(Method::POST, "liveChat/messages", &[("part", "snippet")], Some(&body)).await?;
+        Ok(())
     }
 
     async fn life_cycle(&self, id: &str) -> Result<String> {

@@ -1,9 +1,13 @@
 //! Screen 3: live, with the videos (one may be playing), and the closing hold.
 use super::*;
 
+/// The height of the live chat's message list.
+const CHAT_H: f32 = 460.0;
+
 impl StreamItApp {
     /// Live, and any video playing (a rehearsal before live too): the videos and the
-    /// activity. End service is the fourth step in the steps bar.
+    /// activity, with the live chat down the side. End service is the fourth step in the
+    /// steps bar.
     pub(super) fn live_screen(&mut self, ui: &mut Ui, snap: &Snapshot) {
         let playing = snap.playing.map(|i| {
             let left = snap
@@ -12,7 +16,97 @@ impl StreamItApp {
                 .map(|v| format!("{} left", view::fmt_mmss(v.duration.saturating_sub(v.position))));
             (i, left)
         });
-        self.columns(ui, 420.0, |app, ui| app.videos_panel(ui, snap, playing), |_, ui| activity(ui, snap));
+        self.columns(
+            ui,
+            400.0,
+            |app, ui| {
+                app.videos_panel(ui, snap, playing);
+                activity(ui, snap);
+            },
+            |app, ui| app.chat_panel(ui, snap),
+        );
+    }
+
+    /// The broadcast's live chat, newest at the bottom, and a reply box that posts as the
+    /// channel.
+    fn chat_panel(&mut self, ui: &mut Ui, snap: &Snapshot) {
+        let chat_id = snap.live.as_ref().and_then(|l| l.chat_id.clone());
+        theme::panel().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                theme::lbl(ui, "Live chat");
+                if let Some(b) = snap.broadcast.as_ref().filter(|_| !snap.simulation && chat_id.is_some()) {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.hyperlink_to(RichText::new("Open in YouTube ↗").size(14.0), view::chat_url(&b.id));
+                    });
+                }
+            });
+            ui.add_space(6.0);
+            let note = match (&chat_id, &snap.chat_error) {
+                (_, Some(e)) => Some((format!("Can’t read the chat: {e}"), theme::AMBER_SOFT)),
+                (None, None) if snap.live.is_none() => {
+                    Some(("The chat shows here once the service is prepared.".to_string(), theme::MUTED))
+                }
+                (None, None) => Some(("This broadcast has no live chat.".to_string(), theme::MUTED)),
+                (Some(_), None) if snap.chat.is_empty() => Some(("No messages yet.".to_string(), theme::MUTED)),
+                _ => None,
+            };
+            if let Some((text, color)) = note {
+                ui.add(egui::Label::new(RichText::new(text).size(14.0).color(color)).wrap());
+            }
+            egui::ScrollArea::vertical()
+                .max_height(CHAT_H)
+                .min_scrolled_height(CHAT_H)
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 12.0;
+                    for m in &snap.chat {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                let color = if m.role == ChatRole::Viewer { theme::TEXT } else { theme::BLUE_SOFT };
+                                ui.label(RichText::new(&m.author).font(theme::body_bold(14.0)).color(color));
+                                match m.role {
+                                    ChatRole::Owner => theme::chip(ui, "Channel", theme::BLUE_SOFT, theme::BLUE),
+                                    ChatRole::Moderator => theme::chip(ui, "Moderator", theme::BLUE_SOFT, theme::BLUE),
+                                    ChatRole::Viewer => ui.label(""),
+                                };
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let at = view::chat_time(&m.published);
+                                    ui.label(RichText::new(at).font(theme::mono(12.0)).color(theme::DIM));
+                                });
+                            });
+                            ui.add(egui::Label::new(RichText::new(&m.text).size(14.0).color(theme::SOFT)).wrap());
+                        });
+                    }
+                });
+            ui.add_space(8.0);
+            ui.separator();
+            ui.label(RichText::new("Reply as the channel").size(13.0).color(theme::MUTED));
+            let can = chat_id.is_some();
+            let mut send = false;
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 90.0).max(80.0);
+                let edit = egui::TextEdit::singleline(&mut self.chat_reply)
+                    .hint_text("Say something to everyone watching")
+                    .char_limit(CHAT_REPLY_MAX)
+                    .desired_width(w);
+                let r = ui.add_enabled(can, edit);
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    send = true;
+                }
+                let ready = can && !self.chat_reply.trim().is_empty();
+                if theme::button_enabled(ui, ready, "Send", Kind::Primary).clicked() {
+                    send = true;
+                }
+            });
+            if send && can && !self.chat_reply.trim().is_empty() {
+                let text = std::mem::take(&mut self.chat_reply);
+                self.send(Command::SendChat(text));
+            }
+        });
     }
 
     /// The service's videos with a Play button each. While one plays (`playing`, with the

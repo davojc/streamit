@@ -28,6 +28,56 @@ use tracing::{Instrument, info, warn};
 pub const POLL_EVERY: Duration = Duration::from_secs(2);
 /// How often YouTube's stream health is checked during a service (1 quota unit each).
 pub const STREAM_HEALTH_EVERY: Duration = Duration::from_secs(12);
+/// The live chat is read at most this often (5 quota units each, so about 1,800 an hour).
+pub const CHAT_EVERY: Duration = Duration::from_secs(10);
+/// After a chat read fails, the next try waits this long.
+pub const CHAT_RETRY: Duration = Duration::from_secs(30);
+
+/// Reads the selected broadcast's live chat while it has one (the health poll finds the
+/// chat with the viewer count) and sends the new messages to the engine.
+pub fn spawn_chat_poll(
+    yt: Arc<dyn Broadcasts>,
+    tx: mpsc::Sender<Command>,
+    snap: watch::Receiver<Snapshot>,
+) -> JoinHandle<()> {
+    tokio::spawn(
+        async move {
+            let mut chat: Option<String> = None;
+            let mut page: Option<String> = None;
+            loop {
+                let now = snap.borrow().live.as_ref().and_then(|l| l.chat_id.clone());
+                if now != chat {
+                    chat = now;
+                    page = None;
+                    if tx.send(Command::ChatRead { reset: true, messages: Vec::new(), error: None }).await.is_err() {
+                        return;
+                    }
+                }
+                let Some(id) = chat.clone() else {
+                    tokio::time::sleep(POLL_EVERY).await;
+                    continue;
+                };
+                let (read, wait) = match yt.chat_messages(&id, page.as_deref()).await {
+                    Ok(p) => {
+                        page = p.next_page.or(page);
+                        let read = Command::ChatRead { reset: false, messages: p.messages, error: None };
+                        (read, p.wait.max(CHAT_EVERY))
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "could not read the live chat");
+                        let read = Command::ChatRead { reset: false, messages: Vec::new(), error: Some(e.to_string()) };
+                        (read, CHAT_RETRY)
+                    }
+                };
+                if tx.send(read).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(wait).await;
+            }
+        }
+        .in_current_span(),
+    )
+}
 /// A poll with no answer in this time is a warning.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long startup waits for the network devices' first state before the engine's
@@ -721,11 +771,14 @@ pub fn spawn_health_poll(
                         }
                         // The viewer count and the chat, on the same beat (1 quota unit).
                         let id = snap.borrow().broadcast.as_ref().map(|b| b.id.clone());
+                        // A failed read keeps the last details, so the chat is not dropped.
                         let live = match id {
-                            Some(id) => probes.devices.yt.live_details(&id).await.ok(),
-                            None => None,
+                            Some(id) => probes.devices.yt.live_details(&id).await.ok().map(Some),
+                            None => Some(None),
                         };
-                        if tx.send(Command::LiveDetailsRead(live)).await.is_err() {
+                        if let Some(live) = live
+                            && tx.send(Command::LiveDetailsRead(live)).await.is_err()
+                        {
                             return;
                         }
                         stream_sent = true;
@@ -904,6 +957,40 @@ mod tests {
         let got: BTreeMap<_, _> = p.poll(0).await.into_iter().collect();
         assert!(matches!(got[&DeviceKind::YouTube], DeviceHealth::Warning(_)));
         assert!(matches!(got[&DeviceKind::VideoHub], DeviceHealth::Down(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_poll_reads_the_chat_it_is_given_and_starts_afresh_on_another() {
+        let (d, _log, h) = fake_devices();
+        let msg = |id: &str| devices::ChatMessage {
+            id: id.into(),
+            author: "Ruth".into(),
+            role: devices::ChatRole::Viewer,
+            text: "Morning".into(),
+            published: String::new(),
+        };
+        h.yt.push_chat(msg("a"));
+        let (snap_tx, snap_rx) = watch::channel(Snapshot::default());
+        let (tx, mut rx) = mpsc::channel(8);
+        let poll = spawn_chat_poll(d.yt.clone(), tx, snap_rx);
+        let live = |id: &str| Some(devices::LiveDetails { viewers: None, chat_id: Some(id.into()) });
+        snap_tx.send_modify(|s| s.live = live("chat-1"));
+        let mut next = async || rx.recv().await.unwrap();
+        assert!(matches!(next().await, Command::ChatRead { reset: true, .. }));
+        match next().await {
+            Command::ChatRead { reset: false, messages, error: None } => assert_eq!(messages, vec![msg("a")]),
+            other => panic!("{other:?}"),
+        }
+        h.yt.push_chat(msg("b"));
+        match next().await {
+            Command::ChatRead { messages, .. } => assert_eq!(messages, vec![msg("b")], "only the new ones"),
+            other => panic!("{other:?}"),
+        }
+        snap_tx.send_modify(|s| s.live = live("chat-2"));
+        h.yt.fail_next("chat_messages");
+        assert!(matches!(next().await, Command::ChatRead { reset: true, .. }));
+        assert!(matches!(next().await, Command::ChatRead { error: Some(_), .. }));
+        poll.abort();
     }
 
     #[tokio::test]
