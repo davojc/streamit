@@ -11,10 +11,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use streamit_blockproto::{Block, Link, OnBlock, OnReset};
 pub use streamit_blockproto::{Timings, parse_blocks};
-use streamit_core::devices::{DeviceError, Result, Router};
+use streamit_core::devices::{DeviceError, LabelKind, Result, Router};
 
 const ROUTING: &str = "VIDEO OUTPUT ROUTING";
-const LABELS: &str = "INPUT LABELS";
+const INPUT_LABELS: &str = "INPUT LABELS";
+const OUTPUT_LABELS: &str = "OUTPUT LABELS";
 const DEVICE: &str = "VIDEOHUB DEVICE";
 
 /// The wire form of a route command. Arguments are 1-based; the output is 0-based.
@@ -29,6 +30,17 @@ pub fn format_route(out1: u16, in1: u16) -> String {
     )
 }
 
+/// The wire form of a label change. `n` is 1-based; the protocol's is 0-based. A label is
+/// one line, so line breaks become spaces.
+pub fn format_label(kind: LabelKind, n: u16, text: &str) -> String {
+    let block = match kind {
+        LabelKind::Input => INPUT_LABELS,
+        LabelKind::Output => OUTPUT_LABELS,
+    };
+    let text = text.replace(['\r', '\n'], " ");
+    format!("{block}:\n{} {}\n\n", n.saturating_sub(1), text.trim())
+}
+
 pub struct VideoHub {
     /// 1-based output -> 1-based input.
     table: Arc<Mutex<HashMap<u16, u16>>>,
@@ -36,11 +48,33 @@ pub struct VideoHub {
     link: Link,
 }
 
-/// The input labels (1-based) and how many inputs the VideoHub says it has.
+/// The input and output labels (1-based) and how many of each the VideoHub says it has.
 #[derive(Default)]
 struct Labels {
-    by_input: HashMap<u16, String>,
-    inputs: u16,
+    inputs: HashMap<u16, String>,
+    outputs: HashMap<u16, String>,
+    input_count: u16,
+    output_count: u16,
+}
+
+impl Labels {
+    fn map(&mut self, kind: LabelKind) -> &mut HashMap<u16, String> {
+        match kind {
+            LabelKind::Input => &mut self.inputs,
+            LabelKind::Output => &mut self.outputs,
+        }
+    }
+
+    /// One entry per input or output (as many as the VideoHub says it has, or up to the
+    /// highest labelled one); "" where one has no label.
+    fn list(&self, kind: LabelKind) -> Vec<String> {
+        let (map, count) = match kind {
+            LabelKind::Input => (&self.inputs, self.input_count),
+            LabelKind::Output => (&self.outputs, self.output_count),
+        };
+        let count = map.keys().copied().max().unwrap_or(0).max(count);
+        (1..=count).map(|i| map.get(&i).cloned().unwrap_or_default()).collect()
+    }
 }
 
 impl VideoHub {
@@ -56,7 +90,8 @@ impl VideoHub {
         let (t, l) = (table.clone(), labels.clone());
         let on_block: OnBlock = Arc::new(move |b: &Block| match b.name.as_str() {
             ROUTING => apply_routing(&t, b),
-            LABELS => apply_labels(&l, b),
+            INPUT_LABELS => apply_labels(&l, LabelKind::Input, b),
+            OUTPUT_LABELS => apply_labels(&l, LabelKind::Output, b),
             DEVICE => apply_device(&l, b),
             _ => {}
         });
@@ -90,30 +125,49 @@ impl Router for VideoHub {
         self.link.command(format_route(output, input), &format!("route {output} <- {input}")).await
     }
 
-    /// One entry per input (as many as the VideoHub says it has, or up to the highest
-    /// labelled one); "" where an input has no label.
     async fn input_labels(&self) -> Result<Vec<String>> {
         self.link.ensure_usable()?;
-        let l = self.labels.lock().unwrap_or_else(|e| e.into_inner());
-        let count = l.by_input.keys().copied().max().unwrap_or(0).max(l.inputs);
-        Ok((1..=count).map(|i| l.by_input.get(&i).cloned().unwrap_or_default()).collect())
+        Ok(self.labels.lock().unwrap_or_else(|e| e.into_inner()).list(LabelKind::Input))
+    }
+
+    async fn output_labels(&self) -> Result<Vec<String>> {
+        self.link.ensure_usable()?;
+        Ok(self.labels.lock().unwrap_or_else(|e| e.into_inner()).list(LabelKind::Output))
+    }
+
+    /// Sends the new label and keeps it once the VideoHub ACKs. (The VideoHub also sends the
+    /// changed label block to every client, which says the same.)
+    async fn set_label(&self, kind: LabelKind, n: u16, text: &str) -> Result<()> {
+        if n == 0 {
+            return Err(DeviceError::Other("inputs and outputs are numbered from 1".into()));
+        }
+        let what = format!("{kind:?} {n} label").to_lowercase();
+        self.link.command(format_label(kind, n, text), &what).await?;
+        let text = text.replace(['\r', '\n'], " ").trim().to_string();
+        self.labels.lock().unwrap_or_else(|e| e.into_inner()).map(kind).insert(n, text);
+        Ok(())
     }
 }
 
-fn apply_labels(labels: &Mutex<Labels>, block: &Block) {
+fn apply_labels(labels: &Mutex<Labels>, kind: LabelKind, block: &Block) {
     let mut l = labels.lock().unwrap_or_else(|e| e.into_inner());
     for line in &block.lines {
         let (n, text) = line.split_once(' ').unwrap_or((line.as_str(), ""));
         if let Ok(n) = n.trim().parse::<u16>() {
-            l.by_input.insert(n.saturating_add(1), text.trim().to_string());
+            l.map(kind).insert(n.saturating_add(1), text.trim().to_string());
         }
     }
 }
 
 fn apply_device(labels: &Mutex<Labels>, block: &Block) {
+    let mut l = labels.lock().unwrap_or_else(|e| e.into_inner());
     for line in &block.lines {
-        if let Some(n) = line.strip_prefix("Video inputs:").and_then(|n| n.trim().parse::<u16>().ok()) {
-            labels.lock().unwrap_or_else(|e| e.into_inner()).inputs = n;
+        let count = |prefix: &str| line.strip_prefix(prefix).and_then(|n| n.trim().parse::<u16>().ok());
+        if let Some(n) = count("Video inputs:") {
+            l.input_count = n;
+        }
+        if let Some(n) = count("Video outputs:") {
+            l.output_count = n;
         }
     }
 }

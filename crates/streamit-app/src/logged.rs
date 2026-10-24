@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use streamit_core::config::AudioSourceId;
 use streamit_core::devices::{
-    BroadcastCheck, BroadcastSummary, Broadcasts, Counter, Encoder, EncoderStatus, Fix, Health, Phase, Player,
-    PlayerEvent, Result, Router, StreamSwitcher, Switcher,
+    BroadcastCheck, BroadcastSummary, Broadcasts, Counter, Encoder, EncoderStatus, Fix, Health, LabelKind, Phase,
+    Player, PlayerEvent, Result, Router, StreamSwitcher, Switcher,
 };
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -108,6 +108,12 @@ impl<T: Router + ?Sized> Router for Logged<T> {
     }
     async fn input_labels(&self) -> Result<Vec<String>> {
         self.inner.input_labels().await
+    }
+    async fn output_labels(&self) -> Result<Vec<String>> {
+        self.inner.output_labels().await
+    }
+    async fn set_label(&self, kind: LabelKind, n: u16, text: &str) -> Result<()> {
+        done(self.device, format!("set_label({kind:?}, {n}, {text:?})"), self.inner.set_label(kind, n, text).await)
     }
 }
 

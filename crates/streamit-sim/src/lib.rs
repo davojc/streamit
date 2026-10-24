@@ -127,6 +127,9 @@ pub struct SimWorld {
     pub input8_audio_on: bool,
     pub routes: BTreeMap<u16, u16>,
     pub pending_routes: BTreeMap<u16, PendingRoute>,
+    /// The pretend VideoHub's input and output labels (index 0 is number 1).
+    pub input_labels: Vec<String>,
+    pub output_labels: Vec<String>,
     pub encoder: EncoderStatus,
     /// When a Connecting encoder starts Streaming.
     pub encoder_at: Option<Instant>,
@@ -168,6 +171,8 @@ impl SimWorld {
             input8_audio_on: false,
             routes,
             pending_routes: BTreeMap::new(),
+            input_labels: switcher::sim_input_labels(),
+            output_labels: vec![String::new(); switcher::SIM_PORTS],
             encoder: EncoderStatus::Idle,
             encoder_at: None,
             health_at: None,

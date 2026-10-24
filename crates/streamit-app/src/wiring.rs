@@ -19,7 +19,7 @@ use streamit_core::devices::{
 };
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
 use streamit_core::golive::Stage;
-use streamit_core::routing::{Target, TargetRead};
+use streamit_core::routing::{RoutingRead, Target, TargetRead};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{Instrument, info, warn};
@@ -577,7 +577,7 @@ impl Probes {
     /// For each routing target: the router output feeding each destination (from `c`), the
     /// input on each (`None` when not fed or unreadable) and, for the ATEMs, their program
     /// and preview. Also the VideoHub's input labels.
-    pub async fn read_routing(&self, c: &Config) -> (Vec<String>, [TargetRead; 3]) {
+    pub async fn read_routing(&self, c: &Config) -> (Vec<String>, Vec<String>, [TargetRead; 3]) {
         let d = &self.devices;
         let mut reads: [TargetRead; 3] = Default::default();
         for t in Target::ALL {
@@ -593,7 +593,8 @@ impl Probes {
             };
             reads[t.index()] = TargetRead { outputs, dests, program, preview };
         }
-        (d.hub.input_labels().await.unwrap_or_default(), reads)
+        let inputs = d.hub.input_labels().await.unwrap_or_default();
+        (inputs, d.hub.output_labels().await.unwrap_or_default(), reads)
     }
 
     /// One read per device, all at once.
@@ -650,8 +651,9 @@ pub fn spawn_health_poll(
                 let c = config.read().unwrap_or_else(|e| e.into_inner()).clone();
                 let routing = probes.read_routing(&c).await;
                 if last_routing.as_ref() != Some(&routing) {
-                    let (labels, targets) = routing.clone();
-                    if tx.send(Command::RoutingRead { labels, targets }).await.is_err() {
+                    let (labels, output_labels, targets) = routing.clone();
+                    let read = RoutingRead { labels, output_labels, targets };
+                    if tx.send(Command::RoutingRead(Box::new(read))).await.is_err() {
                         return;
                     }
                     last_routing = Some(routing);
@@ -915,8 +917,8 @@ mod tests {
         c.multiview.outputs = vec![37, 0, 39, 40];
         c.videohub.input8_output = 11;
         let p = Probes::new(d, Late::new("x"), Late::new("x"));
-        let (labels, reads) = p.read_routing(&c).await;
-        assert!(labels.is_empty());
+        let (labels, output_labels, reads) = p.read_routing(&c).await;
+        assert!(labels.is_empty() && output_labels.is_empty());
         let mv = &reads[Target::MultiView.index()];
         assert_eq!(mv.dests, vec![Some(6), None, Some(12), None], "output 40 reads 0: nothing routed");
         assert_eq!(mv.program, None);

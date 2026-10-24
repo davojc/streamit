@@ -505,20 +505,27 @@ impl StreamItApp {
     /// Writes a routing target's presets to the shared settings and the file at once (like
     /// the cue list, Save does not cover them), and gives them to the engine for the deck.
     fn save_presets(&mut self, target: Target, presets: Vec<streamit_core::routing::Preset>) {
+        let p = presets.clone();
+        self.save_routing(target, move |r| r.presets = p.clone());
+        self.send(Command::SetPresets(target, presets));
+    }
+
+    /// Changes a routing target's config in the shared settings, the draft and the file at
+    /// once: the Routing tab saves as it goes (Save in Settings does not cover it).
+    fn save_routing(&mut self, target: Target, change: impl Fn(&mut streamit_core::routing::RoutingConfig)) {
         let c = {
             let mut shared = self.config.write().unwrap_or_else(|e| e.into_inner());
-            shared.routing_mut(target).presets = presets.clone();
+            change(shared.routing_mut(target));
             shared.clone()
         };
-        self.draft.routing_mut(target).presets = presets.clone();
-        self.send(Command::SetPresets(target, presets));
+        change(self.draft.routing_mut(target));
         if !self.file.writable {
             self.notice = Some("Not saved: the settings file could not be backed up (see the log).".into());
             return;
         }
         if let Err(e) = c.save(&self.file.path) {
-            warn!("saving the MultiView presets: {e:#}");
-            self.notice = Some(format!("Could not save the presets: {e:#}"));
+            warn!("saving the {} routing: {e:#}", target.name());
+            self.notice = Some(format!("Could not save the {} routing: {e:#}", target.name()));
         }
     }
 

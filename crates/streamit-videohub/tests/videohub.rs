@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
-use streamit_core::devices::{DeviceError, Router};
-use streamit_videohub::{Timings, VideoHub, format_route, parse_blocks};
+use streamit_core::devices::{DeviceError, LabelKind, Router};
+use streamit_videohub::{Timings, VideoHub, format_label, format_route, parse_blocks};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -288,4 +288,43 @@ async fn input_labels_before_the_dump_are_disconnected() {
     let (_l, addr) = fake().await;
     let hub = VideoHub::connect_with(addr, fast()).await.unwrap();
     assert!(matches!(hub.input_labels().await, Err(DeviceError::Disconnected(_))));
+}
+
+#[test]
+fn format_label_is_zero_based_and_one_line() {
+    assert_eq!(format_label(LabelKind::Input, 3, "Cam 3"), "INPUT LABELS:\n2 Cam 3\n\n");
+    assert_eq!(format_label(LabelKind::Output, 37, " MV top\nleft "), "OUTPUT LABELS:\n36 MV top left\n\n");
+}
+
+#[tokio::test]
+async fn output_labels_are_read_and_labels_can_be_renamed() {
+    let (l, addr) = fake().await;
+    let hub = VideoHub::connect_with(addr, fast()).await.unwrap();
+    let (mut s, _) = l.accept().await.unwrap();
+    s.write_all(FIXTURE.as_bytes()).await.unwrap();
+    wait_route(&hub, 11, 8).await;
+    let outputs = hub.output_labels().await.unwrap();
+    assert_eq!(outputs.len(), 40, "Video outputs: 40");
+    assert_eq!(outputs[10], "Stream ATEM 8");
+
+    // Rename input 2: the command goes out, the ACK comes back, and the label is kept.
+    let rename = tokio::spawn(async move {
+        let msg = read_msg(&mut s).await;
+        s.write_all(b"ACK\n\n").await.unwrap();
+        (msg, s)
+    });
+    hub.set_label(LabelKind::Input, 2, "Pulpit camera").await.unwrap();
+    let (msg, mut s) = rename.await.unwrap();
+    assert_eq!(msg, "INPUT LABELS:\n1 Pulpit camera\n\n");
+    assert_eq!(hub.input_labels().await.unwrap()[1], "Pulpit camera");
+
+    // A NAK leaves the label as it was.
+    let refuse = tokio::spawn(async move {
+        let _ = read_msg(&mut s).await;
+        s.write_all(b"NAK\n\n").await.unwrap();
+        s
+    });
+    assert!(hub.set_label(LabelKind::Output, 11, "Something else").await.is_err());
+    let _s = refuse.await.unwrap();
+    assert_eq!(hub.output_labels().await.unwrap()[10], "Stream ATEM 8");
 }

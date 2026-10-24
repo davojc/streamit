@@ -38,6 +38,13 @@ pub trait StreamSwitcher: Switcher {
     async fn set_audio_on(&self, src: AudioSourceId, on: bool) -> Result<()>;
 }
 
+/// A VideoHub label: an input's or an output's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LabelKind {
+    Input,
+    Output,
+}
+
 #[async_trait]
 pub trait Router: Send + Sync {
     async fn route_of(&self, output: u16) -> Result<u16>;
@@ -45,6 +52,15 @@ pub trait Router: Send + Sync {
     /// The input labels the router reports; index 0 is input 1.
     async fn input_labels(&self) -> Result<Vec<String>> {
         Ok(Vec::new())
+    }
+    /// The output labels the router reports; index 0 is output 1.
+    async fn output_labels(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    /// Renames input or output `n` (1-based) on the router.
+    async fn set_label(&self, kind: LabelKind, n: u16, text: &str) -> Result<()> {
+        let _ = (kind, n, text);
+        Err(DeviceError::Refused("this router cannot rename its inputs and outputs".into()))
     }
 }
 

@@ -2,6 +2,7 @@
 //! four views and the inputs of the two ATEMs. StreamIt controls none of them directly for
 //! this: changing what a destination shows is a VideoHub route to the output feeding it.
 //! Each target has eight presets that save the input on each destination and put them back.
+use crate::devices::LabelKind;
 use serde::{Deserialize, Serialize};
 
 /// What the VideoHub feeds.
@@ -182,6 +183,8 @@ impl TargetState {
 pub struct RoutingState {
     /// The VideoHub's input labels; index 0 is input 1. Empty until the VideoHub answers.
     pub labels: Vec<String>,
+    /// The VideoHub's output labels; index 0 is output 1.
+    pub output_labels: Vec<String>,
     pub targets: [TargetState; 3],
 }
 
@@ -201,8 +204,55 @@ impl RoutingState {
 
     /// The input's VideoHub label, if it has one.
     pub fn own_label(&self, input: u16) -> Option<&str> {
-        input.checked_sub(1).and_then(|i| self.labels.get(i as usize)).map(|l| l.trim()).filter(|l| !l.is_empty())
+        own(&self.labels, input)
     }
+
+    /// The output's VideoHub label, if it has one.
+    pub fn own_output_label(&self, output: u16) -> Option<&str> {
+        own(&self.output_labels, output)
+    }
+
+    /// An output as the lists show it: "37 · MV top left", or "Output 37".
+    pub fn output_name(&self, output: u16) -> String {
+        self.own_output_label(output).map_or_else(|| format!("Output {output}"), |l| format!("{output} · {l}"))
+    }
+
+    /// The labels of `kind`, one per input or output.
+    pub fn labels_of(&self, kind: LabelKind) -> &[String] {
+        match kind {
+            LabelKind::Input => &self.labels,
+            LabelKind::Output => &self.output_labels,
+        }
+    }
+
+    /// Sets label `n` (1-based) of `kind`, growing the list if it is shorter.
+    pub fn set_label(&mut self, kind: LabelKind, n: u16, text: &str) {
+        let list = match kind {
+            LabelKind::Input => &mut self.labels,
+            LabelKind::Output => &mut self.output_labels,
+        };
+        let Some(i) = n.checked_sub(1).map(usize::from) else { return };
+        if list.len() <= i {
+            list.resize(i + 1, String::new());
+        }
+        list[i] = text.trim().to_string();
+    }
+
+    /// The destinations (across every target) fed by router output `output`, as short
+    /// names (TL, S2, H5…).
+    pub fn fed_by(&self, output: u16) -> Vec<(Target, usize)> {
+        Target::ALL
+            .into_iter()
+            .flat_map(|t| {
+                let outs = self.target(t).outputs.clone();
+                outs.into_iter().enumerate().filter(move |&(_, o)| o == output && o != 0).map(move |(i, _)| (t, i))
+            })
+            .collect()
+    }
+}
+
+fn own(labels: &[String], n: u16) -> Option<&str> {
+    n.checked_sub(1).and_then(|i| labels.get(i as usize)).map(|l| l.trim()).filter(|l| !l.is_empty())
 }
 
 /// One target as read from the devices (the health poll sends these).
@@ -212,6 +262,14 @@ pub struct TargetRead {
     pub dests: Vec<Option<u16>>,
     pub program: Option<u16>,
     pub preview: Option<u16>,
+}
+
+/// Everything one routing read found (the health poll sends these to the engine).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoutingRead {
+    pub labels: Vec<String>,
+    pub output_labels: Vec<String>,
+    pub targets: [TargetRead; 3],
 }
 
 /// `presets` with `p` in its slot (replacing what was there), in slot order.
@@ -322,6 +380,24 @@ mod tests {
         assert_eq!(preset_name("  Sermon  ", 4), "Sermon");
         assert_eq!(preset_name("   ", 4), "Preset 4");
         assert_eq!(preset_name(&"x".repeat(40), 1).chars().count(), PRESET_NAME_MAX);
+    }
+
+    #[test]
+    fn output_names_and_what_each_output_feeds() {
+        let mut r = RoutingState { output_labels: vec![String::new(); 40], ..RoutingState::default() };
+        r.targets[0].outputs = vec![37, 38, 39, 40];
+        r.targets[1].outputs = vec![1, 2, 0, 0, 0, 0, 0, 11];
+        r.targets[2].outputs = vec![37, 0];
+        r.set_label(LabelKind::Output, 37, " MV top left ");
+        assert_eq!(r.output_name(37), "37 · MV top left");
+        assert_eq!(r.output_name(5), "Output 5");
+        assert_eq!(r.fed_by(37), vec![(Target::MultiView, 0), (Target::ScreensAtem, 0)]);
+        assert_eq!(r.fed_by(11), vec![(Target::StreamAtem, 7)]);
+        assert!(r.fed_by(0).is_empty());
+        r.set_label(LabelKind::Input, 45, "Far");
+        assert_eq!(r.labels.len(), 45, "grows to fit");
+        assert_eq!(r.label(45), "Far");
+        assert_eq!(r.labels_of(LabelKind::Output)[36], "MV top left");
     }
 
     #[test]

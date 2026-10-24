@@ -18,12 +18,12 @@
 //! Broadcast, Fix, Refresh and device health. Every ignored command is logged at `info`.
 use crate::audio::LiveLevels;
 use crate::config::Config;
-use crate::devices::{self, BroadcastCheck, BroadcastSummary, DeviceError, Devices, Fix, Phase};
+use crate::devices::{self, BroadcastCheck, BroadcastSummary, DeviceError, Devices, Fix, LabelKind, Phase};
 use crate::end::{EndOutcome, end_service};
 use crate::golive::{self, CountdownOutcome, CountdownReport, Readiness, Stage, Stage0Report, T0Error};
 use crate::recovery::{self, Assessment, Offer};
 use crate::rollin::{self, Cue, CueList, CueState, RollinOutcome, RollinReport};
-use crate::routing::{Preset, RoutingState, Target, TargetRead, TargetState, locked};
+use crate::routing::{Preset, RoutingRead, RoutingState, Target, TargetState, locked};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,11 +77,14 @@ pub enum Command {
     RecallPreset(Target, u8),
     /// Replace a target's presets (after a save or a clear in the window).
     SetPresets(Target, Vec<Preset>),
-    /// What the VideoHub and the ATEMs report for routing, from the health poll.
-    RoutingRead {
-        labels: Vec<String>,
-        targets: [TargetRead; 3],
+    /// Rename input or output `n` (1-based) on the VideoHub.
+    SetLabel {
+        kind: LabelKind,
+        n: u16,
+        text: String,
     },
+    /// What the VideoHub and the ATEMs report for routing, from the health poll.
+    RoutingRead(Box<RoutingRead>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -674,8 +677,28 @@ impl Engine {
                 info!(target = target.name(), count = presets.len(), "routing presets replaced");
                 self.set(|s| s.routing.target_mut(target).presets = presets);
             }
-            Command::RoutingRead { labels, targets } => {
-                let (labels, targets) = (labels.clone(), targets.clone());
+            Command::SetLabel { kind, n, text } => {
+                let (kind, n, text) = (*kind, *n, text.clone());
+                if n == 0 {
+                    return self.ignore(&cmd, "inputs and outputs are numbered from 1");
+                }
+                info!(?kind, n, text = %text, "renaming on the VideoHub");
+                let (hub, snap) = (self.d.hub.clone(), self.snap.clone());
+                tokio::spawn(
+                    async move {
+                        match hub.set_label(kind, n, &text).await {
+                            Ok(()) => snap.send_modify(|s| s.routing.set_label(kind, n, &text)),
+                            Err(e) => {
+                                let what = format!("{kind:?} {n}").to_lowercase();
+                                set_warning(&snap, format!("VideoHub: could not rename {what}: {e}"));
+                            }
+                        }
+                    }
+                    .in_current_span(),
+                );
+            }
+            Command::RoutingRead(read) => {
+                let RoutingRead { labels, output_labels, targets } = (**read).clone();
                 self.set(|s| {
                     for (state, read) in s.routing.targets.iter_mut().zip(targets) {
                         state.outputs = read.outputs;
@@ -685,6 +708,9 @@ impl Engine {
                     }
                     if !labels.is_empty() {
                         s.routing.labels = labels;
+                    }
+                    if !output_labels.is_empty() {
+                        s.routing.output_labels = output_labels;
                     }
                 });
             }
@@ -1479,6 +1505,7 @@ fn set_warning(snap: &Shared, msg: String) {
 fn routing_from(c: &Config) -> RoutingState {
     RoutingState {
         labels: Vec::new(),
+        output_labels: Vec::new(),
         targets: Target::ALL.map(|t| TargetState {
             outputs: c.routing_outputs(t),
             dests: vec![None; t.size()],
@@ -1526,6 +1553,7 @@ mod tests {
     use crate::fakes::{Call, CallLog, FakeHandles, fake_devices};
     use crate::golive::Readiness;
     use crate::rollin::Destination;
+    use crate::routing::TargetRead;
     use std::path::PathBuf;
     use std::sync::Mutex;
     use tokio::time::{sleep, timeout};
@@ -2997,7 +3025,7 @@ mod tests {
         dests.resize(8, None);
         targets[1] =
             TargetRead { outputs: vec![1, 2, 3, 4, 0, 0, 0, OUT], dests, program: Some(program), preview: None };
-        Command::RoutingRead { labels: vec![], targets }
+        Command::RoutingRead(Box::new(RoutingRead { labels: vec![], output_labels: vec![], targets }))
     }
 
     fn hub_routes(log: &CallLog) -> Vec<Call> {
@@ -3113,8 +3141,8 @@ mod tests {
         let mut e = Engine::spawn(d, c);
         assert_eq!(snap(&e).routing.target(Target::ScreensAtem).presets, vec![preset(2, &[1, 1])]);
         let mut first = read([1; 4], [1; 4], 1);
-        if let Command::RoutingRead { labels, .. } = &mut first {
-            *labels = vec!["Cam 1".into()];
+        if let Command::RoutingRead(read) = &mut first {
+            read.labels = vec!["Cam 1".into()];
         }
         send(&e, first).await;
         until(&mut e, "labels", |s| s.routing.label(1) == "Cam 1").await;
@@ -3124,5 +3152,16 @@ mod tests {
         assert_eq!(s.routing.label(1), "Cam 1");
         assert_eq!(s.routing.target(Target::StreamAtem).program, Some(3));
         assert!(s.routing.target(Target::StreamAtem).on_air(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn set_label_renames_on_the_videohub_and_shows_it() {
+        let (d, _log, _h) = rig();
+        let mut e = Engine::spawn(d, rt_cfg());
+        // The fake router cannot rename: the refusal is a warning and nothing changes.
+        send(&e, Command::SetLabel { kind: LabelKind::Output, n: 37, text: "MV top left".into() }).await;
+        let s = until(&mut e, "a warning", |s| s.last_warning.as_deref().is_some_and(|w| w.contains("rename"))).await;
+        assert!(s.last_warning.unwrap().contains("output 37"));
+        assert_eq!(s.routing.own_output_label(37), None);
     }
 }

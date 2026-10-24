@@ -3,7 +3,7 @@ use crate::{Fault, Mix, PendingRoute, SimHandle, SimWorld, SwitcherState};
 use async_trait::async_trait;
 use std::time::Duration;
 use streamit_core::config::AudioSourceId;
-use streamit_core::devices::{DeviceError, Result, Router, StreamSwitcher, Switcher};
+use streamit_core::devices::{DeviceError, LabelKind, Result, Router, StreamSwitcher, Switcher};
 use streamit_core::engine::DeviceKind;
 use tokio::time::Instant;
 
@@ -145,8 +145,13 @@ const SIM_LABELS: [&str; 10] = [
     "Lectern laptop",
     "Hall camera",
 ];
-/// How many inputs the pretend VideoHub has.
-const SIM_INPUTS: usize = 40;
+/// How many inputs and outputs the pretend VideoHub has.
+pub(crate) const SIM_PORTS: usize = 40;
+
+/// The pretend VideoHub's input labels at the start.
+pub(crate) fn sim_input_labels() -> Vec<String> {
+    (0..SIM_PORTS).map(|i| SIM_LABELS.get(i).map_or_else(String::new, |l| l.to_string())).collect()
+}
 
 #[derive(Clone)]
 pub struct SimRouter {
@@ -177,8 +182,31 @@ impl Router for SimRouter {
     }
 
     async fn input_labels(&self) -> Result<Vec<String>> {
-        self.sim.lock().check_plugged(DeviceKind::VideoHub)?;
-        Ok((0..SIM_INPUTS).map(|i| SIM_LABELS.get(i).map_or_else(String::new, |l| l.to_string())).collect())
+        let w = self.sim.lock();
+        w.check_plugged(DeviceKind::VideoHub)?;
+        Ok(w.input_labels.clone())
+    }
+
+    async fn output_labels(&self) -> Result<Vec<String>> {
+        let w = self.sim.lock();
+        w.check_plugged(DeviceKind::VideoHub)?;
+        Ok(w.output_labels.clone())
+    }
+
+    async fn set_label(&self, kind: LabelKind, n: u16, text: &str) -> Result<()> {
+        let mut w = self.sim.lock();
+        w.check_plugged(DeviceKind::VideoHub)?;
+        let labels = match kind {
+            LabelKind::Input => &mut w.input_labels,
+            LabelKind::Output => &mut w.output_labels,
+        };
+        match n.checked_sub(1).and_then(|i| labels.get_mut(i as usize)) {
+            Some(l) => {
+                *l = text.trim().to_string();
+                Ok(())
+            }
+            None => Err(DeviceError::Refused(format!("there is no {kind:?} {n}").to_lowercase())),
+        }
     }
 }
 

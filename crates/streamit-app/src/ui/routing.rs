@@ -4,12 +4,15 @@
 //! under them, and dropping an input on a destination routes the VideoHub output feeding
 //! it. What the destinations show always comes from the VideoHub. Changing an ATEM input
 //! that is on program asks first.
-use super::{Section, StreamItApp, Tab};
+use super::StreamItApp;
 use crate::theme::{self, Kind};
 use eframe::egui::{self, Align, Align2, Color32, Layout, Order, Rect, RichText, Sense, Stroke, Ui, vec2};
+use std::collections::HashMap;
+use streamit_core::devices::LabelKind;
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
 use streamit_core::routing::{
-    PRESET_SLOTS, Preset, RoutingState, Target, TargetState, locked, preset_name, with_preset, without_preset,
+    PRESET_SLOTS, Preset, RoutingState, STREAM_VIDEO_INPUT, Target, TargetState, locked, preset_name, with_preset,
+    without_preset,
 };
 use tracing::info;
 
@@ -30,6 +33,8 @@ const COL_W: f32 = 230.0;
 const GAP: f32 = 28.0;
 const CHIP_H: f32 = 24.0;
 const SLOT_H: f32 = 64.0;
+/// A row on the VideoHub sub-tab.
+const LABEL_ROW_H: f32 = 24.0;
 const MV_TILE_MAX_W: f32 = 290.0;
 const ATEM_TILE_MAX_W: f32 = 200.0;
 
@@ -49,9 +54,22 @@ struct OnAir {
 /// A preset to recall: its target, its slot and the routes it needs.
 type Recall = (Target, u8, Vec<(usize, u16)>);
 
+/// The sub-tabs besides the three targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Extra {
+    /// Rename the VideoHub's inputs and outputs.
+    VideoHub,
+    /// Which router output feeds each destination.
+    Config,
+}
+
 /// The window's own routing state: nothing here is saved.
 pub(super) struct RtUi {
     target: Target,
+    /// The VideoHub or Config sub-tab, when one is open instead of a target.
+    extra: Option<Extra>,
+    /// Labels being typed on the VideoHub sub-tab, until sent or dropped.
+    drafts: HashMap<(LabelKind, u16), String>,
     /// An input clicked (rather than dragged): clicking a destination routes it there.
     picked: Option<u16>,
     /// Save preset was pressed: the next slot clicked is saved.
@@ -69,6 +87,8 @@ impl Default for RtUi {
     fn default() -> Self {
         Self {
             target: Target::MultiView,
+            extra: None,
+            drafts: HashMap::new(),
             picked: None,
             saving: false,
             naming: None,
@@ -111,9 +131,18 @@ impl StreamItApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Routing").font(theme::heading_font(30.0)));
             ui.add_space(12.0);
+            let extra = self.routes_ui.extra;
             for t in Target::ALL {
-                if theme::tab(ui, t.name(), t == target, false).clicked() && t != target {
+                if theme::tab(ui, t.name(), extra.is_none() && t == target, false).clicked()
+                    && (t != target || extra.is_some())
+                {
                     self.routes_ui = RtUi { target: t, ..RtUi::default() };
+                }
+            }
+            ui.add_space(8.0);
+            for (e, name) in [(Extra::VideoHub, "VideoHub"), (Extra::Config, "Config")] {
+                if theme::tab(ui, name, extra == Some(e), false).clicked() && extra != Some(e) {
+                    self.routes_ui = RtUi { target, extra: Some(e), ..RtUi::default() };
                 }
             }
             ui.add_space(12.0);
@@ -127,16 +156,19 @@ impl StreamItApp {
             ui.label(RichText::new(text).size(14.0).color(theme::SOFT));
         });
         ui.add_space(12.0);
+        match self.routes_ui.extra {
+            Some(Extra::VideoHub) => return self.videohub_page(ui, snap),
+            Some(Extra::Config) => return self.config_page(ui, snap),
+            None => {}
+        }
         if state.outputs.iter().all(|&o| o == 0) {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(format!("Set which router output feeds the {} first.", target.name()))
                         .color(theme::AMBER_SOFT),
                 );
-                if theme::button(ui, "Open Settings", Kind::Plain).clicked() {
-                    self.tab = Tab::Settings;
-                    self.section = Section::Equipment;
-                    self.scroll_to = Some(Section::Equipment);
+                if theme::button(ui, "Open Config", Kind::Plain).clicked() {
+                    self.routes_ui.extra = Some(Extra::Config);
                 }
             });
             ui.add_space(12.0);
@@ -641,6 +673,200 @@ impl StreamItApp {
     }
 }
 
+// ---------------------------------------------------------------- VideoHub and Config
+
+/// How many inputs or outputs to list: as many as the VideoHub has labels for, else 40.
+fn port_count(labels: &[String]) -> u16 {
+    if labels.is_empty() { DEFAULT_INPUTS } else { labels.len() as u16 }
+}
+
+/// What a label field does when it loses focus: send the typed name if it changed, or drop
+/// it (Escape, or nothing changed).
+pub(super) fn label_to_send(typed: &str, current: &str, escaped: bool) -> Option<String> {
+    let typed = typed.trim();
+    (!escaped && typed != current.trim()).then(|| typed.to_string())
+}
+
+impl StreamItApp {
+    /// Rename the VideoHub's inputs and outputs. A name goes to the VideoHub when its field
+    /// loses focus (Enter or a click elsewhere); Escape puts it back.
+    fn videohub_page(&mut self, ui: &mut Ui, snap: &Snapshot) {
+        let routing = &snap.routing;
+        theme::panel().inner_margin(20).show(ui, |ui| {
+            theme::lbl(ui, "VideoHub labels");
+            ui.label(
+                RichText::new(
+                    "The names the VideoHub shows on its front panel and in Videohub Setup. Change one and press \
+                     Enter (or click away): it goes to the VideoHub straight away, and StreamIt uses the new name \
+                     everywhere. Escape puts it back.",
+                )
+                .color(theme::SOFT),
+            );
+            ui.add_space(12.0);
+            let half = (ui.available_width() - GAP) / 2.0;
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = GAP;
+                for (kind, title, sub) in
+                    [(LabelKind::Input, "Inputs", "what comes in"), (LabelKind::Output, "Outputs", "what it feeds")]
+                {
+                    ui.allocate_ui_with_layout(vec2(half, 0.0), Layout::top_down(Align::Min), |ui| {
+                        ui.horizontal(|ui| {
+                            theme::lbl(ui, title);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| theme::lbl(ui, sub));
+                        });
+                        ui.add_space(4.0);
+                        let count = port_count(routing.labels_of(kind));
+                        let (left, right) = input_columns(count);
+                        let col_w = (half - 12.0) / 2.0;
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = 12.0;
+                            for range in [left, right] {
+                                ui.allocate_ui_with_layout(vec2(col_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                                    ui.spacing_mut().item_spacing.y = 4.0;
+                                    for n in range {
+                                        self.label_row(ui, routing, kind, n);
+                                    }
+                                });
+                            }
+                        });
+                    });
+                }
+            });
+            if let Some(w) = snap.last_warning.as_deref().filter(|w| w.starts_with("VideoHub")) {
+                ui.add_space(8.0);
+                ui.label(RichText::new(w).size(14.0).color(theme::AMBER_SOFT));
+            }
+        });
+    }
+
+    fn label_row(&mut self, ui: &mut Ui, routing: &RoutingState, kind: LabelKind, n: u16) {
+        let current =
+            n.checked_sub(1).and_then(|i| routing.labels_of(kind).get(i as usize)).cloned().unwrap_or_default();
+        let key = (kind, n);
+        let mut text = self.routes_ui.drafts.get(&key).cloned().unwrap_or_else(|| current.clone());
+        // One exact-width row: the number, the name, then (for an output) what it feeds.
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), LABEL_ROW_H), Sense::hover());
+        ui.painter().text(
+            row.left_center() + vec2(22.0, 0.0),
+            Align2::RIGHT_CENTER,
+            n.to_string(),
+            theme::mono_bold(12.0),
+            theme::DIM,
+        );
+        let fed = if kind == LabelKind::Output { routing.fed_by(n) } else { Vec::new() };
+        let badges_w = fed.len() as f32 * 27.0;
+        let field = Rect::from_min_max(row.min + vec2(30.0, 0.0), row.max - vec2(badges_w, 0.0));
+        let r = ui.put(
+            field,
+            egui::TextEdit::singleline(&mut text)
+                .id(egui::Id::unique(("vh-label", kind == LabelKind::Output, n)))
+                .hint_text(RichText::new("No label").size(13.0))
+                .font(egui::FontId::proportional(13.0))
+                .align(Align2::LEFT_CENTER)
+                .margin(vec2(6.0, 2.0))
+                .desired_width(f32::INFINITY)
+                .char_limit(40),
+        );
+        for (k, (t, i)) in fed.into_iter().enumerate() {
+            let b = Rect::from_min_size(
+                egui::pos2(field.right() + 3.0 + k as f32 * 27.0, row.center().y - 8.0),
+                vec2(24.0, 16.0),
+            );
+            ui.painter().rect_filled(b, 4.0, colour(t, i));
+            ui.painter().text(b.center(), Align2::CENTER_CENTER, t.dest_key(i), theme::mono_bold(10.0), Color32::BLACK);
+        }
+        if r.has_focus() || r.changed() {
+            self.routes_ui.drafts.insert(key, text.clone());
+        }
+        if r.lost_focus() {
+            let escaped = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            self.routes_ui.drafts.remove(&key);
+            if let Some(name) = label_to_send(&text, &current, escaped) {
+                info!(?kind, n, name = %name, "VideoHub: renaming from the window");
+                self.send(Command::SetLabel { kind, n, text: name });
+            }
+        }
+    }
+
+    /// Which router output feeds each destination. A change applies and is saved at once.
+    fn config_page(&mut self, ui: &mut Ui, snap: &Snapshot) {
+        let routing = &snap.routing;
+        let (config, video_out) = {
+            let c = self.config.read().unwrap_or_else(|e| e.into_inner());
+            (Target::ALL.map(|t| c.routing(t).outputs_for(t.size())), c.videohub.input8_output)
+        };
+        let outputs = port_count(&routing.output_labels);
+        theme::panel().inner_margin(20).show(ui, |ui| {
+            theme::lbl(ui, "Routing config");
+            ui.label(
+                RichText::new(
+                    "Which router output feeds each destination, or \"Not from the router\" (plugged straight \
+                     in). A change applies and is saved straight away.",
+                )
+                .color(theme::SOFT),
+            );
+            for t in Target::ALL {
+                ui.add_space(12.0);
+                ui.label(RichText::new(t.name()).font(theme::heading_font(18.0)));
+                ui.add_space(4.0);
+                let per_row = 4;
+                for row in 0..t.size().div_ceil(per_row) {
+                    ui.columns(per_row, |c| {
+                        for (k, col) in c.iter_mut().enumerate() {
+                            let i = row * per_row + k;
+                            if i >= t.size() {
+                                continue;
+                            }
+                            let name = if t == Target::MultiView {
+                                format!("{} (MV in {})", t.dest_name(i), i + 1)
+                            } else {
+                                t.dest_name(i)
+                            };
+                            col.label(
+                                RichText::new(name.to_uppercase()).font(theme::label_font(11.0)).color(theme::MUTED),
+                            );
+                            if t == Target::StreamAtem && i == STREAM_VIDEO_INPUT {
+                                // One setting: the output StreamIt routes videos through.
+                                let text = if video_out == 0 {
+                                    "Set in Settings › Inputs & routing".to_string()
+                                } else {
+                                    format!("{} (videos)", routing.output_name(video_out))
+                                };
+                                col.label(RichText::new(text).color(theme::SOFT))
+                                    .on_hover_text("The router output to input 8, in Settings › Inputs & routing");
+                                continue;
+                            }
+                            let now = config[t.index()][i];
+                            let shown =
+                                if now == 0 { "Not from the router".to_string() } else { routing.output_name(now) };
+                            let mut picked = now;
+                            egui::ComboBox::from_id_salt(("rt-cfg", t.index(), i))
+                                .selected_text(shown)
+                                .width(col.available_width())
+                                .height(400.0)
+                                .show_ui(col, |ui| {
+                                    ui.selectable_value(&mut picked, 0, "Not from the router");
+                                    for o in 1..=outputs {
+                                        ui.selectable_value(&mut picked, o, routing.output_name(o));
+                                    }
+                                });
+                            if picked != now {
+                                info!(target = t.name(), dest = i, output = picked, "routing config changed");
+                                self.save_routing(t, |r| {
+                                    if r.outputs.len() < t.size() {
+                                        r.outputs.resize(t.size(), 0);
+                                    }
+                                    r.outputs[i] = picked;
+                                });
+                            }
+                        }
+                    });
+                }
+            }
+        });
+    }
+}
+
 fn not_saved(target: Target) -> String {
     format!("Not saved: the VideoHub has not said what every {} input shows yet.", target.name())
 }
@@ -676,6 +902,16 @@ mod tests {
         assert_eq!(dests_on(&t, 3), vec![0, 2]);
         assert_eq!(dests_on(&t, 4), vec![3]);
         assert!(dests_on(&t, 9).is_empty());
+    }
+
+    #[test]
+    fn a_label_is_sent_only_when_it_changed_and_escape_was_not_pressed() {
+        assert_eq!(label_to_send(" Pulpit ", "Cam 2", false), Some("Pulpit".into()));
+        assert_eq!(label_to_send("Cam 2 ", "Cam 2", false), None, "unchanged");
+        assert_eq!(label_to_send("Pulpit", "Cam 2", true), None, "Escape puts it back");
+        assert_eq!(label_to_send("", "Cam 2", false), Some(String::new()), "clearing a label is a change");
+        assert_eq!(port_count(&[]), 40);
+        assert_eq!(port_count(&vec![String::new(); 16]), 16);
     }
 
     #[test]
