@@ -477,6 +477,12 @@ fn youtube(c: &Config) -> Result<Arc<dyn Broadcasts>, String> {
 
 #[cfg(feature = "gst")]
 async fn playout(c: &Config) -> (Arc<Late<dyn Player>>, Arc<Late<dyn Counter>>, Vec<AbortHandle>) {
+    // A PC without GStreamer: down for this run, not retried (installing it needs a restart).
+    if let Err(e) = streamit_playout::available() {
+        warn!("DeckLink player and NDI counter: {e}");
+        let down = streamit_playout::NOT_INSTALLED;
+        return (Late::new(down), Late::new(down), Vec::new());
+    }
     let player: Arc<Late<dyn Player>> = Late::new("DeckLink player starting");
     let counter: Arc<Late<dyn Counter>> = Late::new("NDI counter starting");
     let pc = c.playout.clone();

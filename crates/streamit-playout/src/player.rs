@@ -76,7 +76,7 @@ pub struct GstPlayer {
 impl GstPlayer {
     /// Initialises GStreamer. Nothing is sent to the DeckLink until the first `load`.
     pub fn new(cfg: &PlayoutConfig, sink: SinkKind) -> Result<Arc<GstPlayer>> {
-        gst::init().map_err(|e| other(format!("GStreamer init failed: {e}")))?;
+        crate::loader::init().map_err(other)?;
         let mode = VideoMode::from_nick(&cfg.video_mode).ok_or_else(|| {
             other(format!(
                 "unsupported playout.video_mode {:?} (expected a 1080p DeckLink mode such as 1080p2997)",
