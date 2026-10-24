@@ -25,6 +25,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 url = "2"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 eframe = "0.37.0"
 mdns-sd = "0.21.6"
 rfd = "0.17.2"

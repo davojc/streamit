@@ -19,7 +19,9 @@ mod logged;
 mod logging;
 mod probe;
 mod session;
+mod theme;
 mod ui;
+mod view;
 mod wiring;
 
 use anyhow::anyhow;
@@ -105,7 +107,8 @@ fn run_app() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("StreamIt")
-            .with_inner_size([1100.0, 860.0]),
+            .with_inner_size([1400.0, 900.0])
+            .with_min_inner_size([960.0, 640.0]),
         ..Default::default()
     };
     let handle = rt.handle().clone();

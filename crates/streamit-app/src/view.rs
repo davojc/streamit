@@ -1,0 +1,363 @@
+//! What the screens show, worked out from the snapshot and the settings. No egui here:
+//! the drawing lives in `ui/`, so these choices can be tested.
+use std::time::{Duration, SystemTime};
+use streamit_core::config::Config;
+use streamit_core::engine::{DeviceHealth, DeviceKind, Snapshot};
+use streamit_core::golive::{Readiness, Stage};
+use streamit_core::recovery::Offer;
+use streamit_core::rollin::{CueState, Destination};
+
+/// The colour family of a badge, a dot or a step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Grey,
+    Green,
+    Amber,
+    Red,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderView {
+    pub badge: String,
+    pub badge_tone: Tone,
+    /// How long the service has been on air ("00:32:15"), while it is.
+    pub timer: Option<String>,
+    pub broadcast: String,
+    /// "All equipment OK", or the first device with a problem and what it is.
+    pub equipment: String,
+    pub equipment_tone: Tone,
+    pub simulation: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepState {
+    Done,
+    Current,
+    Todo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceScreen {
+    BeforeService,
+    Countdown,
+    Live,
+    VideoPlaying,
+    Ending,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CountdownView {
+    /// What is left of the countdown video ("0:42").
+    pub remaining: String,
+    pub file_name: String,
+    /// When YouTube goes public, as countdown time ("0:10").
+    pub public_at_text: String,
+    pub public: bool,
+    /// "NDI counter sending 0:42 as “StreamIt Countdown”".
+    pub ndi_text: String,
+    pub ndi_ok: bool,
+    /// How much of the video has played, 0..=1 (0 while its length is unknown).
+    pub progress: f32,
+    /// Going public failed and can be retried.
+    pub show_retry_public: bool,
+}
+
+/// Every device, in the order the screens list them.
+pub const ALL_KINDS: [DeviceKind; 8] = [
+    DeviceKind::StreamAtem,
+    DeviceKind::ScreensAtem,
+    DeviceKind::VideoHub,
+    DeviceKind::WebPresenter,
+    DeviceKind::YouTube,
+    DeviceKind::DeckLink,
+    DeviceKind::Ndi,
+    DeviceKind::StreamDeck,
+];
+
+pub fn kind_name(k: DeviceKind) -> &'static str {
+    match k {
+        DeviceKind::StreamAtem => "Stream ATEM",
+        DeviceKind::ScreensAtem => "Screens ATEM",
+        DeviceKind::VideoHub => "VideoHub",
+        DeviceKind::WebPresenter => "Web Presenter",
+        DeviceKind::YouTube => "YouTube",
+        DeviceKind::DeckLink => "DeckLink",
+        DeviceKind::Ndi => "NDI counter",
+        DeviceKind::StreamDeck => "Stream Deck",
+    }
+}
+
+/// A device's colour and, when it is not OK, what is wrong.
+pub fn device_state(s: &Snapshot, k: DeviceKind) -> (Tone, Option<String>) {
+    match s.device_status.get(&k) {
+        Some(DeviceHealth::Ok) => (Tone::Green, None),
+        Some(DeviceHealth::Warning(w)) => (Tone::Amber, Some(w.clone())),
+        Some(DeviceHealth::Down(e)) => (Tone::Red, Some(e.clone())),
+        None => (Tone::Grey, Some("not checked yet".into())),
+    }
+}
+
+/// Going public failed (or was never done) and can be retried.
+fn public_failed(s: &Snapshot) -> bool {
+    s.offers.contains(&Offer::GoPublic)
+}
+
+pub fn header(s: &Snapshot, _c: &Config) -> HeaderView {
+    let (badge, badge_tone) = match &s.stage {
+        Stage::Idle => ("IDLE".to_string(), Tone::Grey),
+        Stage::Prepared(Readiness::Ready) => ("READY".into(), Tone::Green),
+        Stage::Prepared(Readiness::Waiting(_)) => ("PREPARING".into(), Tone::Amber),
+        Stage::Prepared(Readiness::Warning(_)) => ("READY".into(), Tone::Amber),
+        Stage::Countdown { public, .. } => {
+            (format!("COUNTDOWN · {}", if *public { "PUBLIC" } else { "PRIVATE" }), Tone::Amber)
+        }
+        Stage::Live => (format!("LIVE · {}", if public_failed(s) { "PRIVATE" } else { "PUBLIC" }), Tone::Red),
+        Stage::Ending { .. } => ("ENDING".into(), Tone::Red),
+        Stage::Ended => ("ENDED".into(), Tone::Grey),
+    };
+    let timer = s
+        .on_air_since
+        .filter(|_| matches!(s.stage, Stage::Live | Stage::Ending { .. }))
+        .map(|t| fmt_hhmmss(SystemTime::now().duration_since(t).unwrap_or_default()));
+    let broadcast = s.broadcast.as_ref().map(|b| b.title.clone()).unwrap_or_else(|| "No broadcast selected".into());
+    let problem = ALL_KINDS.iter().find_map(|&k| match device_state(s, k) {
+        (tone, Some(why)) => Some((format!("{} · {why}", kind_name(k)), tone)),
+        _ => None,
+    });
+    let (equipment, equipment_tone) = problem.unwrap_or_else(|| ("All equipment OK".into(), Tone::Green));
+    HeaderView { badge, badge_tone, timer, broadcast, equipment, equipment_tone, simulation: s.simulation }
+}
+
+/// Prepare → Countdown → Live → End service.
+pub fn steps(s: &Snapshot) -> [StepState; 4] {
+    use StepState::*;
+    let current = match s.stage {
+        Stage::Idle => 0,
+        Stage::Prepared(_) | Stage::Countdown { .. } => 1,
+        Stage::Live => 2,
+        Stage::Ending { .. } => 3,
+        Stage::Ended => 4,
+    };
+    std::array::from_fn(|i| match i.cmp(&current) {
+        std::cmp::Ordering::Less => Done,
+        std::cmp::Ordering::Equal => Current,
+        std::cmp::Ordering::Greater => Todo,
+    })
+}
+
+/// Which Service screen to show. Chosen by stage: `countdown_total` lingers into Live.
+pub fn service_screen(s: &Snapshot) -> ServiceScreen {
+    match s.stage {
+        Stage::Countdown { .. } => ServiceScreen::Countdown,
+        Stage::Ending { .. } => ServiceScreen::Ending,
+        _ if s.playing.is_some() => ServiceScreen::VideoPlaying,
+        Stage::Live => ServiceScreen::Live,
+        Stage::Idle | Stage::Prepared(_) | Stage::Ended => ServiceScreen::BeforeService,
+    }
+}
+
+pub fn countdown(s: &Snapshot, c: &Config) -> Option<CountdownView> {
+    let Stage::Countdown { remaining, public } = s.stage else { return None };
+    let text = fmt_mmss(remaining);
+    let progress = match s.countdown_total {
+        Some(total) if !total.is_zero() => (1.0 - remaining.as_secs_f32() / total.as_secs_f32()).clamp(0.0, 1.0),
+        _ => 0.0,
+    };
+    Some(CountdownView {
+        file_name: c
+            .playout
+            .countdown_file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| c.playout.countdown_file.display().to_string()),
+        public_at_text: fmt_mmss(c.timings.go_public_offset),
+        public,
+        ndi_text: format!("NDI counter sending {text} as “{}”", c.ndi.source_name),
+        ndi_ok: matches!(s.device_status.get(&DeviceKind::Ndi), Some(DeviceHealth::Ok)),
+        progress,
+        show_retry_public: public_failed(s),
+        remaining: text,
+    })
+}
+
+/// `M:SS`, rounding a part second up, as a countdown does (41.2 s shows 0:42).
+pub fn fmt_mmss(d: Duration) -> String {
+    let secs = d.as_secs() + u64::from(d.subsec_nanos() > 0);
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// `M:SS` of elapsed time, whole seconds (1:12.8 played shows 1:12).
+pub fn fmt_mmss_floor(d: Duration) -> String {
+    let secs = d.as_secs();
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// The first part of a device problem, for tight spaces ("disconnected: atem not
+/// connected" shows "disconnected").
+pub fn short_problem(why: &str) -> &str {
+    why.split(':').next().unwrap_or(why).trim()
+}
+
+/// Where a video plays, as its chip says.
+pub fn dest_short(d: Destination) -> &'static str {
+    match d {
+        Destination::HallAndOnline => "Hall + Online",
+        Destination::HallOnly => "Hall only",
+        Destination::OnlineOnly => "Online only",
+        Destination::AudioOnly => "Audio only",
+    }
+}
+
+/// A level in whole dB with a real minus sign ("−2 dB", "0 dB", "+3 dB").
+pub fn fmt_db(db: f32) -> String {
+    let r = db.round() as i32;
+    match r {
+        0 => "0 dB".into(),
+        r if r < 0 => format!("−{} dB", -r),
+        r => format!("+{r} dB"),
+    }
+}
+
+/// The first video not yet played: its Play button is the blue one.
+pub fn next_cue(s: &Snapshot) -> Option<usize> {
+    s.cues.iter().position(|(_, st)| *st == CueState::Cued)
+}
+
+/// `HH:MM:SS`, whole seconds, for the on-air timer.
+pub fn fmt_hhmmss(d: Duration) -> String {
+    let s = d.as_secs();
+    format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use streamit_core::devices::BroadcastSummary;
+
+    fn countdown_at(secs: u64) -> Snapshot {
+        Snapshot {
+            stage: Stage::Countdown { remaining: Duration::from_secs(secs), public: false },
+            countdown_total: Some(Duration::from_secs(300)),
+            ..Snapshot::default()
+        }
+    }
+
+    #[test]
+    fn badge_live_public_red() {
+        let s = Snapshot {
+            stage: Stage::Live,
+            on_air_since: Some(SystemTime::now() - Duration::from_secs(3 * 60 + 5)),
+            broadcast: Some(BroadcastSummary {
+                id: "b".into(),
+                title: "Sunday Service".into(),
+                scheduled_start: None,
+                life_cycle: "live".into(),
+                bound_stream_id: None,
+            }),
+            ..Snapshot::default()
+        };
+        let h = header(&s, &Config::default());
+        assert_eq!(h.badge, "LIVE · PUBLIC");
+        assert_eq!(h.badge_tone, Tone::Red);
+        assert_eq!(h.broadcast, "Sunday Service");
+        let t = h.timer.unwrap();
+        assert!(t == "00:03:05" || t == "00:03:06", "{t}");
+
+        let idle = header(&Snapshot::default(), &Config::default());
+        assert_eq!((idle.badge.as_str(), idle.badge_tone, idle.timer), ("IDLE", Tone::Grey, None));
+        let cd = header(&countdown_at(42), &Config::default());
+        assert_eq!((cd.badge.as_str(), cd.badge_tone), ("COUNTDOWN · PRIVATE", Tone::Amber));
+        let ready = Snapshot { stage: Stage::Prepared(Readiness::Ready), ..Snapshot::default() };
+        assert_eq!(header(&ready, &Config::default()).badge_tone, Tone::Green);
+        let not_public = Snapshot { stage: Stage::Live, offers: vec![Offer::GoPublic], ..Snapshot::default() };
+        assert_eq!(header(&not_public, &Config::default()).badge, "LIVE · PRIVATE");
+    }
+
+    #[test]
+    fn steps_during_countdown_are_done_current_todo_todo() {
+        use StepState::*;
+        assert_eq!(steps(&countdown_at(42)), [Done, Current, Todo, Todo]);
+        assert_eq!(steps(&Snapshot::default()), [Current, Todo, Todo, Todo]);
+        assert_eq!(steps(&Snapshot { stage: Stage::Live, ..Snapshot::default() }), [Done, Done, Current, Todo]);
+        let ending = Snapshot { stage: Stage::Ending { remaining: Duration::from_secs(4) }, ..Snapshot::default() };
+        assert_eq!(steps(&ending), [Done, Done, Done, Current]);
+        assert_eq!(steps(&Snapshot { stage: Stage::Ended, ..Snapshot::default() }), [Done; 4]);
+    }
+
+    #[test]
+    fn screen_is_video_playing_when_playing_and_live() {
+        let live = Snapshot { stage: Stage::Live, ..Snapshot::default() };
+        assert_eq!(service_screen(&live), ServiceScreen::Live);
+        assert_eq!(service_screen(&Snapshot { playing: Some(1), ..live }), ServiceScreen::VideoPlaying);
+        assert_eq!(service_screen(&Snapshot::default()), ServiceScreen::BeforeService);
+        // The countdown screen comes from the stage, not from countdown_total.
+        assert_eq!(service_screen(&countdown_at(5)), ServiceScreen::Countdown);
+        let lingering =
+            Snapshot { stage: Stage::Live, countdown_total: Some(Duration::from_secs(300)), ..Snapshot::default() };
+        assert_eq!(service_screen(&lingering), ServiceScreen::Live);
+        let ending = Snapshot { stage: Stage::Ending { remaining: Duration::from_secs(4) }, ..Snapshot::default() };
+        assert_eq!(service_screen(&ending), ServiceScreen::Ending);
+    }
+
+    #[test]
+    fn countdown_view_shows_file_name_and_remaining() {
+        let mut c = Config::default();
+        c.playout.countdown_file = PathBuf::from(r"C:\Videos\Countdown – Autumn.mp4");
+        let v = countdown(&countdown_at(42), &c).unwrap();
+        assert_eq!(v.remaining, "0:42");
+        assert_eq!(v.file_name, "Countdown – Autumn.mp4");
+        assert_eq!(v.public_at_text, "0:10");
+        assert_eq!(v.ndi_text, "NDI counter sending 0:42 as “StreamIt Countdown”");
+        assert!((v.progress - 0.86).abs() < 0.001, "{}", v.progress);
+        assert!(!v.public);
+        // Only during the countdown stage, even though countdown_total lingers.
+        let live =
+            Snapshot { stage: Stage::Live, countdown_total: Some(Duration::from_secs(300)), ..Snapshot::default() };
+        assert_eq!(countdown(&live, &c), None);
+    }
+
+    #[test]
+    fn retry_public_shown_only_when_offered() {
+        let c = Config::default();
+        assert!(!countdown(&countdown_at(30), &c).unwrap().show_retry_public);
+        let failed = Snapshot { offers: vec![Offer::GoPublic], ..countdown_at(30) };
+        assert!(countdown(&failed, &c).unwrap().show_retry_public);
+        let other = Snapshot { offers: vec![Offer::Recover], ..countdown_at(30) };
+        assert!(!countdown(&other, &c).unwrap().show_retry_public);
+    }
+
+    #[test]
+    fn equipment_summary_names_first_problem() {
+        let mut s = Snapshot::default();
+        for k in ALL_KINDS {
+            s.device_status.insert(k, DeviceHealth::Ok);
+        }
+        let h = header(&s, &Config::default());
+        assert_eq!((h.equipment.as_str(), h.equipment_tone), ("All equipment OK", Tone::Green));
+        s.device_status.insert(DeviceKind::StreamDeck, DeviceHealth::Down("unplugged".into()));
+        s.device_status.insert(DeviceKind::VideoHub, DeviceHealth::Warning("slow to answer".into()));
+        let h = header(&s, &Config::default());
+        assert_eq!((h.equipment.as_str(), h.equipment_tone), ("VideoHub · slow to answer", Tone::Amber));
+        s.device_status.insert(DeviceKind::VideoHub, DeviceHealth::Ok);
+        let h = header(&s, &Config::default());
+        assert_eq!((h.equipment.as_str(), h.equipment_tone), ("Stream Deck · unplugged", Tone::Red));
+    }
+
+    #[test]
+    fn fmt_mmss_rounds_up_partial_seconds() {
+        assert_eq!(fmt_mmss(Duration::from_millis(41_200)), "0:42");
+        assert_eq!(fmt_mmss(Duration::ZERO), "0:00");
+        assert_eq!(fmt_mmss(Duration::from_secs(3605)), "60:05");
+        assert_eq!(fmt_mmss(Duration::from_secs(42)), "0:42");
+    }
+
+    #[test]
+    fn small_helpers() {
+        assert_eq!(short_problem("disconnected: atem not connected"), "disconnected");
+        assert_eq!(short_problem("unplugged"), "unplugged");
+        assert_eq!((fmt_db(-2.0), fmt_db(0.04), fmt_db(3.0)), ("−2 dB".into(), "0 dB".into(), "+3 dB".into()));
+        assert_eq!(fmt_hhmmss(Duration::from_secs(32 * 60 + 15)), "00:32:15");
+        assert_eq!(fmt_mmss_floor(Duration::from_millis(72_800)), "1:12");
+    }
+}

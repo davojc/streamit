@@ -207,18 +207,16 @@ pub struct Front {
     pub tx: mpsc::Sender<Command>,
     /// The current session's snapshot.
     pub rx: watch::Receiver<Snapshot>,
-    #[allow(dead_code)] // read by the screens (Task 7)
     pub mode: watch::Receiver<Mode>,
     /// The pretend world, while simulating.
-    #[allow(dead_code)] // read by the Simulation tab (Task 7)
+    #[allow(dead_code)] // read by the Simulation tab (Task 9)
     pub sim: watch::Receiver<Option<SimControl>>,
     /// Settings the simulation filled with a simulated default (empty in real mode).
-    #[allow(dead_code)] // read by Settings (Task 7)
+    #[allow(dead_code)] // read by Settings (Task 9)
     pub sim_defaults: watch::Receiver<Vec<&'static str>>,
     /// The current session's YouTube, for the window's broadcast list.
     pub yt: watch::Receiver<Arc<dyn Broadcasts>>,
     /// True while one session is being stopped and the next opened.
-    #[allow(dead_code)] // read by the screens (Task 7)
     pub switching: watch::Receiver<bool>,
 }
 

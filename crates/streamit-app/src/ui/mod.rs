@@ -1,19 +1,24 @@
-//! The window: a Run tab (what the operator uses during a service) and a Settings tab.
-//! Plain egui; every press becomes the same `Command` the Stream Deck would send.
+//! The window: the header (stage badge, broadcast, equipment, tabs), the simulation
+//! banner, and the tabs: Service (`service.rs`), Videos, Settings and, in simulation
+//! only, Simulation. Every press becomes the same `Command` the Stream Deck would send.
+//! The Videos and Settings tabs are v1's, restyled later.
+mod service;
+
 use crate::discovery::{self, BmdKind, DiscoveredDevice};
-use crate::session::Front;
-use eframe::egui::{self, Color32, RichText, Ui, vec2};
+use crate::session::{Front, Mode};
+use crate::theme;
+use crate::view::{self, ServiceScreen};
+use eframe::egui::{self, Color32, Margin, RichText, Ui};
 use std::future::Future;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use streamit_core::config::{AudioSourceId, Config};
-use streamit_core::devices::{BroadcastSummary, Broadcasts, Fix};
-use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
+use streamit_core::devices::{BroadcastSummary, Broadcasts};
+use streamit_core::engine::{Command, Snapshot};
 use streamit_core::golive::Stage;
 use streamit_core::rollin::{Cue, CueState, Destination, MAX_CUES};
-use streamit_deck::layout::{self, KEYS, Rgb};
 use streamit_youtube::{API_BASE, Auth, StreamSummary, YouTubeClient};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, watch};
@@ -60,8 +65,11 @@ impl<T: Send + 'static> Pending<T> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
-    Run,
+    Service,
+    Videos,
     Settings,
+    /// Only offered in simulation mode.
+    Simulation,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -134,8 +142,14 @@ pub struct StreamItApp {
     rt: Handle,
     tx: mpsc::Sender<Command>,
     snap: watch::Receiver<Snapshot>,
-    /// The current session's YouTube (real or pretend).
+    /// The current session's YouTube (real or pretend); the broadcast list reloads when
+    /// it changes.
     yt: watch::Receiver<Arc<dyn Broadcasts>>,
+    mode: watch::Receiver<Mode>,
+    /// True while one session is being stopped and the next opened.
+    switching: watch::Receiver<bool>,
+    /// The mode the window title was last set for.
+    titled: Option<Mode>,
     config: Arc<RwLock<Config>>,
     file: ConfigFile,
     ctx: egui::Context,
@@ -149,7 +163,12 @@ pub struct StreamItApp {
     notice: Option<String>,
 
     broadcasts: Vec<BroadcastSummary>,
-    broadcasts_job: Pending<Result<Vec<BroadcastSummary>, String>>,
+    /// Each result carries the list's generation: one from before the YouTube changed
+    /// (the other mode) is dropped.
+    broadcasts_job: Pending<(u64, Result<Vec<BroadcastSummary>, String>)>,
+    broadcasts_gen: u64,
+    /// A load for the current generation is under way.
+    broadcasts_loading: bool,
     broadcasts_error: Option<String>,
 
     /// The window's copy of the cue list; edits go to the engine with SetCues.
@@ -183,12 +202,16 @@ impl StreamItApp {
         startup: Config,
         load_error: Option<String>,
     ) -> StreamItApp {
+        theme::install(ctx);
         let draft = startup.clone();
         let mut app = StreamItApp {
             rt,
             tx: s.tx,
             snap: s.rx,
             yt: s.yt,
+            mode: s.mode,
+            switching: s.switching,
+            titled: None,
             config,
             file,
             ctx: ctx.clone(),
@@ -199,10 +222,12 @@ impl StreamItApp {
             engine_cues: startup.cues.clone(),
             startup,
             draft,
-            tab: Tab::Run,
+            tab: Tab::Service,
             notice: load_error,
             broadcasts: Vec::new(),
             broadcasts_job: Pending::default(),
+            broadcasts_gen: 0,
+            broadcasts_loading: false,
             broadcasts_error: None,
             cues_dirty_at: None,
             cues_sent_at: None,
@@ -230,9 +255,35 @@ impl StreamItApp {
     }
 
     fn load_broadcasts(&mut self) {
-        let yt = self.yt.borrow().clone();
+        let yt = self.yt.borrow_and_update().clone();
+        let generation = self.broadcasts_gen;
+        self.broadcasts_loading = true;
         self.broadcasts_job
-            .start(&self.rt, &self.ctx, async move { yt.upcoming().await.map_err(|e| e.to_string()) });
+            .start(&self.rt, &self.ctx, async move { (generation, yt.upcoming().await.map_err(|e| e.to_string())) });
+    }
+
+    /// A mode switch brings another YouTube: forget the old list and load the new one.
+    fn follow_youtube(&mut self) {
+        if self.yt.has_changed().unwrap_or(false) {
+            info!("the session's YouTube changed; reloading the broadcast list");
+            self.broadcasts_gen += 1;
+            self.broadcasts.clear();
+            self.broadcasts_error = None;
+            self.load_broadcasts();
+        }
+    }
+
+    /// The window title says when nothing is live; the Simulation tab goes with the mode.
+    fn follow_mode(&mut self, ctx: &egui::Context) {
+        let mode = *self.mode.borrow();
+        if self.titled == Some(mode) {
+            return;
+        }
+        self.titled = Some(mode);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title(mode).into()));
+        if mode == Mode::Real && self.tab == Tab::Simulation {
+            self.tab = Tab::Service;
+        }
     }
 
     fn scan(&mut self) {
@@ -242,13 +293,20 @@ impl StreamItApp {
     }
 
     fn poll_jobs(&mut self) {
-        if let Some(r) = self.broadcasts_job.take() {
+        if let Some((generation, r)) = self.broadcasts_job.take() {
             match r {
+                _ if generation != self.broadcasts_gen => {
+                    info!("dropping a broadcast list from before the mode switch");
+                }
                 Ok(list) => {
+                    self.broadcasts_loading = false;
                     self.broadcasts = list;
                     self.broadcasts_error = None;
                 }
-                Err(e) => self.broadcasts_error = Some(e),
+                Err(e) => {
+                    self.broadcasts_loading = false;
+                    self.broadcasts_error = Some(e);
+                }
             }
         }
         if let Some(found) = self.scan_job.take() {
@@ -433,67 +491,134 @@ impl StreamItApp {
     }
 }
 
+fn window_title(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Real => "StreamIt",
+        Mode::Simulation => "StreamIt — SIMULATION",
+    }
+}
+
 impl eframe::App for StreamItApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.follow_youtube();
         self.poll_jobs();
         let snap = self.snap.borrow().clone();
         self.take_added_files(&snap);
         self.sync_cues(&snap);
         self.close_guard(ui, &snap);
-        // Keep blinking keys, the countdown and device colours current.
-        ui.ctx().request_repaint_after(Duration::from_millis(250));
+        self.follow_mode(&ui.ctx().clone());
+        // Keep the timers, the countdown and device colours current.
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
 
-        egui::Panel::top("tabs").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Run, RichText::new("Run").size(18.0));
-                ui.selectable_value(&mut self.tab, Tab::Settings, RichText::new("Settings").size(18.0));
-                if let Some(n) = self.notice.clone() {
-                    ui.separator();
-                    ui.label(RichText::new(n).color(Color32::from_rgb(220, 150, 0)));
-                    if ui.small_button("x").clicked() {
-                        self.notice = None;
-                    }
+        let config = self.config.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let simulating = *self.mode.borrow() == Mode::Simulation || snap.simulation;
+        if simulating {
+            egui::Panel::top("sim_banner").frame(egui::Frame::new()).show_separator_line(false).show(ui, |ui| {
+                if theme::sim_banner(ui) {
+                    self.tab = Tab::Settings;
                 }
             });
-        });
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
-                Tab::Run => self.run_tab(ui, &snap),
-                Tab::Settings => self.settings_tab(ui),
+        }
+        egui::Panel::top("header")
+            .frame(egui::Frame::new().fill(theme::HEADER).inner_margin(Margin::symmetric(28, 16)))
+            .show(ui, |ui| self.header(ui, &snap, &config));
+        if let Some(n) = self.notice.clone() {
+            egui::Panel::top("notice")
+                .frame(egui::Frame::new().fill(theme::AMBER_DARK).inner_margin(Margin::symmetric(28, 8)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(n).color(theme::AMBER_TEXT));
+                        if ui.small_button("Dismiss").clicked() {
+                            self.notice = None;
+                        }
+                    });
+                });
+        }
+        if self.tab == Tab::Service {
+            egui::Panel::top("steps")
+                .frame(egui::Frame::new().fill(theme::GROUND).inner_margin(Margin::symmetric(28, 14)))
+                .show(ui, |ui| theme::step_strip(ui, view::steps(&snap)));
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::GROUND).inner_margin(Margin::symmetric(28, 24)))
+            .show(ui, |ui| {
+                let viewport = ui.available_height();
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
+                    Tab::Service => self.service_tab(ui, &snap, &config, viewport),
+                    Tab::Videos => theme::panel().show(ui, |ui| self.cue_editor(ui, &snap)).inner,
+                    Tab::Settings => theme::panel().show(ui, |ui| self.settings_tab(ui)).inner,
+                    Tab::Simulation => simulation_tab(ui),
+                });
+            });
+    }
+}
+
+impl StreamItApp {
+    fn header(&mut self, ui: &mut Ui, snap: &Snapshot, config: &Config) {
+        let h = view::header(snap, config);
+        let switching = *self.switching.borrow();
+        let simulating = *self.mode.borrow() == Mode::Simulation;
+        // The first screen lists every device, so its header leaves the summary out.
+        let summary = !(self.tab == Tab::Service && view::service_screen(snap) == ServiceScreen::BeforeService);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 24.0;
+            let mut name = egui::text::LayoutJob::default();
+            name.append("Stream", 0.0, egui::TextFormat::simple(theme::heading_font(24.0), theme::TEXT));
+            name.append("It", 0.0, egui::TextFormat::simple(theme::heading_font(24.0), theme::RED));
+            ui.label(name);
+            if switching {
+                theme::switching_badge(ui);
+            } else {
+                theme::badge(ui, &h);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let tabs: &[(Tab, &str)] = if simulating {
+                    &[
+                        (Tab::Settings, "Settings"),
+                        (Tab::Simulation, "Simulation"),
+                        (Tab::Videos, "Videos"),
+                        (Tab::Service, "Service"),
+                    ]
+                } else {
+                    &[(Tab::Settings, "Settings"), (Tab::Videos, "Videos"), (Tab::Service, "Service")]
+                };
+                for &(tab, name) in tabs {
+                    if theme::tab(ui, name, self.tab == tab, tab == Tab::Simulation).clicked() {
+                        self.tab = tab;
+                    }
+                }
+                if summary {
+                    ui.add_space(18.0);
+                    ui.label(RichText::new(&h.equipment).size(14.0).color(theme::MUTED));
+                    theme::dot(ui, theme::tone_color(h.equipment_tone));
+                    ui.add_space(6.0);
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        theme::lbl(ui, "Broadcast");
+                        ui.add(egui::Label::new(RichText::new(&h.broadcast).size(16.0)).truncate());
+                    });
+                });
             });
         });
     }
 }
 
-// ---------------------------------------------------------------- Run tab
-
-fn color(c: Rgb) -> Color32 {
-    Color32::from_rgb(c.0, c.1, c.2)
+/// Task 9 builds this tab; for now it only says where the controls will be.
+fn simulation_tab(ui: &mut Ui) {
+    theme::panel().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        theme::lbl(ui, "Simulation");
+        ui.label(
+            RichText::new("The pretend equipment controls arrive here in a later update. Leave simulation in Settings › Equipment.")
+                .color(theme::SOFT),
+        );
+    });
 }
 
-fn kind_name(k: DeviceKind) -> &'static str {
-    match k {
-        DeviceKind::StreamAtem => "Stream ATEM",
-        DeviceKind::ScreensAtem => "Screens ATEM",
-        DeviceKind::VideoHub => "VideoHub",
-        DeviceKind::WebPresenter => "Web Presenter",
-        DeviceKind::YouTube => "YouTube",
-        DeviceKind::DeckLink => "DeckLink",
-        DeviceKind::Ndi => "NDI",
-        DeviceKind::StreamDeck => "Stream Deck",
-    }
-}
-
-const ALL_KINDS: [DeviceKind; 8] = [
-    DeviceKind::StreamAtem,
-    DeviceKind::ScreensAtem,
-    DeviceKind::VideoHub,
-    DeviceKind::WebPresenter,
-    DeviceKind::YouTube,
-    DeviceKind::DeckLink,
-    DeviceKind::Ndi,
-    DeviceKind::StreamDeck,
-];
+// ---------------------------------------------------------------- Videos tab (v1, restyled later)
 
 fn dest_name(d: Destination) -> &'static str {
     match d {
@@ -508,141 +633,13 @@ const DESTINATIONS: [Destination; 4] =
     [Destination::HallAndOnline, Destination::HallOnly, Destination::OnlineOnly, Destination::AudioOnly];
 
 impl StreamItApp {
-    fn run_tab(&mut self, ui: &mut Ui, snap: &Snapshot) {
-        let blink = ((ui.input(|i| i.time) * 4.0) as u64).is_multiple_of(2);
-
-        // Stage, warning, flash.
-        ui.horizontal(|ui| {
-            let phase = layout::appearance(layout::PHASE_KEY, snap, blink);
-            ui.label(
-                RichText::new(format!(" {} ", phase.text.replace('\n', " ")))
-                    .size(22.0)
-                    .strong()
-                    .color(color(phase.fg))
-                    .background_color(color(phase.bg)),
-            );
-            ui.label(format!("{:?}", snap.stage));
-            if snap.mics_ducked {
-                ui.label(RichText::new("Mics ducked").color(Color32::from_rgb(220, 150, 0)).strong());
-            }
-        });
-        if let Some(w) = &snap.last_warning {
-            ui.label(RichText::new(format!("Warning: {w}")).color(Color32::from_rgb(220, 150, 0)).strong());
-        }
-        if let Some(i) = snap.flash {
-            ui.label(RichText::new(format!("Cue {} ignored: something else is running", i + 1)).color(Color32::RED));
-        }
-        if let Some(k) = snap.flash_key {
-            ui.label(RichText::new(format!("{k:?} ignored right now")).color(Color32::RED));
-        }
-        if !snap.offers.is_empty() {
-            ui.label(format!("Offered: {:?}", snap.offers));
-        }
-
-        // Device status row.
-        ui.add_space(6.0);
-        ui.horizontal_wrapped(|ui| {
-            for k in ALL_KINDS {
-                let (bg, fg, why) = match snap.device_status.get(&k) {
-                    Some(DeviceHealth::Ok) => (layout::GREEN, layout::WHITE, "OK".to_string()),
-                    Some(DeviceHealth::Warning(w)) => (layout::AMBER, layout::BLACK, w.clone()),
-                    Some(DeviceHealth::Down(e)) => (layout::RED, layout::WHITE, e.clone()),
-                    None => (layout::GREY, layout::WHITE, "unknown".to_string()),
-                };
-                ui.label(RichText::new(format!(" {} ", kind_name(k))).color(color(fg)).background_color(color(bg)))
-                    .on_hover_text(why);
-            }
-        });
-
-        ui.separator();
-        self.broadcast_section(ui, snap);
-        ui.separator();
-
-        // Every Stream Deck key, as the deck shows it; presses send what the deck would.
-        ui.heading("Stream Deck");
-        egui::Grid::new("deck").spacing(vec2(4.0, 4.0)).show(ui, |ui| {
-            for key in 0..KEYS {
-                let look = layout::appearance(key, snap, blink);
-                let cmd = layout::command_for(key, snap);
-                let text = RichText::new(look.text.clone()).color(color(look.fg)).size(12.0);
-                let b = egui::Button::new(text).fill(color(look.bg)).min_size(vec2(112.0, 58.0));
-                if ui.add_enabled(cmd.is_some(), b).clicked() {
-                    // Decide from the latest snapshot, as the deck does.
-                    let latest = layout::command_for(key, &self.snap.borrow());
-                    if let Some(c) = latest {
-                        self.send(c);
-                    }
-                }
-                if (key + 1) % layout::COLS == 0 {
-                    ui.end_row();
-                }
-            }
-        });
-
-        ui.separator();
-        self.cue_editor(ui, snap);
-    }
-
-    fn broadcast_section(&mut self, ui: &mut Ui, snap: &Snapshot) {
-        ui.horizontal(|ui| {
-            ui.label("Broadcast:");
-            let selected = snap.broadcast.as_ref().map(|b| b.title.clone()).unwrap_or_else(|| "(none)".into());
-            let mut choice: Option<String> = None;
-            egui::ComboBox::from_id_salt("broadcast").selected_text(selected).width(360.0).show_ui(ui, |ui| {
-                for b in &self.broadcasts {
-                    let label = match &b.scheduled_start {
-                        Some(s) => format!("{}  ({s})", b.title),
-                        None => b.title.clone(),
-                    };
-                    let on = snap.broadcast.as_ref().is_some_and(|x| x.id == b.id);
-                    if ui.selectable_label(on, label).clicked() {
-                        choice = Some(b.id.clone());
-                    }
-                }
-            });
-            if let Some(id) = choice {
-                self.send(Command::SelectBroadcast(id));
-            }
-            let busy = self.broadcasts_job.running;
-            if ui.add_enabled(!busy, egui::Button::new("Refresh")).clicked() {
-                self.send(Command::Refresh);
-                self.load_broadcasts();
-            }
-            if busy {
-                ui.spinner();
-            }
-        });
-        if let Some(e) = &self.broadcasts_error {
-            ui.label(RichText::new(format!("Could not list broadcasts: {e}")).color(Color32::from_rgb(220, 150, 0)));
-        }
-        if let Some(c) = snap.check {
-            let rows = [
-                ("Bound to our stream key", c.bound_to_ours, Fix::Bind),
-                ("Auto Start off", !c.auto_start, Fix::AutoStartOff),
-                ("Auto Stop on (safety net)", c.auto_stop, Fix::AutoStopOn),
-                ("Monitor stream on", c.monitor_stream, Fix::MonitorOn),
-            ];
-            egui::Grid::new("check").show(ui, |ui| {
-                for (what, ok, fix) in rows {
-                    let (mark, col) = if ok { ("OK", Color32::from_rgb(0, 160, 70)) } else { ("NO", Color32::RED) };
-                    ui.label(RichText::new(mark).color(col).strong());
-                    ui.label(what);
-                    if !ok && ui.button("Fix").clicked() {
-                        self.send(Command::FixBroadcast(fix));
-                    }
-                    ui.end_row();
-                }
-            });
-        } else if snap.broadcast.is_some() {
-            ui.label("Checking the broadcast...");
-        }
-    }
-
     fn cue_editor(&mut self, ui: &mut Ui, snap: &Snapshot) {
         ui.heading(format!("Cue list ({}/{MAX_CUES})", self.cues.len()));
         let locked = snap.playing.is_some();
         if locked {
-            ui.label(RichText::new("The cue list is locked while a video plays.").color(Color32::from_rgb(220, 150, 0)));
+            ui.label(
+                RichText::new("The cue list is locked while a video plays.").color(Color32::from_rgb(220, 150, 0)),
+            );
         }
         let mut changed = false;
         ui.add_enabled_ui(!locked, |ui| {
@@ -821,7 +818,9 @@ impl StreamItApp {
         ui.heading("Devices on the network");
         ui.horizontal(|ui| {
             let busy = self.scan_job.running;
-            if ui.add_enabled(!busy, egui::Button::new("Scan")).clicked() {
+            // Simulation never touches the network: no mDNS scan.
+            let simulating = *self.mode.borrow() == Mode::Simulation;
+            if ui.add_enabled(!busy && !simulating, egui::Button::new("Scan")).clicked() {
                 self.scan();
             }
             if busy {
@@ -910,7 +909,9 @@ impl StreamItApp {
             ui.add(egui::TextEdit::singleline(&mut self.draft.youtube.client_id).desired_width(420.0));
             ui.end_row();
             ui.label("OAuth client secret");
-            ui.add(egui::TextEdit::singleline(&mut self.draft.youtube.client_secret).password(true).desired_width(420.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.youtube.client_secret).password(true).desired_width(420.0),
+            );
             ui.end_row();
             ui.label("Stream key id");
             let mut s = self.draft.youtube.stream_id.clone().unwrap_or_default();
