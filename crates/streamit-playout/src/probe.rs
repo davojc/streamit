@@ -16,6 +16,7 @@ pub const USAGE: &str = "usage:\n  play <file> <gain_db>\n  counter <seconds>";
 
 /// Runs the probe; `args` are everything after the program name.
 pub async fn run(args: &[String]) -> anyhow::Result<()> {
+    crate::loader::init().map_err(|e| anyhow!(e))?;
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["play", file, gain] => {
             let gain = gain.parse::<f32>().map_err(|_| anyhow!("bad gain_db {gain:?}"))?;

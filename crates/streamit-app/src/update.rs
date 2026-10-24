@@ -1,9 +1,7 @@
 //! Updates from the GitHub releases of davojc/streamit.
 //!
-//! Each release carries two Windows builds: the playout build (with GStreamer, for the
-//! playout PC) and the plain build (no DeckLink or NDI, for any other PC). A running
-//! StreamIt only ever moves to the same kind of build it is. Installing replaces the
-//! running exe in place; the new version runs from the next start. The window offers it
+//! Each release carries one Windows exe, built with GStreamer delay-loaded, so it runs
+//! on the playout PC and on any other PC. Installing replaces the running exe in place; the new version runs from the next start. The window offers it
 //! only while no service is running (the same rule as the simulation switch).
 use semver::Version;
 use serde::Deserialize;
@@ -13,9 +11,8 @@ use std::time::Duration;
 
 const LATEST_URL: &str = "https://api.github.com/repos/davojc/streamit/releases/latest";
 pub const RELEASES_PAGE: &str = "https://github.com/davojc/streamit/releases";
-/// The release file this build updates from.
-pub const ASSET: &str =
-    if cfg!(feature = "gst") { "streamit-windows-x64-playout.exe" } else { "streamit-windows-x64.exe" };
+/// The release file StreamIt updates from.
+pub const ASSET: &str = "streamit-windows-x64.exe";
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
@@ -153,31 +150,28 @@ mod tests {
         )
     }
 
-    const BOTH: &str = r#"
-        {"name":"streamit-windows-x64.exe","browser_download_url":"https://x/plain.exe","digest":"sha256:AB12"},
-        {"name":"streamit-windows-x64-playout.exe","browser_download_url":"https://x/playout.exe","digest":null}"#;
+    const ASSETS: &str = r#"
+        {"name":"notes.txt","browser_download_url":"https://x/notes.txt","digest":null},
+        {"name":"streamit-windows-x64.exe","browser_download_url":"https://x/streamit.exe","digest":"sha256:AB12"}"#;
 
     #[test]
-    fn a_newer_release_is_offered_with_this_builds_file() {
-        let r = newer(&release("v1.2.0", BOTH), "1.1.0", "streamit-windows-x64.exe").unwrap().unwrap();
+    fn a_newer_release_is_offered_with_its_exe() {
+        let r = newer(&release("v1.2.0", ASSETS), "1.1.0", "streamit-windows-x64.exe").unwrap().unwrap();
         assert_eq!(r.version, Version::new(1, 2, 0));
-        assert_eq!(r.url, "https://x/plain.exe");
+        assert_eq!(r.url, "https://x/streamit.exe", "only the exe, never another file");
         assert_eq!(r.sha256.as_deref(), Some("ab12"));
-        let p = newer(&release("v1.2.0", BOTH), "1.1.0", "streamit-windows-x64-playout.exe").unwrap().unwrap();
-        assert_eq!(p.url, "https://x/playout.exe", "the playout build never moves to the plain one");
-        assert_eq!(p.sha256, None);
     }
 
     #[test]
     fn same_or_older_releases_are_not_offered() {
-        assert_eq!(newer(&release("v1.1.0", BOTH), "1.1.0", "streamit-windows-x64.exe").unwrap(), None);
-        assert_eq!(newer(&release("1.0.9", BOTH), "1.1.0", "streamit-windows-x64.exe").unwrap(), None);
-        assert_eq!(newer(&release("v1.1.0", BOTH), "1.10.0", "streamit-windows-x64.exe").unwrap(), None);
+        assert_eq!(newer(&release("v1.1.0", ASSETS), "1.1.0", "streamit-windows-x64.exe").unwrap(), None);
+        assert_eq!(newer(&release("1.0.9", ASSETS), "1.1.0", "streamit-windows-x64.exe").unwrap(), None);
+        assert_eq!(newer(&release("v1.1.0", ASSETS), "1.10.0", "streamit-windows-x64.exe").unwrap(), None);
     }
 
     #[test]
     fn drafts_and_prereleases_are_skipped() {
-        let pre = release("v2.0.0", BOTH).replace(r#""prerelease":false"#, r#""prerelease":true"#);
+        let pre = release("v2.0.0", ASSETS).replace(r#""prerelease":false"#, r#""prerelease":true"#);
         assert_eq!(newer(&pre, "1.1.0", "streamit-windows-x64.exe").unwrap(), None);
     }
 
@@ -186,7 +180,7 @@ mod tests {
         let e = newer(&release("v1.2.0", ""), "1.1.0", "streamit-windows-x64.exe").unwrap_err();
         assert!(e.contains("no streamit-windows-x64.exe yet"), "{e}");
         assert!(newer("<html>", "1.1.0", "x").is_err());
-        assert!(newer(&release("latest", BOTH), "1.1.0", "x").is_err());
+        assert!(newer(&release("latest", ASSETS), "1.1.0", "x").is_err());
     }
 
     #[test]

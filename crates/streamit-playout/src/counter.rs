@@ -30,7 +30,7 @@ impl NdiCounter {
     /// Starts the NDI source (`ndi.source_name`) showing an empty frame. Blocks for up to
     /// 5 s while the pipeline starts.
     pub fn new(cfg: &NdiConfig) -> Result<Arc<NdiCounter>> {
-        gst::init().map_err(|e| other(format!("GStreamer init failed: {e}")))?;
+        crate::loader::init().map_err(other)?;
         let pipeline = gst::parse::launch(&counter_pipeline(&cfg.source_name, cfg.fg, cfg.bg))
             .map_err(other)?
             .downcast::<gst::Pipeline>()
