@@ -251,6 +251,8 @@ impl Broadcasts for YouTubeClient {
         let health = st["healthStatus"]["status"].as_str().unwrap_or("");
         Ok(match stream_status {
             "active" if health == "good" || health == "ok" => Health::Good,
+            // Active (the key is in use) but YouTube has no data: nothing is arriving.
+            "active" if health == "noData" => Health::NotReceiving,
             "active" => Health::Bad(if health.is_empty() { "no health reported".into() } else { health.into() }),
             "inactive" | "ready" => Health::NotReceiving,
             "" => Health::Bad("unknown".into()),

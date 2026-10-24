@@ -254,10 +254,11 @@ async fn health_maps_status() {
         health_for(json!({"streamStatus":"active","healthStatus":{"status":"bad"}}), some).await,
         Ok(Health::Bad(_))
     ));
-    assert!(matches!(
+    // Active but no data: nothing is arriving.
+    assert_eq!(
         health_for(json!({"streamStatus":"active","healthStatus":{"status":"noData"}}), some).await,
-        Ok(Health::Bad(_))
-    ));
+        Ok(Health::NotReceiving)
+    );
     assert!(matches!(health_for(json!({}), some).await, Ok(Health::Bad(_))));
     assert_eq!(health_for(json!({}), None).await, Err(DeviceError::Refused("no stream selected".into())));
 }

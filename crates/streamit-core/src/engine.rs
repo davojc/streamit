@@ -19,7 +19,7 @@
 use crate::audio::LiveLevels;
 use crate::config::Config;
 use crate::devices::{
-    self, BroadcastCheck, BroadcastSummary, DeviceError, Devices, Fix, LabelKind, LightingStatus, Phase,
+    self, BroadcastCheck, BroadcastSummary, DeviceError, Devices, Fix, Health, LabelKind, LightingStatus, Phase,
 };
 use crate::end::{EndOutcome, end_service};
 use crate::golive::{self, CountdownOutcome, CountdownReport, Readiness, Stage, Stage0Report, T0Error};
@@ -94,6 +94,9 @@ pub enum Command {
     },
     /// What the lighting console says now, from the health poll (`None`: not answering).
     LightingRead(Option<LightingStatus>),
+    /// YouTube's health for the stream key, from the poll while a service is under way
+    /// (`None`: not being checked).
+    StreamHealthRead(Option<Health>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -147,6 +150,10 @@ pub struct Snapshot {
     pub routing: RoutingState,
     /// The lighting console's show and active cue, while it answers.
     pub lighting: Option<LightingStatus>,
+    /// YouTube's health for the stream, checked from Prepare until the service ends.
+    pub stream_health: Option<Health>,
+    /// Live, and YouTube has not been receiving the stream for `STREAM_ALARM_AFTER`.
+    pub stream_alarm: bool,
 }
 
 /// How far the playing roll-in is.
@@ -187,6 +194,8 @@ impl Default for Snapshot {
             simulation: false,
             routing: RoutingState::default(),
             lighting: None,
+            stream_health: None,
+            stream_alarm: false,
         }
     }
 }
@@ -309,6 +318,10 @@ enum Wake {
     Aux(Aux),
 }
 
+/// How long YouTube may not receive the stream, while live, before StreamIt raises the
+/// alarm (a short gap is normal when the encoder reconnects).
+pub const STREAM_ALARM_AFTER: Duration = Duration::from_secs(20);
+
 pub struct Engine {
     d: Devices,
     config: Arc<RwLock<Config>>,
@@ -339,6 +352,8 @@ pub struct Engine {
     /// The devices are pretend ones: a sequence still running when the engine stops is
     /// aborted (simulated crash) rather than left to finish.
     simulation: bool,
+    /// Since when YouTube has not been receiving the stream, while live.
+    not_receiving_since: Option<tokio::time::Instant>,
 }
 
 impl Engine {
@@ -382,6 +397,7 @@ impl Engine {
             key_flash_gen: 0,
             aux,
             simulation,
+            not_receiving_since: None,
         };
         tokio::spawn(engine.run(rx, aux_rx).in_current_span());
         EngineHandle { tx, rx: srx }
@@ -727,6 +743,34 @@ impl Engine {
                     }
                     .in_current_span(),
                 );
+            }
+            Command::StreamHealthRead(health) => {
+                let health = health.clone();
+                let live = self.stage() == Stage::Live;
+                let receiving = !matches!(health, Some(Health::NotReceiving));
+                let was_alarm = self.snap.borrow().stream_alarm;
+                let now = tokio::time::Instant::now();
+                if !live || receiving {
+                    self.not_receiving_since = None;
+                } else {
+                    self.not_receiving_since.get_or_insert(now);
+                }
+                let alarm = self.not_receiving_since.is_some_and(|t| now.duration_since(t) >= STREAM_ALARM_AFTER);
+                if alarm && !was_alarm {
+                    warn!("YouTube is not receiving the stream");
+                    set_warning(
+                        &self.snap,
+                        "YouTube is not receiving the stream: check the Web Presenter and the internet".into(),
+                    );
+                    self.set(|s| log(s, "YouTube stopped receiving the stream".into()));
+                } else if was_alarm && !alarm && live && receiving {
+                    info!("YouTube is receiving the stream again");
+                    self.set(|s| log(s, "YouTube receiving the stream again".into()));
+                }
+                self.set(|s| {
+                    s.stream_health = health;
+                    s.stream_alarm = alarm;
+                });
             }
             Command::LightingRead(status) => {
                 let status = status.clone();
@@ -3228,5 +3272,57 @@ mod tests {
         until(&mut e, "the status", |s| s.lighting == Some(st.clone())).await;
         send(&e, Command::LightingRead(None)).await;
         until(&mut e, "no status", |s| s.lighting.is_none()).await;
+    }
+
+    // ---- stream health
+
+    async fn health_read(e: &EngineHandle, h: Health) {
+        send(e, Command::StreamHealthRead(Some(h))).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn not_receiving_while_live_alarms_after_20_s_and_clears() {
+        let (d, _log, h) = rig();
+        h.yt.set_life_cycle("live");
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        until(&mut e, "live", |s| s.stage == Stage::Live).await;
+        health_read(&e, Health::NotReceiving).await;
+        let s = until(&mut e, "the reading", |s| s.stream_health == Some(Health::NotReceiving)).await;
+        assert!(!s.stream_alarm, "a short gap is not an alarm");
+        sleep(Duration::from_secs(21)).await;
+        health_read(&e, Health::NotReceiving).await;
+        let s = until(&mut e, "the alarm", |s| s.stream_alarm).await;
+        assert!(s.last_warning.unwrap().contains("not receiving the stream"));
+        assert!(s.activity.iter().any(|a| a.text == "YouTube stopped receiving the stream"));
+        health_read(&e, Health::Good).await;
+        let s = until(&mut e, "the all-clear", |s| !s.stream_alarm).await;
+        assert!(s.activity.iter().any(|a| a.text == "YouTube receiving the stream again"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poor_health_or_not_live_never_alarms() {
+        let (d, _log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        // Idle: not receiving is expected.
+        health_read(&e, Health::NotReceiving).await;
+        sleep(Duration::from_secs(30)).await;
+        health_read(&e, Health::NotReceiving).await;
+        let s = until(&mut e, "the reading", |s| s.stream_health == Some(Health::NotReceiving)).await;
+        assert!(!s.stream_alarm);
+        send(&e, Command::StreamHealthRead(None)).await;
+        until(&mut e, "not checked", |s| s.stream_health.is_none()).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiving_but_poor_is_shown_but_not_an_alarm() {
+        let (d, _log, h) = rig();
+        h.yt.set_life_cycle("live");
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        until(&mut e, "live", |s| s.stage == Stage::Live).await;
+        health_read(&e, Health::Bad("bad".into())).await;
+        sleep(Duration::from_secs(30)).await;
+        health_read(&e, Health::Bad("bad".into())).await;
+        let s = until(&mut e, "the reading", |s| s.stream_health == Some(Health::Bad("bad".into()))).await;
+        assert!(!s.stream_alarm);
     }
 }

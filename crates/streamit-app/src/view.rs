@@ -652,6 +652,19 @@ pub fn yt_state_text(life_cycle: Option<&str>) -> String {
     }
 }
 
+/// The Service tab's YouTube strip: its colour and words, from YouTube's stream health.
+pub fn stream_health_line(h: &Health, alarm: bool) -> (Tone, String) {
+    match h {
+        Health::Good => (Tone::Green, "YouTube is receiving the stream".into()),
+        Health::Bad(why) if why.starts_with("could not check") => (Tone::Amber, format!("YouTube stream health {why}")),
+        Health::Bad(why) => (Tone::Amber, format!("YouTube is receiving the stream, but it is poor ({why})")),
+        Health::NotReceiving if alarm => {
+            (Tone::Red, "YouTube is NOT receiving the stream. Check the Web Presenter and the internet.".into())
+        }
+        Health::NotReceiving => (Tone::Amber, "YouTube is not receiving the stream yet".into()),
+    }
+}
+
 pub fn health_text(h: &Health) -> String {
     match h {
         Health::Good => "good".into(),
@@ -1158,5 +1171,19 @@ mod tests {
         );
         assert_eq!(sim_default_note(&fields, "videohub.fallback_normal_input", 13), None);
         assert_eq!(sim_default_note(&[], "videohub.input8_output", 11), None);
+    }
+
+    #[test]
+    fn the_youtube_strip_says_what_youtube_sees() {
+        assert_eq!(stream_health_line(&Health::Good, false).0, Tone::Green);
+        let (tone, text) = stream_health_line(&Health::Bad("bad".into()), false);
+        assert_eq!(tone, Tone::Amber);
+        assert!(text.contains("poor (bad)"), "{text}");
+        assert_eq!(stream_health_line(&Health::NotReceiving, false).0, Tone::Amber, "before the alarm");
+        let (tone, text) = stream_health_line(&Health::NotReceiving, true);
+        assert_eq!(tone, Tone::Red);
+        assert!(text.contains("NOT receiving"), "{text}");
+        let (_, text) = stream_health_line(&Health::Bad("could not check: offline".into()), false);
+        assert_eq!(text, "YouTube stream health could not check: offline");
     }
 }

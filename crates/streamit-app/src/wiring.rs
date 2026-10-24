@@ -26,6 +26,8 @@ use tracing::{Instrument, info, warn};
 
 /// How often every device is polled.
 pub const POLL_EVERY: Duration = Duration::from_secs(2);
+/// How often YouTube's stream health is checked during a service (1 quota unit each).
+pub const STREAM_HEALTH_EVERY: Duration = Duration::from_secs(12);
 /// A poll with no answer in this time is a warning.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long startup waits for the network devices' first state before the engine's
@@ -688,7 +690,33 @@ pub fn spawn_health_poll(
         async move {
             let mut last_routing = None;
             let mut last_lighting = None;
+            let mut stream_checked: Option<tokio::time::Instant> = None;
+            let mut stream_sent = false;
             loop {
+                // YouTube's stream health, from Prepare until the service ends.
+                let active = {
+                    let s = snap.borrow();
+                    matches!(s.stage, Stage::Prepared(_) | Stage::Countdown { .. } | Stage::Live | Stage::Ending { .. })
+                };
+                if active {
+                    if stream_checked.is_none_or(|t| t.elapsed() >= STREAM_HEALTH_EVERY) {
+                        stream_checked = Some(tokio::time::Instant::now());
+                        let h = match probes.devices.yt.health().await {
+                            Ok(h) => h,
+                            Err(e) => Health::Bad(format!("could not check: {e}")),
+                        };
+                        if tx.send(Command::StreamHealthRead(Some(h))).await.is_err() {
+                            return;
+                        }
+                        stream_sent = true;
+                    }
+                } else if stream_sent {
+                    stream_checked = None;
+                    stream_sent = false;
+                    if tx.send(Command::StreamHealthRead(None)).await.is_err() {
+                        return;
+                    }
+                }
                 let lighting = probes.read_lighting().await;
                 if last_lighting.as_ref() != Some(&lighting) {
                     if tx.send(Command::LightingRead(lighting.clone())).await.is_err() {

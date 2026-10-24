@@ -37,6 +37,9 @@ impl StreamItApp {
         let screen = view::service_screen(snap);
         let top = ui.cursor().top();
         self.alerts(ui, snap, screen);
+        if let Some(h) = &snap.stream_health {
+            stream_health_strip(ui, h, snap.stream_alarm);
+        }
         let tall = (viewport - (ui.cursor().top() - top) - 2.0).max(480.0);
         match screen {
             ServiceScreen::BeforeService => self.before_service(ui, snap, c, tall),
@@ -218,6 +221,27 @@ impl StreamItApp {
 }
 
 // ---------------------------------------------------------------- shared pieces
+
+/// What YouTube says about the stream, from Prepare until the service ends.
+fn stream_health_strip(ui: &mut Ui, h: &streamit_core::devices::Health, alarm: bool) {
+    let (tone, text) = view::stream_health_line(h, alarm);
+    let (fill, stroke, colour) = match tone {
+        Tone::Green => (theme::GREEN_DARK, theme::GREEN_BORDER, theme::TEXT),
+        Tone::Red => (theme::RED_DARK, theme::RED, theme::RED_SOFT),
+        _ => (theme::AMBER_DARK, theme::AMBER_BORDER, theme::AMBER_TEXT),
+    };
+    theme::panel().fill(fill).stroke(egui::Stroke::new(1.0, stroke)).inner_margin(egui::Margin::symmetric(16, 8)).show(
+        ui,
+        |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                theme::dot(ui, theme::tone_color(tone));
+                ui.label(RichText::new(text).color(colour).strong());
+            });
+        },
+    );
+    ui.add_space(10.0);
+}
 
 fn warning_bar(ui: &mut Ui, text: &str) {
     theme::panel()

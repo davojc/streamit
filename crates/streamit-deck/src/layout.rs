@@ -379,6 +379,10 @@ fn blank() -> KeyLook {
 }
 
 fn status_look(snap: &Snapshot, kind: DeviceKind, label: &str) -> KeyLook {
+    // Live and YouTube is not receiving the stream: as bad as YouTube being down.
+    if kind == DeviceKind::YouTube && snap.stream_alarm {
+        return look("YOUTUBE\nNO STREAM", RED, WHITE);
+    }
     match snap.device_status.get(&kind) {
         Some(DeviceHealth::Ok) => look(label, GREEN, WHITE),
         Some(DeviceHealth::Warning(_)) => look(label, AMBER, BLACK),
@@ -635,6 +639,17 @@ mod tests {
         assert_eq!(text(Page::Target(Target::MultiView), 3), "");
         assert_eq!(text(Page::Target(Target::StreamAtem), 3), "STREAM\nATEM");
         assert_eq!(text(Page::Target(Target::ScreensAtem), 3), "SCREENS\nATEM");
+    }
+
+    #[test]
+    fn the_youtube_key_goes_red_when_the_stream_is_not_arriving() {
+        let mut s = Snapshot::default();
+        s.device_status.insert(DeviceKind::YouTube, DeviceHealth::Ok);
+        assert_eq!(appearance(Page::Home, 4, &s, true).bg, GREEN);
+        s.stream_alarm = true;
+        let l = appearance(Page::Home, 4, &s, true);
+        assert_eq!((l.text.as_str(), l.bg), ("YOUTUBE\nNO STREAM", RED));
+        assert_eq!(appearance(Page::Stream, 5, &s, true).bg, RED, "on the Stream page too");
     }
 
     #[test]
