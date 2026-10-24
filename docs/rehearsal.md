@@ -9,9 +9,10 @@ Do Part 0 at the desk any time. Do Part A once. Do Part B in order. Write the re
 Do this first, at the desk, with no kit. Nothing real is touched and no broadcast is needed. Part B is the real rehearsal.
 
 1. Open StreamIt. Go to Settings, then Equipment, then the Simulation card. Press **Switch to simulation**. The amber banner appears and a Simulation tab is added.
-2. On the Simulation tab, set the speed. 4× is good for drills. Press **Reset simulation** between drills.
-3. Run to the step the drill needs: **Prepare**, then the countdown, then live, then play a video from the Service tab.
-4. When you finish, press **Leave simulation** on the Simulation card. It works only when the stage is Idle or Ended.
+2. On the Simulation tab, set the speed. 4× is good for drills.
+3. **Reset between drills:** press **End service** first (on the Service tab or in the **MORE** menu), then **Reset simulation** on the Simulation tab. Reset works only when the stage is Idle or Ended and nothing is running.
+4. Run to the step the drill needs: **Prepare**, then **Start countdown**, then live, then play a video from the Service tab.
+5. When you finish, press **Leave simulation** on the Simulation card. It works only when the stage is Idle or Ended.
 
 If the Stream Deck is down, use the **MORE** menu in the window (Start service now, Go public now, End broadcast, End service).
 
@@ -19,7 +20,7 @@ Drills. Each fault button breaks one thing. Press it again to put it right.
 
 - **VideoHub unplugged mid-video.** Play a video. Press **Unplug VideoHub**. Let the video end, or press **Stop video**. A warning appears. Press **Unplug VideoHub** again to plug it back in, then press **Recover**. Pass if the warning clears and Camera 8 is back on input 8.
 - **YouTube refuses public.** Press **YouTube refuses public**. Start the countdown, or press **Start service now**. The picture still cuts on time. A warning appears with **Retry going public**. Press **YouTube refuses public** again to let it through, then press **Retry going public**. Pass if the broadcast shows as public.
-- **Mic fade fails at T-0.** Press **Mic fade fails**. Start the countdown and let it reach T-0. A warning appears. Press **Mic fade fails** again to fix it, then press **Recover**. Pass if the mics come up.
+- **Mic fade fails at T-0.** Press **Mic fade fails**. Press **Start countdown** on the Service tab (or the COUNTDOWN key) and let it reach T-0. A warning appears. Press **Mic fade fails** again to fix it, then press **Recover**. Pass if the mics come up.
 - **Crash & restart mid-video.** Play a video. Press **Crash & restart app**. StreamIt restarts against the same pretend equipment and changes nothing by itself. Press **Recover**. Pass if the right input is on air and the mics are right.
 
 ## Part A. Before the rehearsal
@@ -196,22 +197,22 @@ Open StreamIt (`target\release\streamit.exe`) and go to the Settings tab.
 6. **Playout.** Set the countdown file, the DeckLink device, and the NDI source name `StreamIt Countdown`.
 7. Press **Save**. Then **restart StreamIt**. Device addresses, roles, the YouTube client and key, and the playout and NDI settings only apply after a restart.
 8. After the restart, launch on the church network and check: the discovered kit is listed, the roles stuck, and the Stream Deck shows live status for each device. Startup must not change any device. In the log (`%APPDATA%\StreamIt\logs`) there should be no commands sent during startup.
-9. Add at least two short videos to the cue list on the Run tab: one for the hall and online, one with a return input.
+9. Add at least two short videos on the **Videos** tab (**Add videos…**): one for the hall and online, one with a return input.
 
 ## Part B. The rehearsal
 
-Select the private test broadcast in the Run tab. Keep it private until check 3. Press keys on the Stream Deck or the matching buttons on the Run tab. Both do the same thing. Do the checks in order.
+On the **Service** tab, select the private test broadcast in the **Pre-flight checks** panel (the broadcast list at its top). Keep it private until check 3. Press keys on the Stream Deck or the matching buttons in the window. Both do the same thing. The window's buttons: **Prepare** and **Start countdown** on the Service tab; **Play**, **Stop video** and **Unmute mics** in the Service tab's video list once live; **End service** on the live screen; and the **MORE** menu (right of the step bar) for Start service now, Go public now, End broadcast and End service. Do the checks in order.
 
 1. **Stage 0: the checks.**
-   Look at the checks list. Turn Auto Start on in YouTube Studio for the test broadcast. Press **Fix** next to Auto Start. Auto Start must go off.
+   Look at the Pre-flight checks on the Service tab. Turn Auto Start on in YouTube Studio for the test broadcast. Press **Fix** next to Auto Start. Auto Start must go off.
    *Pass if:* all the checks show (stream key, Auto Start off, Auto Stop on, monitor stream on). The Auto Start check fails when you turn it on, and **Fix** turns it off again. Nothing else changes by itself.
 
 2. **Prepare.**
-   Press PREPARE (Stream Deck key or Run tab button).
+   Press PREPARE (Stream Deck key, or **Prepare** on the Service tab).
    *Pass if:* the opening still is on air and silent. The Web Presenter is streaming. The stage reaches READY within 60 s. The broadcast is in `testing` in YouTube Studio.
 
 3. **Countdown.**
-   Press COUNT DOWN. Watch the hall screen, your NDI receiver, and YouTube Studio.
+   Press COUNT DOWN (Stream Deck key, or **Start countdown** on the Service tab). Watch the hall screen, your NDI receiver, and YouTube Studio.
    *Pass if:* the hall shows the countdown. The NDI counter is yellow on the NDI receiver. The broadcast goes public at T-10s. **Measure the go-public latency:** the time in seconds from the moment the countdown reaches T-10s to the moment YouTube Studio shows the broadcast as Public. Write it in Part C.
 
 4. **T-0.**
