@@ -221,8 +221,7 @@ pub fn appearance(key: u8, snap: &Snapshot, blink_phase: bool) -> KeyLook {
             let mut l = phase_look(&snap.stage);
             if snap.simulation {
                 // Simulation is always visible: SIM under the stage, colours unchanged.
-                l.text.push_str("
-SIM");
+                l.text.push_str("\nSIM");
             }
             l
         }

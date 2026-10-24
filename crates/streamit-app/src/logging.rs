@@ -6,9 +6,10 @@
 //! for practice. Every event inside the `simulation` span (see [`simulation_span`]) goes
 //! to the sim file only, and every other event to the real file only, so a practice run
 //! never muddles the record of a real service. The simulation session runs its engine,
-//! command log and health poll inside that span, and the engine's tasks carry it on.
+//! snapshot log and health poll inside that span (the engine's tasks carry it on), and
+//! the session's router logs each command in the span of the session it goes to.
 //!
-//! Every Command (through the command log in the session), device health change, device
+//! Every Command (logged by the session's router), device health change, device
 //! error and engine warning is logged at `info` or above. Tokens and the OAuth client
 //! secret are never logged: nothing here formats the config, and the YouTube crate logs
 //! no credentials. `RUST_LOG` overrides the default `info` level.
@@ -35,10 +36,14 @@ pub fn log_dir() -> PathBuf {
     }
 }
 
-/// The span a simulation session runs in. At `error` level so that no `RUST_LOG`
-/// setting (short of `off`) can disable it and send practice events to the real log.
+/// The simulation span's own target. Nothing else logs under it, and [`env_filter`]
+/// always enables it, so no `RUST_LOG` (a level or a list of targets) can switch the span
+/// off and send practice events to the real log.
+pub const SIM_TARGET: &str = "streamit_simulation";
+
+/// The span a simulation session runs in.
 pub fn simulation_span() -> tracing::Span {
-    tracing::error_span!("simulation")
+    tracing::span!(target: SIM_TARGET, tracing::Level::ERROR, "simulation")
 }
 
 /// The event happens inside the simulation span (at any depth).
@@ -77,12 +82,20 @@ fn daily(dir: &Path, prefix: &str) -> Option<RollingFileAppender> {
         .ok()
 }
 
+/// The level filter from `spec` (RUST_LOG syntax), always enabling the simulation span
+/// (its own target, see [`simulation_span`]) whatever `spec` names, so the routing holds.
+pub fn env_filter(spec: &str) -> EnvFilter {
+    let always = format!("{SIM_TARGET}=error").parse().expect("a valid directive");
+    EnvFilter::new(spec).add_directive(always)
+}
+
 /// Installs the global subscriber. `console` adds a stderr layer (probes run from a
 /// terminal). Keep the guards alive until exit so the files are flushed.
 pub fn init(console: bool) -> Vec<WorkerGuard> {
     // The graphics stack logs its adapter list at info; keep it out of the service log.
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,wgpu_hal=warn,wgpu_core=warn,egui_wgpu=warn,naga=warn"));
+    const DEFAULT: &str = "info,wgpu_hal=warn,wgpu_core=warn,egui_wgpu=warn,naga=warn";
+    let spec = std::env::var("RUST_LOG").ok().filter(|s| EnvFilter::try_new(s).is_ok());
+    let filter = env_filter(spec.as_deref().unwrap_or(DEFAULT));
     let dir = log_dir();
     let made = std::fs::create_dir_all(&dir).is_ok();
     let real = if made { daily(&dir, "streamit") } else { None };
@@ -172,5 +185,23 @@ pub mod tests {
         for line in ["sim-one", "sim-nested", "sim-task"] {
             assert!(sim.contains(line) && !real.contains(line), "{line}: real {real:?} sim {sim:?}");
         }
+    }
+
+    /// A RUST_LOG that names only some targets must not switch the simulation span off,
+    /// or practice events would land in the real log.
+    #[test]
+    fn target_scoped_rust_log_keeps_the_routing() {
+        let (real, sim) = (Buf::default(), Buf::default());
+        let (r, s) = (real.clone(), sim.clone());
+        let subscriber = tracing_subscriber::registry()
+            .with(env_filter("off,streamit::logging::tests=info"))
+            .with(file_layers(move || r.clone(), move || s.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("real-one");
+            simulation_span().in_scope(|| tracing::info!("sim-one"));
+        });
+        let (real, sim) = (real.text(), sim.text());
+        assert!(real.contains("real-one") && !real.contains("sim-one"), "real {real:?}");
+        assert!(sim.contains("sim-one"), "sim {sim:?}");
     }
 }

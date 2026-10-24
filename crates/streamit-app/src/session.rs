@@ -1,14 +1,17 @@
 //! Sessions: the real ↔ simulation switch.
 //!
 //! A session is one mode's device layer (built by a [`DeviceFactory`]), its engine, its
-//! command log, its snapshot log and its health poll. The window and the Stream Deck
-//! never hold a session: they hold the [`Front`], whose command channel and snapshot
-//! stay the same across switches. Commands sent to the front go to the current
-//! session's engine (through its command log), and its snapshots come back out.
+//! snapshot log and its health poll. The window and the Stream Deck never hold a
+//! session: they hold the [`Front`], whose command channel and snapshot stay the same
+//! across switches. One router passes (and logs) each front command to the current
+//! session's engine through a gate, and the engine's snapshots come back out.
 //!
 //! The app always starts in real mode. A switch is refused unless nothing is happening
-//! (stage Idle or Ended, and no job); it stops the old session completely, then opens the
-//! new one. Opening the real session is the normal read-only startup. The simulation
+//! (stage Idle or Ended, and no job). It closes the gate (later presses are dropped),
+//! waits until every press already on its way has reached the old engine, checks again,
+//! and only then stops the old session completely and opens the new one, so no press
+//! made in one world can ever run in the other. Opening the real session is the normal
+//! read-only startup. The simulation
 //! session builds only pretend devices: [`SimFactory`] never touches `wiring`, mDNS or a
 //! socket, and the real factory is not called while simulating.
 //!
@@ -21,7 +24,8 @@ use crate::logging::simulation_span;
 use crate::wiring::{self, Absent, Probes};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use streamit_core::audio::LiveLevels;
 use streamit_core::config::Config;
@@ -31,10 +35,20 @@ use streamit_core::golive::Stage;
 use streamit_sim::{SimControl, Speed};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle};
-use tracing::{Instrument, Span, info, warn};
+use tracing::{Instrument, Span, error, info, warn};
 
 /// What a refused switch says.
 pub const REFUSED: &str = "Finish or end the service first";
+/// What a switch says while the engine is still in its startup check.
+pub const CHECKING: &str = "Still checking the equipment — try again in a moment";
+/// The simulation could not be opened; the real equipment was reopened.
+pub const SIM_FAILED: &str = "The simulation could not start; StreamIt is back in real mode";
+/// Neither mode could be opened: nothing more can be switched.
+pub const BROKEN: &str = "StreamIt could not reopen the equipment: restart StreamIt";
+/// Longest a switch waits for presses already on their way to reach the engine.
+pub const DRAIN_WAIT: Duration = Duration::from_secs(2);
+/// How long the engine is given to act on the last press it took.
+const SETTLE: Duration = Duration::from_millis(20);
 /// Longest a stopping session waits for its engine and the engine's side tasks to let go
 /// of the devices. A side task still running then (a slow YouTube call) finishes on its
 /// own; it holds the old devices only until it does.
@@ -203,26 +217,40 @@ pub struct Front {
     pub sim_defaults: watch::Receiver<Vec<&'static str>>,
     /// The current session's YouTube, for the window's broadcast list.
     pub yt: watch::Receiver<Arc<dyn Broadcasts>>,
+    /// True while one session is being stopped and the next opened.
+    #[allow(dead_code)] // read by the screens (Task 7)
+    pub switching: watch::Receiver<bool>,
+}
+
+/// Where the front's commands go: the current engine, and the span to log them in.
+#[derive(Clone)]
+struct Route {
+    tx: mpsc::Sender<Command>,
+    span: Span,
 }
 
 /// The senders behind the `Front`.
 struct Outputs {
-    /// The current session's command log; `None` while switching.
-    target: watch::Sender<Option<mpsc::Sender<Command>>>,
+    /// The current session's engine; `None` while the gate is closed for a switch.
+    target: watch::Sender<Option<Route>>,
+    /// Commands the router has taken but not yet handed to an engine (or dropped).
+    inflight: Arc<AtomicUsize>,
     snap: watch::Sender<Snapshot>,
     mode: watch::Sender<Mode>,
     sim: watch::Sender<Option<SimControl>>,
     sim_defaults: watch::Sender<Vec<&'static str>>,
     yt: watch::Sender<Arc<dyn Broadcasts>>,
-    /// The Stream Deck's last reported health: it reports only changes, so each new
-    /// engine is told it when it starts.
-    deck: Arc<Mutex<Option<DeviceHealth>>>,
+    switching: watch::Sender<bool>,
 }
 
 /// One running session.
 struct Session {
     mode: Mode,
-    /// The command log, snapshot forwarding, snapshot log and health poll.
+    /// The engine's command sender. Only this, the gate (`Outputs::target`) and the
+    /// health poll hold it, so the engine stops once the session is closed.
+    tx: mpsc::Sender<Command>,
+    span: Span,
+    /// The snapshot forwarding, snapshot log and health poll.
     tasks: Vec<JoinHandle<()>>,
     device_tasks: Vec<AbortHandle>,
     /// The engine's snapshot: closed once the engine and all its tasks have stopped.
@@ -233,13 +261,25 @@ struct Session {
     levels_file: PathBuf,
 }
 
-pub struct Sessions {
+impl Session {
+    fn route(&self) -> Route {
+        Route { tx: self.tx.clone(), span: self.span.clone() }
+    }
+}
+
+/// Everything a session is opened from, shared with the task that opens it.
+struct Inner {
     real: Arc<dyn DeviceFactory>,
     sim: Arc<dyn DeviceFactory>,
     /// The real config, shared with the window.
     config: Arc<RwLock<Config>>,
     paths: Paths,
     out: Outputs,
+}
+
+pub struct Sessions {
+    inner: Arc<Inner>,
+    /// `None` only if a switch failed and the real equipment could not be reopened.
     current: tokio::sync::Mutex<Option<Session>>,
 }
 
@@ -270,37 +310,84 @@ impl Sessions {
         let (sim_tx, sim_rx) = watch::channel(None);
         let (defaults, defaults_rx) = watch::channel(Vec::new());
         let (yt, yt_rx) = watch::channel(Absent::new("starting") as Arc<dyn Broadcasts>);
-        let out = Outputs { target, snap, mode, sim: sim_tx, sim_defaults: defaults, yt, deck: Arc::default() };
-        spawn_router(front_rx, target_rx, out.deck.clone());
-        let sessions = Sessions { real, sim, config, paths, out, current: tokio::sync::Mutex::new(None) };
-        let first = sessions.open(Mode::Real).await;
-        *sessions.current.lock().await = Some(first);
-        let front = Front { tx: front_tx, rx: snap_rx, mode: mode_rx, sim: sim_rx, sim_defaults: defaults_rx, yt: yt_rx };
+        let (switching, switching_rx) = watch::channel(false);
+        let inflight = Arc::new(AtomicUsize::new(0));
+        spawn_router(front_rx, target_rx, inflight.clone());
+        let out = Outputs { target, inflight, snap, mode, sim: sim_tx, sim_defaults: defaults, yt, switching };
+        let inner = Arc::new(Inner { real, sim, config, paths, out });
+        let first = Inner::open(inner.clone(), Mode::Real).await;
+        let sessions = Sessions { inner, current: tokio::sync::Mutex::new(Some(first)) };
+        let front = Front {
+            tx: front_tx,
+            rx: snap_rx,
+            mode: mode_rx,
+            sim: sim_rx,
+            sim_defaults: defaults_rx,
+            yt: yt_rx,
+            switching: switching_rx,
+        };
         (sessions, front)
     }
 
-    /// Switches to `to`: refused unless the stage is Idle or Ended with no job running.
+    /// Switches to `to`. Refused unless the stage is Idle or Ended with no job running,
+    /// checked again once every press already on its way has reached the engine.
     /// Stops the old session's engine, health poll and device tasks, then builds the new
     /// devices and spawns the new engine. Switching to the current mode does nothing.
     #[cfg_attr(not(test), allow(dead_code))] // called from Settings › Equipment (Task 7)
     pub async fn switch(&self, to: Mode) -> Result<(), SwitchRefused> {
         let mut current = self.current.lock().await;
-        let old = current.take().expect("a session is always open outside a switch");
+        let Some(old) = current.take() else {
+            return Err(SwitchRefused(BROKEN.into()));
+        };
         if old.mode == to {
             *current = Some(old);
             return Ok(());
         }
-        // The engine's own snapshot is the latest word on what is happening.
+        // 1. Busy now: refuse without touching the gate.
         if !may_switch(&old.engine.borrow()) {
             info!(to = ?to, "switch refused: a service or sequence is under way");
             *current = Some(old);
             return Err(SwitchRefused(REFUSED.into()));
         }
+        let out = &self.inner.out;
+        // 2. Close the gate: from here front presses are dropped (and logged).
+        out.target.send_replace(None);
+        // 3. Let every press already on its way reach the engine. An engine still in its
+        //    startup check is not reading commands yet: refuse rather than wait for it.
+        if !drained(&out.inflight, &old.tx).await {
+            info!(to = ?to, "switch refused: the engine is still in its startup check");
+            out.target.send_replace(Some(old.route()));
+            *current = Some(old);
+            return Err(SwitchRefused(CHECKING.into()));
+        }
+        // 4. A late press that started something runs in the world it was made in.
+        if !may_switch(&old.engine.borrow()) {
+            info!(to = ?to, "switch refused: a press just before the switch started a sequence");
+            out.target.send_replace(Some(old.route()));
+            *current = Some(old);
+            return Err(SwitchRefused(REFUSED.into()));
+        }
+        // 5. Nothing can reach the old engine now: stop it and open the new mode.
         info!(from = ?old.mode, to = ?to, "switching mode");
-        self.close(old).await;
-        *current = Some(self.open(to).await);
-        info!(mode = ?to, "mode switched");
-        Ok(())
+        out.switching.send_replace(true);
+        self.inner.close(old).await;
+        let result = match Inner::open_guarded(self.inner.clone(), to).await {
+            Some(s) => {
+                *current = Some(s);
+                info!(mode = ?to, "mode switched");
+                Ok(())
+            }
+            None if to == Mode::Real => Err(SwitchRefused(BROKEN.into())),
+            None => match Inner::open_guarded(self.inner.clone(), Mode::Real).await {
+                Some(s) => {
+                    *current = Some(s);
+                    Err(SwitchRefused(SIM_FAILED.into()))
+                }
+                None => Err(SwitchRefused(BROKEN.into())),
+            },
+        };
+        out.switching.send_replace(false);
+        result
     }
 
     /// The levels file the current engine saves to.
@@ -308,22 +395,57 @@ impl Sessions {
     pub async fn levels_file(&self) -> PathBuf {
         self.current.lock().await.as_ref().expect("open").levels_file.clone()
     }
+}
 
-    /// Builds `mode`'s devices and starts its engine, logs and poll, then points the
-    /// front at it.
-    async fn open(&self, mode: Mode) -> Session {
+/// Waits until no front press is between the router and the engine and the engine has
+/// taken every queued command, then a little longer so it has acted on the last one.
+/// False if that takes longer than `DRAIN_WAIT` (the engine is in its startup check).
+async fn drained(inflight: &AtomicUsize, engine: &mpsc::Sender<Command>) -> bool {
+    let quiet = || inflight.load(Ordering::SeqCst) == 0 && engine.capacity() == engine.max_capacity();
+    let settle = async {
+        loop {
+            if quiet() {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(SETTLE).await;
+                if quiet() {
+                    return;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    };
+    tokio::time::timeout(DRAIN_WAIT, settle).await.is_ok()
+}
+
+impl Inner {
+    /// `open` in a task of its own, so a factory that panics leaves the app able to
+    /// recover. `None` if it failed (and nothing of it is left running).
+    async fn open_guarded(inner: Arc<Inner>, mode: Mode) -> Option<Session> {
+        match tokio::spawn(Inner::open(inner, mode)).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                error!(mode = ?mode, "could not open {mode:?} mode: {e}");
+                None
+            }
+        }
+    }
+
+    /// Builds `mode`'s devices and starts its engine, snapshot log and health poll, then
+    /// points the front at it.
+    async fn open(inner: Arc<Inner>, mode: Mode) -> Session {
         let span = span_for(mode);
-        let real = self.config.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let real = inner.config.read().unwrap_or_else(|e| e.into_inner()).clone();
         let factory = match mode {
-            Mode::Real => &self.real,
-            Mode::Simulation => &self.sim,
+            Mode::Real => &inner.real,
+            Mode::Simulation => &inner.sim,
         };
         let built = factory.build(&real).instrument(span.clone()).await;
         let config = match built.config {
             Some(effective) => Arc::new(RwLock::new(effective)),
-            None => self.config.clone(),
+            None => inner.config.clone(),
         };
-        let levels_file = self.paths.levels_for(mode).to_path_buf();
+        let levels_file = inner.paths.levels_for(mode).to_path_buf();
         let (engine, tx, mut tasks) = {
             let _in = span.enter();
             // The mics' live levels from the last run of this mode, so Go Live and Recover
@@ -340,83 +462,113 @@ impl Sessions {
                 Some(levels_file.clone()),
                 mode == Mode::Simulation,
             );
-            let (tx, log) = spawn_command_log(engine.tx);
             let snap_log = spawn_snapshot_log(engine.rx.clone());
-            (engine.rx, tx, vec![log, snap_log])
+            (engine.rx, engine.tx, vec![snap_log])
         };
         for (kind, health) in &built.health {
             let _ = tx.send(Command::DeviceHealth(*kind, health.clone())).await;
-        }
-        let deck = self.out.deck.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(h) = deck {
-            let _ = tx.send(Command::DeviceHealth(DeviceKind::StreamDeck, h)).await;
         }
         if let Some(probes) = built.probes {
             let _in = span.enter();
             tasks.push(wiring::spawn_health_poll(probes, config, tx.clone(), engine.clone(), &built.health));
         }
-        tasks.push(spawn_forward(engine.clone(), self.out.snap.clone()));
-        self.out.yt.send_replace(built.devices.yt.clone());
-        self.out.sim.send_replace(built.sim.clone());
-        self.out.sim_defaults.send_replace(built.sim_defaults);
-        self.out.mode.send_replace(mode);
-        self.out.target.send_replace(Some(tx));
-        Session { mode, tasks, device_tasks: built.tasks, engine, sim: built.sim, levels_file }
+        let out = &inner.out;
+        tasks.push(spawn_forward(engine.clone(), out.snap.clone()));
+        out.yt.send_replace(built.devices.yt.clone());
+        out.sim.send_replace(built.sim.clone());
+        out.sim_defaults.send_replace(built.sim_defaults);
+        out.mode.send_replace(mode);
+        let session = Session { mode, tx, span, tasks, device_tasks: built.tasks, engine, sim: built.sim, levels_file };
+        // Opening the gate also tells the new engine the Stream Deck's health (the router
+        // remembers it; the deck reports only changes).
+        out.target.send_replace(Some(session.route()));
+        session
     }
 
-    /// Stops `s` completely: no command reaches it any more, its logs and health poll
-    /// stop, the front lets go of its devices, its engine stops (its command channel
-    /// closes with the command log), and its device tasks stop. The real clients'
-    /// reconnect loops end when their last handle (held by the engine, the poll and the
-    /// front) is dropped; the pretend player's end timer ends when the world is reset.
+    /// Stops `s` completely (the gate is already closed, so no command reaches it): its
+    /// snapshot log, forwarding and health poll stop, the front lets go of its devices,
+    /// its engine stops once its last command sender is dropped, and its device tasks
+    /// stop. The real clients' reconnect loops end when their last handle (held by the
+    /// engine, the poll and the front) is dropped; the pretend player's end timer ends
+    /// when the world is reset.
     async fn close(&self, s: Session) {
+        let Session { mode, tx, tasks, device_tasks, engine, sim, .. } = s;
         self.out.target.send_replace(None);
+        drop(tx);
         self.out.yt.send_replace(Absent::new("switching mode"));
         self.out.sim.send_replace(None);
-        for t in &s.tasks {
+        for t in &tasks {
             t.abort();
         }
-        for t in s.tasks {
+        for t in tasks {
             let _ = t.await;
         }
-        for t in &s.device_tasks {
+        for t in &device_tasks {
             t.abort();
         }
-        if let Some(sim) = &s.sim {
+        if let Some(sim) = &sim {
             sim.reset();
         }
-        let mut engine = s.engine;
+        let mut engine = engine;
         let stopped = tokio::time::timeout(STOP_WAIT, async { while engine.changed().await.is_ok() {} }).await;
         if stopped.is_err() {
-            warn!(
-                mode = ?s.mode,
-                "the old engine's side tasks are still finishing; they keep the old devices until they do"
+            error!(
+                mode = ?mode,
+                "the old engine has not stopped within {} s: its side tasks keep the old devices until they finish",
+                STOP_WAIT.as_secs()
             );
         }
     }
 }
 
-/// Passes each front command to the current session; while switching, drops it.
+/// Passes each front command to the current engine, logging it in that session's span;
+/// while the gate is closed, drops it. Remembers the Stream Deck's last health and tells
+/// each newly opened engine.
 fn spawn_router(
     mut rx: mpsc::Receiver<Command>,
-    target: watch::Receiver<Option<mpsc::Sender<Command>>>,
-    deck: Arc<Mutex<Option<DeviceHealth>>>,
+    mut target: watch::Receiver<Option<Route>>,
+    inflight: Arc<AtomicUsize>,
 ) {
     tokio::spawn(async move {
-        while let Some(cmd) = rx.recv().await {
-            if let Command::DeviceHealth(DeviceKind::StreamDeck, h) = &cmd {
-                *deck.lock().unwrap_or_else(|e| e.into_inner()) = Some(h.clone());
-            }
-            let to = target.borrow().clone();
-            let sent = match to {
-                Some(to) => to.send(cmd.clone()).await.is_ok(),
-                None => false,
-            };
-            if !sent {
-                info!(command = ?cmd, "switching mode: command dropped");
+        let mut deck: Option<DeviceHealth> = None;
+        loop {
+            tokio::select! {
+                changed = target.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let open = target.borrow_and_update().is_some();
+                    if let (true, Some(h)) = (open, deck.clone()) {
+                        deliver(&target, &inflight, Command::DeviceHealth(DeviceKind::StreamDeck, h)).await;
+                    }
+                }
+                cmd = rx.recv() => {
+                    let Some(cmd) = cmd else { return };
+                    if let Command::DeviceHealth(DeviceKind::StreamDeck, h) = &cmd {
+                        deck = Some(h.clone());
+                    }
+                    deliver(&target, &inflight, cmd).await;
+                }
             }
         }
     });
+}
+
+/// Hands `cmd` to the engine behind the gate. Counted in `inflight` from before the gate
+/// is read until the engine has it, so a switch can wait for it.
+async fn deliver(target: &watch::Receiver<Option<Route>>, inflight: &AtomicUsize, cmd: Command) {
+    inflight.fetch_add(1, Ordering::SeqCst);
+    let route = target.borrow().clone();
+    match route {
+        Some(route) => {
+            route.span.in_scope(|| log_command(&cmd));
+            if route.tx.send(cmd).await.is_err() {
+                route.span.in_scope(|| warn!("the engine has stopped; command dropped"));
+            }
+        }
+        None => info!(command = ?cmd, "switching mode: command dropped"),
+    }
+    inflight.fetch_sub(1, Ordering::SeqCst);
 }
 
 /// Copies the session's snapshots to the front.
@@ -429,32 +581,17 @@ fn spawn_forward(mut engine: watch::Receiver<Snapshot>, front: watch::Sender<Sna
     })
 }
 
-/// Every command from the window, the deck and the health poll passes through here and
-/// is logged before it reaches the engine. Holds the engine's only command sender, so
-/// stopping this task stops the engine.
-fn spawn_command_log(engine: mpsc::Sender<Command>) -> (mpsc::Sender<Command>, JoinHandle<()>) {
-    let (tx, mut rx) = mpsc::channel::<Command>(64);
-    let task = tokio::spawn(
-        async move {
-            while let Some(cmd) = rx.recv().await {
-                match &cmd {
-                    // Health changes are logged by the poll with their reason.
-                    Command::DeviceHealth(..) => {}
-                    Command::SetCues(cues) => {
-                        let names: Vec<&str> = cues.iter().map(|c| c.name.as_str()).collect();
-                        info!(cues = ?names, "command SetCues");
-                    }
-                    other => info!(command = ?other, "command"),
-                }
-                if engine.send(cmd).await.is_err() {
-                    warn!("the engine has stopped; dropping commands");
-                    return;
-                }
-            }
+/// Every command from the window and the deck is logged before it reaches the engine.
+fn log_command(cmd: &Command) {
+    match cmd {
+        // Health changes are logged by the poll (and the deck) with their reason.
+        Command::DeviceHealth(..) => {}
+        Command::SetCues(cues) => {
+            let names: Vec<&str> = cues.iter().map(|c| c.name.as_str()).collect();
+            info!(cues = ?names, "command SetCues");
         }
-        .in_current_span(),
-    );
-    (tx, task)
+        other => info!(command = ?other, "command"),
+    }
 }
 
 /// The stage without its ticking clock, so the log has one line per real change.
@@ -516,6 +653,9 @@ mod tests {
         armed: AtomicBool,
         last_log: Mutex<Option<CallLog>>,
         last_stream: Mutex<Option<Weak<dyn StreamSwitcher>>>,
+        /// Each build's YouTube answers `upcoming` this late, holding the engine in its
+        /// startup check.
+        slow_startup: Mutex<Option<Duration>>,
     }
 
     impl Spy {
@@ -535,10 +675,34 @@ mod tests {
         async fn build(&self, _c: &Config) -> Built {
             assert!(!self.armed.load(Ordering::SeqCst), "this factory must not be called now");
             self.builds.fetch_add(1, Ordering::SeqCst);
-            let (devices, log, _h) = fake_devices();
+            let (devices, log, h) = fake_devices();
+            if let Some(d) = *self.slow_startup.lock().unwrap() {
+                h.yt.set_delay("upcoming", d);
+            }
             *self.last_log.lock().unwrap() = Some(log);
             *self.last_stream.lock().unwrap() = Some(Arc::downgrade(&devices.stream));
             Built::plain(devices)
+        }
+    }
+
+    /// A factory that takes `.0` to build.
+    struct Slow<F>(Duration, F);
+
+    #[async_trait]
+    impl<F: DeviceFactory> DeviceFactory for Slow<F> {
+        async fn build(&self, c: &Config) -> Built {
+            tokio::time::sleep(self.0).await;
+            self.1.build(c).await
+        }
+    }
+
+    /// A factory that fails.
+    struct Panics;
+
+    #[async_trait]
+    impl DeviceFactory for Panics {
+        async fn build(&self, _c: &Config) -> Built {
+            panic!("this factory fails");
         }
     }
 
@@ -556,8 +720,17 @@ mod tests {
         real: Arc<dyn DeviceFactory>,
         sim: Arc<dyn DeviceFactory>,
     ) -> (Sessions, Front, PathBuf, Paths) {
+        start_cfg(name, real, sim, Config::default()).await
+    }
+
+    async fn start_cfg(
+        name: &str,
+        real: Arc<dyn DeviceFactory>,
+        sim: Arc<dyn DeviceFactory>,
+        c: Config,
+    ) -> (Sessions, Front, PathBuf, Paths) {
         let (config, p) = paths(name);
-        let shared = Arc::new(RwLock::new(Config::default()));
+        let shared = Arc::new(RwLock::new(c));
         let (s, f) = Sessions::start(real, sim, shared, p.clone()).await;
         (s, f, config, p)
     }
@@ -612,6 +785,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn simulation_builds_no_real_devices() {
         let real = Arc::new(Spy::default());
+        // The real SimFactory: it builds only streamit_sim's pretend devices (SimControl)
+        // and never calls wiring::build, discovery or any client's connect, so the only
+        // way a real client could be built here is through the real factory, armed below.
         let (s, front, ..) = start_with("nodev", real.clone(), Arc::new(SimFactory)).await;
         assert_eq!(real.builds(), 1, "the app starts in real mode");
         assert_eq!(*front.mode.borrow(), Mode::Real);
@@ -633,9 +809,24 @@ mod tests {
     async fn switch_refused_while_job_runs() {
         let sim = Arc::new(Spy::default());
         sim.arm();
-        let (s, front, ..) = start_with("job", Arc::new(Spy::default()), sim.clone()).await;
-        front.tx.send(Command::Prepare).await.unwrap();
-        wait_for(&front, "Prepare to run", |s| s.job.is_some()).await;
+        // A video in Idle: the stage stays Idle, so only the running job refuses the switch.
+        // (The fake player plays until told it ended.)
+        let mut c = Config::default();
+        c.videohub.input8_output = 12;
+        c.videohub.decklink_input = 40;
+        c.cues = vec![streamit_core::rollin::Cue {
+            path: PathBuf::from("v.mp4"),
+            name: "v".into(),
+            destination: streamit_core::rollin::Destination::AudioOnly,
+            gain_db: 0.0,
+            return_input: None,
+        }];
+        let (s, front, ..) = start_cfg("job", Arc::new(Spy::default()), sim.clone(), c).await;
+        front.tx.send(Command::PlayCue(0)).await.unwrap();
+        wait_for(&front, "the video to run", |s| s.job.is_some()).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let at = front.rx.borrow().clone();
+        assert_eq!((at.stage.clone(), at.job), (Stage::Idle, Some("a video")));
         assert_eq!(s.switch(Mode::Simulation).await, refused());
         assert_eq!(*front.mode.borrow(), Mode::Real);
         assert_eq!(sim.builds(), 0);
@@ -705,6 +896,103 @@ mod tests {
         s.switch(Mode::Simulation).await.unwrap();
         // The real clients' reconnect loops end when their last handle drops.
         assert!(weak.upgrade().is_none(), "the old session's devices are all released");
+    }
+
+    /// A press already on its way to the real engine (queued behind its slow startup
+    /// check) must never run on the real equipment once the mode reads Simulation.
+    #[tokio::test(start_paused = true)]
+    async fn prepare_sent_just_before_switch_never_runs_on_real_after_mode_reads_simulation() {
+        let real = Arc::new(Spy::default());
+        *real.slow_startup.lock().unwrap() = Some(Duration::from_secs(8));
+        let (s, front, ..) = start_with("race", real.clone(), Arc::new(SimFactory)).await;
+        front.tx.send(Command::Prepare).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await; // queued behind the startup check
+        let r = s.switch(Mode::Simulation).await;
+        let mode = *front.mode.borrow();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let ran_on_real = !real.calls().is_empty();
+        match r {
+            Ok(()) => {
+                assert_eq!(mode, Mode::Simulation);
+                assert!(!ran_on_real, "the press ran on the real equipment after the switch: {:?}", real.calls());
+            }
+            Err(e) => {
+                assert_eq!(e.0, CHECKING);
+                assert_eq!(*front.mode.borrow(), Mode::Real);
+                assert!(ran_on_real, "refused: the press runs in the world it was made in");
+            }
+        }
+    }
+
+    /// A press still waiting in the front's queue when the gate closes is dropped: it
+    /// reaches neither the old engine nor the new one.
+    #[tokio::test(start_paused = true)]
+    async fn press_queued_at_the_gate_is_dropped() {
+        let real = Arc::new(Spy::default());
+        let (s, front, ..) = start_with("gate", real.clone(), Arc::new(SimFactory)).await;
+        tokio::time::sleep(Duration::from_secs(30)).await; // past the startup check
+        // One thread: the router has not run between these two lines.
+        front.tx.send(Command::Prepare).await.unwrap();
+        s.switch(Mode::Simulation).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(real.calls(), vec![], "nothing ran on the real equipment");
+        let snap = front.rx.borrow().clone();
+        assert!(snap.simulation);
+        assert_eq!((snap.stage, snap.job), (Stage::Idle, None), "nor in the simulation");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn command_sent_during_switch_is_dropped_not_delivered_to_new_engine() {
+        let slow_sim = Arc::new(Slow(Duration::from_secs(3), SimFactory));
+        let (s, front, ..) = start_with("during", Arc::new(Spy::default()), slow_sim).await;
+        let s = Arc::new(s);
+        let sw = tokio::spawn({
+            let s = s.clone();
+            async move { s.switch(Mode::Simulation).await }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(*front.switching.borrow(), "the window can show the switch");
+        front.tx.send(Command::Prepare).await.unwrap();
+        sw.await.unwrap().unwrap();
+        assert!(!*front.switching.borrow());
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let snap = front.rx.borrow().clone();
+        assert!(snap.simulation);
+        assert_eq!((snap.stage, snap.job), (Stage::Idle, None), "the press was dropped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deck_health_reported_during_a_switch_reaches_the_new_engine() {
+        let slow_sim = Arc::new(Slow(Duration::from_secs(3), SimFactory));
+        let (s, front, ..) = start_with("deckmid", Arc::new(Spy::default()), slow_sim).await;
+        front.tx.send(Command::DeviceHealth(DeviceKind::StreamDeck, DeviceHealth::Ok)).await.unwrap();
+        let s = Arc::new(s);
+        let sw = tokio::spawn({
+            let s = s.clone();
+            async move { s.switch(Mode::Simulation).await }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let unplugged = DeviceHealth::Down("unplugged".into());
+        front.tx.send(Command::DeviceHealth(DeviceKind::StreamDeck, unplugged.clone())).await.unwrap();
+        sw.await.unwrap().unwrap();
+        wait_for(&front, "the deck's latest health", |s| {
+            s.simulation && s.device_status.get(&DeviceKind::StreamDeck) == Some(&unplugged)
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_open_falls_back_to_real() {
+        let real = Arc::new(Spy::default());
+        let (s, front, ..) = start_with("fail", real.clone(), Arc::new(Panics)).await;
+        let r = s.switch(Mode::Simulation).await;
+        assert!(r.is_err(), "{r:?}");
+        assert_eq!(*front.mode.borrow(), Mode::Real);
+        assert!(!*front.switching.borrow());
+        assert_eq!(real.builds(), 2, "the real equipment was reopened");
+        // Still usable.
+        front.tx.send(Command::Prepare).await.unwrap();
+        wait_for(&front, "Prepare on real", |s| !s.simulation && s.job.is_some()).await;
     }
 
     #[test]
