@@ -46,6 +46,13 @@ pub fn simulation_span() -> tracing::Span {
     tracing::span!(target: SIM_TARGET, tracing::Level::ERROR, "simulation")
 }
 
+/// Runs `f` (which logs a simulation control the operator used: speed, reset, faults,
+/// Crash & restart, the mode switch) inside the simulation span, so the window's own
+/// practice actions go to the sim log with the rest of the practice run.
+pub fn sim_action<R>(f: impl FnOnce() -> R) -> R {
+    simulation_span().in_scope(f)
+}
+
 /// The event happens inside the simulation span (at any depth).
 fn in_simulation<S>(cx: &Context<'_, S>) -> bool
 where
@@ -185,6 +192,22 @@ pub mod tests {
         for line in ["sim-one", "sim-nested", "sim-task"] {
             assert!(sim.contains(line) && !real.contains(line), "{line}: real {real:?} sim {sim:?}");
         }
+    }
+
+    /// M5: the window's simulation controls log to the sim log.
+    #[test]
+    fn sim_actions_go_to_the_sim_log() {
+        let (real, sim) = (Buf::default(), Buf::default());
+        let (r, s) = (real.clone(), sim.clone());
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info"))
+            .with(file_layers(move || r.clone(), move || s.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            sim_action(|| tracing::info!("simulation: speed X10"));
+        });
+        let (real, sim) = (real.text(), sim.text());
+        assert!(sim.contains("simulation: speed X10"), "sim {sim:?}");
+        assert!(!real.contains("simulation: speed"), "real {real:?}");
     }
 
     /// A RUST_LOG that names only some targets must not switch the simulation span off,

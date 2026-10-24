@@ -543,7 +543,11 @@ impl StreamItApp {
             Mode::Real => Mode::Simulation,
             Mode::Simulation => Mode::Real,
         };
-        info!(to = ?to, "switch pressed");
+        // Pressed while simulating: part of the practice run, so it goes to the sim log.
+        match from {
+            Mode::Simulation => crate::logging::sim_action(|| info!(to = ?to, "switch pressed")),
+            Mode::Real => info!(to = ?to, "switch pressed"),
+        }
         let sessions = self.sessions.clone();
         self.switch_job.start(&self.rt, &self.ctx, async move { sessions.switch(to).await });
     }
@@ -677,7 +681,13 @@ impl StreamItApp {
                 let w = ui.available_width();
                 ui.add_sized([w, FIELD_H], egui::TextEdit::singleline(&mut y.client_secret).password(true));
             });
-            field(&mut col[2], "Stream key id", |ui| opt_text(ui, &mut y.stream_id, "pick below"));
+            field(&mut col[2], "Stream key id", |ui| {
+                opt_text(ui, &mut y.stream_id, "pick below");
+                // The real id is shown (and saved); the simulation binds to its own stream.
+                if simulating {
+                    amber_note(ui, "(simulation uses its own pretend stream)");
+                }
+            });
         });
         ui.add_space(8.0);
         let (id, secret) = (self.draft.youtube.client_id.clone(), self.draft.youtube.client_secret.clone());

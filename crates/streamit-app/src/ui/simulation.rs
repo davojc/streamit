@@ -4,6 +4,7 @@
 //! reads and drives the pretend world through `Front.sim` (`SimControl`); nothing here
 //! goes through the engine except "Crash & restart app" (`Sessions::restart_engine`).
 use super::StreamItApp;
+use crate::logging::sim_action;
 use crate::session::Mode;
 use crate::theme::{self, Kind};
 use crate::view;
@@ -108,7 +109,7 @@ impl StreamItApp {
                         None => r,
                     };
                     if r.clicked() {
-                        info!("simulation: reset");
+                        sim_action(|| info!("simulation: reset"));
                         sim.reset();
                     }
                     if let Some(why) = reset.reason {
@@ -135,7 +136,7 @@ impl StreamItApp {
                 for input in view::sim_sources(mp) {
                     let lit = if v.stream_program == input { Lit::Program } else { Lit::Off };
                     if src_button(ui, &view::source_label(input, mp), lit).clicked() {
-                        info!(input, "simulation: program");
+                        sim_action(|| info!(input, "simulation: program"));
                         sim.set_program(input);
                     }
                 }
@@ -145,17 +146,17 @@ impl StreamItApp {
                 for input in view::sim_sources(mp) {
                     let lit = if v.stream_preview == input { Lit::Preview } else { Lit::Off };
                     if src_button(ui, &view::source_label(input, mp), lit).clicked() {
-                        info!(input, "simulation: preview");
+                        sim_action(|| info!(input, "simulation: preview"));
                         sim.set_preview(input);
                     }
                 }
                 ui.add_space(8.0);
                 if theme::button(ui, "Cut", Kind::Plain).clicked() {
-                    info!("simulation: cut");
+                    sim_action(|| info!("simulation: cut"));
                     sim.cut();
                 }
                 if theme::button(ui, "Auto", Kind::Plain).clicked() {
-                    info!("simulation: auto");
+                    sim_action(|| info!("simulation: auto"));
                     sim.auto();
                 }
             });
@@ -207,11 +208,11 @@ impl StreamItApp {
                         if fault_button(ui, w, text, *kind, *enabled).clicked() {
                             match view::FAULTS.get(row * 2 + col) {
                                 Some(f) => {
-                                    info!(fault = ?f, on = !v.faults.contains(f), "simulation: fault");
+                                    sim_action(|| info!(fault = ?f, on = !v.faults.contains(f), "simulation: fault"));
                                     sim.toggle_fault(*f);
                                 }
                                 None => {
-                                    info!("simulation: crash & restart app");
+                                    sim_action(|| info!("simulation: crash & restart app"));
                                     let sessions = self.sessions.clone();
                                     self.restart_job
                                         .start(&self.rt, &self.ctx, async move { sessions.restart_engine().await });
@@ -253,7 +254,7 @@ fn speed_panel(ui: &mut Ui, sim: &SimControl, v: &SimView) {
             for (speed, text) in [(Speed::X1, "1×"), (Speed::X4, "4×"), (Speed::X10, "10×")] {
                 let lit = if v.speed == speed { Lit::Selected } else { Lit::Off };
                 if src_button(ui, text, lit).clicked() && v.speed != speed {
-                    info!(speed = ?speed, "simulation: speed");
+                    sim_action(|| info!(speed = ?speed, "simulation: speed"));
                     sim.set_speed(speed);
                 }
             }
