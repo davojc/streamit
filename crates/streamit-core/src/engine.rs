@@ -644,6 +644,11 @@ impl Engine {
             Stage::Prepared(r) => r.clone(),
             _ => Readiness::Warning("Prepare has not been run".into()),
         };
+        // Offers a Stop (or a failed countdown) left say nothing about this countdown.
+        self.set(|s| {
+            remove(&mut s.offers, Offer::GoLive);
+            remove(&mut s.offers, Offer::GoPublic);
+        });
         let cancel = CancellationToken::new();
         let (d, c, snap, levels, bid, tok) =
             (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone(), self.bid(), cancel.clone());
@@ -1140,6 +1145,11 @@ impl Engine {
                     }
                 } else {
                     s.offers = a.offer;
+                }
+                // I6: mics left down (after a restart, or a failed fade up) show as down.
+                // A running video reports its own fades.
+                if !busy {
+                    s.mics_ducked = a.mics_down;
                 }
                 if !busy && s.stage == Stage::Idle {
                     if a.stage == Stage::Live {
@@ -2146,6 +2156,40 @@ mod tests {
         let s = until(&mut e, "stopped", |s| s.job.is_none() && !matches!(s.stage, Stage::Countdown { .. })).await;
         assert!(s.offers.contains(&Offer::GoLive), "{:?}", s.offers);
         assert!(s.offers.contains(&Offer::GoPublic), "the countdown had not gone public: {:?}", s.offers);
+    }
+
+    /// A countdown started again after a Stop drops the Go Live / Go Public offers the
+    /// stop left: nothing has failed in the new countdown.
+    #[tokio::test(start_paused = true)]
+    async fn restarted_countdown_clears_the_stop_offers() {
+        let (d, _log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        send(&e, Command::StopCountdown).await;
+        until(&mut e, "offers after the stop", |s| s.job.is_none() && s.offers.contains(&Offer::GoLive)).await;
+        send(&e, Command::Countdown).await;
+        let s = until(&mut e, "Countdown again", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        assert!(!s.offers.contains(&Offer::GoLive), "{:?}", s.offers);
+        assert!(!s.offers.contains(&Offer::GoPublic), "{:?}", s.offers);
+    }
+
+    /// I6: after a restart into Live with the mics left at the floor, the snapshot shows
+    /// them down (and Recover offered) from the assessment.
+    #[tokio::test(start_paused = true)]
+    async fn restart_into_live_with_mics_down_shows_them_down() {
+        let (d, _log, h) = rig();
+        h.encoder.set_status(crate::devices::EncoderStatus::Streaming);
+        h.yt.set_life_cycle("live");
+        h.stream.set_audio_level_state(MIC, crate::audio::FLOOR_DB);
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        let s = until(&mut e, "Live, Recover", |s| s.stage == Stage::Live && s.offers.contains(&Offer::Recover)).await;
+        assert!(s.mics_ducked, "the mics are down: {s:?}");
+        // Mics up again (put right by hand) and a Refresh: no longer shown down.
+        h.stream.set_audio_level_state(MIC, -3.0);
+        send(&e, Command::Refresh).await;
+        let s = until(&mut e, "mics up", |s| !s.mics_ducked).await;
+        assert!(!s.offers.contains(&Offer::Recover), "{:?}", s.offers);
     }
 
     // ---- I1 ----

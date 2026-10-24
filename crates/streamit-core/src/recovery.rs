@@ -25,6 +25,9 @@ pub struct Assessment {
     /// A broadcast was given but its life cycle could not be read (failed or timed
     /// out), so the YouTube-based offers (Go Public, Go Live, End Broadcast) say nothing.
     pub broadcast_unknown: bool,
+    /// The stream is up and a mic is at (or below) the video level: the mics were left
+    /// down. Only read while streaming on a live input or the DeckLink; false otherwise.
+    pub mics_down: bool,
 }
 
 /// Read every device and say what the operator may press. Read-only: no action
@@ -42,9 +45,11 @@ pub async fn assess(d: &Devices, c: &Config, bid: Option<&str>, player_active: b
     let encoder = d.encoder.status().await.ok();
     let streaming = encoder == Some(EncoderStatus::Streaming);
     let on_live_input = stream_prog.is_some_and(|p| sa.live_inputs.contains(&p));
+    let on_decklink = stream_prog == Some(sa.decklink_input);
 
+    // On the DeckLink the mics were faded down for the video, and stay down after a crash.
     let mut mic_muted = false;
-    if streaming && on_live_input {
+    if streaming && (on_live_input || on_decklink) {
         let down = down_threshold(sa.duck_db);
         for &m in &sa.mic_sources {
             if d.stream.audio_level(m).await.is_ok_and(|db| db <= down) {
@@ -53,7 +58,7 @@ pub async fn assess(d: &Devices, c: &Config, bid: Option<&str>, player_active: b
         }
     }
 
-    let recover_needed = stream_prog == Some(sa.decklink_input)
+    let recover_needed = on_decklink
         || screens_prog == Some(c.screens_atem.decklink_input)
         || route_on_decklink
         || mic_muted;
@@ -70,7 +75,9 @@ pub async fn assess(d: &Devices, c: &Config, bid: Option<&str>, player_active: b
     if recover_needed && !player_active {
         offer.push(Offer::Recover);
     }
-    if lc == Some("live") && on_live_input {
+    // Live on the DeckLink is a crash mid-video during the service: Live (so Prepare
+    // can't put the opening still on air), with Recover offered above.
+    if lc == Some("live") && (on_live_input || on_decklink) {
         stage = Stage::Live;
     } else if lc == Some("live") && stream_prog == Some(d.stream.media_player_input(sa.media_player)) {
         stage = Stage::Live;
@@ -79,7 +86,7 @@ pub async fn assess(d: &Devices, c: &Config, bid: Option<&str>, player_active: b
         stage = Stage::Prepared(Readiness::Ready);
         offer.extend([Offer::GoPublic, Offer::GoLive]);
     }
-    Assessment { stage, offer, broadcast_unknown }
+    Assessment { stage, offer, broadcast_unknown, mics_down: mic_muted }
 }
 
 /// One-press fix for a crash during a video. Every step is attempted; failures
@@ -224,14 +231,14 @@ mod tests {
         let start = tokio::time::Instant::now();
         let a = assess(&d, &cfg(), Some("b"), false).await;
         assert!(start.elapsed() <= LIFE_CYCLE_TIMEOUT + Duration::from_millis(100), "{:?}", start.elapsed());
-        assert_eq!(a, Assessment { stage: Stage::Idle, offer: vec![], broadcast_unknown: true });
+        assert_eq!(a, Assessment { stage: Stage::Idle, offer: vec![], broadcast_unknown: true, mics_down: false });
     }
 
     #[tokio::test(start_paused = true)]
     async fn quiet_start_is_idle_with_no_offers() {
         let (d, _l, _h) = rig();
         let a = assess(&d, &cfg(), None, false).await;
-        assert_eq!(a, Assessment { stage: Stage::Idle, offer: vec![], broadcast_unknown: false });
+        assert_eq!(a, Assessment { stage: Stage::Idle, offer: vec![], broadcast_unknown: false, mics_down: false });
     }
 
     #[tokio::test(start_paused = true)]
@@ -300,6 +307,34 @@ mod tests {
         assert!(a.offer.is_empty());
     }
 
+    /// A restart mid-video during a live service: YouTube is live and the stream is on
+    /// the DeckLink. That is Live (so Prepare cannot run), with Recover offered.
+    #[tokio::test(start_paused = true)]
+    async fn live_broadcast_on_decklink_is_live_with_recover() {
+        let (d, _l, h) = rig();
+        h.encoder.set_status(EncoderStatus::Streaming);
+        h.yt.set_life_cycle("live");
+        h.stream.set_program_state(8);
+        h.stream.set_audio_level_state(MIC, FLOOR_DB);
+        let a = assess(&d, &cfg(), Some("b"), false).await;
+        assert_eq!(a.stage, Stage::Live);
+        assert_eq!(a.offer, vec![Offer::Recover]);
+        assert!(a.mics_down, "the mics were faded down for the video");
+        // YouTube's state unknown: the stage stays Idle, Recover still offered.
+        h.yt.fail_next("life_cycle");
+        let a = assess(&d, &cfg(), Some("b"), false).await;
+        assert_eq!((a.stage, a.offer), (Stage::Idle, vec![Offer::Recover]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mics_down_is_reported() {
+        let (d, _l, h) = rig();
+        h.encoder.set_status(EncoderStatus::Streaming);
+        assert!(!assess(&d, &cfg(), None, false).await.mics_down);
+        h.stream.set_audio_level_state(MIC, FLOOR_DB);
+        assert!(assess(&d, &cfg(), None, false).await.mics_down);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn live_on_media_player_offers_go_live_and_end() {
         let (d, _l, h) = rig();
@@ -319,7 +354,7 @@ mod tests {
         h.encoder.fail_next("status");
         h.yt.fail_next("life_cycle");
         let a = assess(&d, &cfg(), Some("b"), false).await;
-        assert_eq!(a, Assessment { stage: Stage::Idle, offer: vec![], broadcast_unknown: true });
+        assert_eq!(a, Assessment { stage: Stage::Idle, offer: vec![], broadcast_unknown: true, mics_down: false });
     }
 
     #[tokio::test(start_paused = true)]
