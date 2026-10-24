@@ -165,6 +165,8 @@ pub struct StreamItApp {
     unsaved_ok: bool,
     /// "Start service now" from Idle was clicked once in the More menu: the next click sends it.
     confirm_start_now: bool,
+    /// End service was pressed: the window asks before ending.
+    confirm_end: bool,
     /// The config the devices were built from.
     startup: Config,
     draft: Config,
@@ -256,6 +258,7 @@ impl StreamItApp {
             confirm_unsaved: false,
             unsaved_ok: false,
             confirm_start_now: false,
+            confirm_end: false,
             live_inputs_text: join_inputs(&draft.stream_atem.live_inputs),
             cues: startup.cues.clone(),
             engine_cues: startup.cues.clone(),
@@ -607,6 +610,49 @@ impl StreamItApp {
         });
     }
 
+    /// End service asks first (unless the service is already ending, when a press skips the
+    /// closing hold). It sends End Service only on "End service".
+    pub(super) fn end_service(&mut self, snap: &Snapshot) {
+        if streamit_deck::layout::end_needs_confirm(snap) {
+            info!("End service pressed in the window; asking first");
+            self.confirm_end = true;
+        } else {
+            self.send(Command::EndService);
+        }
+    }
+
+    fn end_guard(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        if !self.confirm_end {
+            return;
+        }
+        // The service ended some other way (the Stream Deck, say) while the window asked.
+        if !streamit_deck::layout::end_needs_confirm(snap) {
+            self.confirm_end = false;
+            return;
+        }
+        let hold = self.config.read().unwrap_or_else(|e| e.into_inner()).timings.closing_hold.as_secs();
+        egui::Modal::new(egui::Id::unique("confirm_end")).show(ctx, |ui| {
+            ui.set_max_width(440.0);
+            ui.heading("End the service?");
+            ui.label(format!(
+                "The closing still goes on air for {hold} s, then the YouTube broadcast ends and the Web \
+                 Presenter stops. This can't be undone."
+            ));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new("Keep going").strong()).clicked() {
+                    info!("End service: kept going");
+                    self.confirm_end = false;
+                }
+                if ui.button(RichText::new("End service").color(Color32::RED)).clicked() {
+                    info!("End service confirmed in the window");
+                    self.confirm_end = false;
+                    self.send(Command::EndService);
+                }
+            });
+        });
+    }
+
     /// Closing with unsaved Settings edits: save them, throw them away, or stay open.
     fn unsaved_guard(&mut self, ctx: &egui::Context) {
         if !self.confirm_unsaved {
@@ -654,6 +700,7 @@ impl eframe::App for StreamItApp {
         self.take_added_files(&snap);
         self.sync_cues(&snap);
         self.close_guard(ui, &snap);
+        self.end_guard(ui.ctx(), &snap);
         self.follow_mode(&ui.ctx().clone());
         // Keep the timers, the countdown and device colours current.
         ui.ctx().request_repaint_after(Duration::from_millis(100));

@@ -54,6 +54,10 @@ pub enum Press {
     Command(Command),
     Go(Page),
     Recall(Target, u8),
+    /// END SERVICE: the CONFIRM END key appears; ending needs a press of that.
+    AskEnd,
+    /// CONFIRM END: ends the service if END SERVICE asked for it just before.
+    ConfirmEnd,
 }
 
 /// Every device's health, across the top of Home.
@@ -114,6 +118,8 @@ const GO_LIVE: u8 = 12;
 const END_SERVICE: u8 = 13;
 const END_BROADCAST: u8 = 14;
 const RECOVER: u8 = 15;
+/// Appears below END SERVICE when it is pressed: the press that really ends the service.
+pub const CONFIRM_END: u8 = 21;
 
 // Videos: the cues (rows 1 and 2, columns 0-6), STOP VIDEO and UNMUTE MICS.
 const STOP_VIDEO: u8 = 15;
@@ -162,6 +168,12 @@ fn offered(snap: &Snapshot, o: Offer) -> bool {
 /// restart). Once live, ending or ended it is inert; the engine also ignores it there.
 fn go_live_pressable(snap: &Snapshot) -> bool {
     matches!(snap.stage, Stage::Idle | Stage::Prepared(_) | Stage::Countdown { .. }) || offered(snap, Offer::GoLive)
+}
+
+/// END SERVICE needs confirming: the service is not already ending (pressed again while
+/// it ends, END SERVICE skips the closing hold straight away).
+pub fn end_needs_confirm(snap: &Snapshot) -> bool {
+    !matches!(snap.stage, Stage::Ending { .. }) && snap.job != Some("End Service")
 }
 
 /// Recalling the preset in `slot` of `t` would change an input on program: the deck asks
@@ -214,7 +226,9 @@ pub fn press_for(page: Page, key: u8, snap: &Snapshot) -> Option<Press> {
             // Always available (spec): a redundant transition is harmless.
             GO_PUBLIC => Some(Command::GoPublic),
             GO_LIVE => go_live_pressable(snap).then_some(Command::GoLive),
+            END_SERVICE if end_needs_confirm(snap) => return Some(Press::AskEnd),
             END_SERVICE => Some(Command::EndService),
+            CONFIRM_END => return Some(Press::ConfirmEnd),
             END_BROADCAST => Some(Command::EndBroadcast),
             RECOVER => offered(snap, Offer::Recover).then_some(Command::Recover),
             _ => None,
@@ -307,17 +321,18 @@ const CUE_LINE_WIDTH: usize = 9;
 
 /// How `key` on `page` should look. `blink_phase` is the 2 Hz toggle: true is the "on" half.
 pub fn appearance(page: Page, key: u8, snap: &Snapshot, blink_phase: bool) -> KeyLook {
-    appearance_with(page, key, snap, blink_phase, None)
+    appearance_with(page, key, snap, blink_phase, None, false)
 }
 
 /// `appearance`, with `armed` the preset waiting for its second press (it blinks PRESS
-/// AGAIN).
+/// AGAIN) and `confirm_end` whether END SERVICE is waiting for CONFIRM END.
 pub fn appearance_with(
     page: Page,
     key: u8,
     snap: &Snapshot,
     blink_phase: bool,
     armed: Option<(Target, u8)>,
+    confirm_end: bool,
 ) -> KeyLook {
     if key == PHASE_KEY {
         let mut l = phase_look(&snap.stage);
@@ -352,7 +367,7 @@ pub fn appearance_with(
     }
     match page {
         Page::Home => home_look(key, snap),
-        Page::Stream => stream_look(key, snap, blink_phase),
+        Page::Stream => stream_look(key, snap, blink_phase, confirm_end),
         Page::Videos => videos_look(key, snap, blink_phase),
         Page::Routing => routing_look(key),
         Page::Target(t) => target_look(t, key, snap, blink_phase, armed),
@@ -383,8 +398,16 @@ fn home_look(key: u8, snap: &Snapshot) -> KeyLook {
     }
 }
 
-fn stream_look(key: u8, snap: &Snapshot, blink_phase: bool) -> KeyLook {
+fn stream_look(key: u8, snap: &Snapshot, blink_phase: bool, confirm_end: bool) -> KeyLook {
     match key {
+        CONFIRM_END if confirm_end => {
+            let mut l = look("CONFIRM\nEND", RED, WHITE);
+            l.blink = true;
+            if !blink_phase {
+                l.bg = DIM_BG;
+            }
+            l
+        }
         PREPARE => look("PREPARE", SLATE, WHITE),
         COUNTDOWN => look("COUNT\nDOWN", SLATE, WHITE),
         STOP_COUNTDOWN => look("STOP\nCOUNT", SLATE, WHITE),
@@ -634,7 +657,7 @@ mod tests {
         assert_eq!(cmd(Page::Stream, 8, &s), Some(Command::Prepare));
         assert_eq!(cmd(Page::Stream, 9, &s), Some(Command::Countdown));
         assert_eq!(cmd(Page::Stream, 10, &s), Some(Command::StopCountdown));
-        assert_eq!(cmd(Page::Stream, 13, &s), Some(Command::EndService));
+        assert_eq!(press_for(Page::Stream, 13, &s), Some(Press::AskEnd), "END SERVICE asks first");
         assert_eq!(cmd(Page::Stream, 14, &s), Some(Command::EndBroadcast));
         let s = Snapshot { offers: vec![Offer::GoPublic, Offer::GoLive, Offer::Recover], ..s };
         assert_eq!(cmd(Page::Stream, 11, &s), Some(Command::GoPublic));
@@ -643,7 +666,7 @@ mod tests {
         for k in 1..8 {
             assert_eq!(press_for(Page::Stream, k, &s), None, "status key {k} is read-only");
         }
-        for k in 16..KEYS {
+        for k in (16..KEYS).filter(|&k| k != CONFIRM_END) {
             assert_eq!(press_for(Page::Stream, k, &s), None, "key {k}: nothing below row 1");
         }
     }
@@ -657,6 +680,24 @@ mod tests {
                 assert!(!matches!(cmd(page, k, &s), Some(Command::GoLive | Command::EndService)), "{page:?} {k}");
             }
         }
+    }
+
+    #[test]
+    fn end_service_asks_for_confirm_end_unless_already_ending() {
+        let live = Snapshot { stage: Stage::Live, ..Snapshot::default() };
+        assert_eq!(press_for(Page::Stream, 13, &live), Some(Press::AskEnd));
+        assert_eq!(press_for(Page::Stream, CONFIRM_END, &live), Some(Press::ConfirmEnd));
+        // Already ending: END SERVICE skips the closing hold at once, as before.
+        let ending = Snapshot { stage: Stage::Ending { remaining: Duration::from_secs(5) }, ..Snapshot::default() };
+        assert_eq!(cmd(Page::Stream, 13, &ending), Some(Command::EndService));
+        let running = Snapshot { job: Some("End Service"), ..live.clone() };
+        assert_eq!(cmd(Page::Stream, 13, &running), Some(Command::EndService));
+        // CONFIRM END shows only while END SERVICE waits for it, and blinks red.
+        assert_eq!(appearance(Page::Stream, CONFIRM_END, &live, true).text, "");
+        let on = appearance_with(Page::Stream, CONFIRM_END, &live, true, None, true);
+        assert_eq!((on.text.as_str(), on.bg, on.blink), ("CONFIRM\nEND", RED, true));
+        assert_eq!(appearance_with(Page::Stream, CONFIRM_END, &live, false, None, true).bg, DIM_BG);
+        assert_eq!(press_for(Page::Videos, CONFIRM_END, &live), None, "CONFIRM END is on the Stream page only");
     }
 
     #[test]
@@ -954,10 +995,10 @@ mod tests {
         assert!(!needs_second_press(&s, Target::MultiView, 3), "the MultiView is never on air");
         assert!(!needs_second_press(&s, Target::StreamAtem, 7), "empty slot");
         let page = Page::Target(Target::StreamAtem);
-        let on = appearance_with(page, 9, &s, true, Some((Target::StreamAtem, 2)));
+        let on = appearance_with(page, 9, &s, true, Some((Target::StreamAtem, 2)), false);
         assert_eq!((on.text.as_str(), on.bg, on.blink), ("PRESS\nAGAIN", AMBER, true));
-        assert_eq!(appearance_with(page, 9, &s, false, Some((Target::StreamAtem, 2))).bg, DIM_BG);
-        assert_eq!(appearance_with(page, 9, &s, true, Some((Target::ScreensAtem, 2))).text, "BAND");
+        assert_eq!(appearance_with(page, 9, &s, false, Some((Target::StreamAtem, 2)), false).bg, DIM_BG);
+        assert_eq!(appearance_with(page, 9, &s, true, Some((Target::ScreensAtem, 2)), false).text, "BAND");
     }
 
     #[test]

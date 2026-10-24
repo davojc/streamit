@@ -28,6 +28,13 @@ pub const BLINK_TOGGLE: Duration = Duration::from_millis(250);
 const BRIGHTNESS: u8 = 80;
 /// How long a preset that would change what is on air waits for its second press.
 pub const SECOND_PRESS: Duration = Duration::from_secs(3);
+/// How long CONFIRM END waits after END SERVICE.
+pub const CONFIRM_END_FOR: Duration = Duration::from_secs(5);
+
+/// What a CONFIRM END press does: end the service only while END SERVICE's wait is on.
+fn confirm_end(end_until: Option<tokio::time::Instant>, now: tokio::time::Instant) -> bool {
+    end_until.is_some_and(|until| now < until)
+}
 
 /// A preset waiting for its second press, and until when.
 type Armed = Option<(Target, u8, tokio::time::Instant)>;
@@ -121,12 +128,14 @@ async fn draw(
     snap: &Snapshot,
     phase: bool,
     armed: Armed,
+    end_until: Option<tokio::time::Instant>,
     cache: &mut [Option<KeyLook>],
 ) -> Result<(), SessionError> {
     let mut changed = false;
     let armed = armed.map(|(t, slot, _)| (t, slot));
+    let confirm_end = end_until.is_some();
     for key in 0..KEYS {
-        let look = appearance_with(page, key, snap, phase, armed);
+        let look = appearance_with(page, key, snap, phase, armed, confirm_end);
         if cache[key as usize].as_ref() == Some(&look) {
             continue;
         }
@@ -175,11 +184,13 @@ async fn session(dev: &AsyncStreamDeck, handle: &mut EngineHandle) -> Result<(),
         // Each connection starts on Home; the deck changes page only when a key says so.
         let mut page = Page::Home;
         let mut armed: Armed = None;
+        // END SERVICE was pressed: CONFIRM END shows until then.
+        let mut end_until: Option<tokio::time::Instant> = None;
         let mut phase = true;
         let mut ticker = interval(BLINK_TOGGLE);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut snap = handle.rx.borrow_and_update().clone();
-        draw(dev, page, &snap, phase, armed, &mut cache).await?;
+        draw(dev, page, &snap, phase, armed, end_until, &mut cache).await?;
         loop {
             tokio::select! {
                 changed = handle.rx.changed() => {
@@ -187,37 +198,63 @@ async fn session(dev: &AsyncStreamDeck, handle: &mut EngineHandle) -> Result<(),
                         return Ok(());
                     }
                     snap = handle.rx.borrow_and_update().clone();
-                    draw(dev, page, &snap, phase, armed, &mut cache).await?;
+                    draw(dev, page, &snap, phase, armed, end_until, &mut cache).await?;
                 }
                 _ = ticker.tick() => {
                     phase = !phase;
-                    if armed.is_some_and(|(_, _, until)| tokio::time::Instant::now() >= until) {
+                    let now = tokio::time::Instant::now();
+                    if armed.is_some_and(|(_, _, until)| now >= until) {
                         armed = None;
                     }
-                    draw(dev, page, &snap, phase, armed, &mut cache).await?;
+                    if end_until.is_some_and(|until| now >= until) {
+                        end_until = None;
+                    }
+                    draw(dev, page, &snap, phase, armed, end_until, &mut cache).await?;
                 }
                 press = key_rx.recv() => match press {
                     Some(Ok(key)) => match decide_press(page, key, &handle.rx) {
+                        Some(Press::AskEnd) => {
+                            end_until = Some(tokio::time::Instant::now() + CONFIRM_END_FOR);
+                            draw(dev, page, &snap, phase, armed, end_until, &mut cache).await?;
+                        }
+                        Some(Press::ConfirmEnd) => {
+                            let end = confirm_end(end_until, tokio::time::Instant::now());
+                            end_until = None;
+                            if end && handle.tx.send(Command::EndService).await.is_err() {
+                                return Ok(());
+                            }
+                            draw(dev, page, &snap, phase, armed, end_until, &mut cache).await?;
+                        }
                         Some(Press::Go(to)) => {
                             page = to;
                             armed = None;
-                            draw(dev, page, &snap, phase, armed, &mut cache).await?;
+                            end_until = None;
+                            draw(dev, page, &snap, phase, armed, end_until, &mut cache).await?;
                         }
                         Some(Press::Command(cmd)) => {
+                            // Any other key cancels a waiting CONFIRM END.
+                            if end_until.take().is_some() {
+                                draw(dev, page, &snap, phase, armed, end_until, &mut cache).await?;
+                            }
                             if handle.tx.send(cmd).await.is_err() {
                                 return Ok(());
                             }
                         }
                         Some(Press::Recall(t, slot)) => {
+                            end_until = None;
                             let needs = needs_second_press(&handle.rx.borrow(), t, slot);
                             let (recall, next) = second_press(armed, t, slot, needs, tokio::time::Instant::now());
                             armed = next;
                             if recall && handle.tx.send(Command::RecallPreset(t, slot)).await.is_err() {
                                 return Ok(());
                             }
-                            draw(dev, page, &snap, phase, armed, &mut cache).await?;
+                            draw(dev, page, &snap, phase, armed, end_until, &mut cache).await?;
                         }
-                        None => {}
+                        None => {
+                            if end_until.take().is_some() {
+                                draw(dev, page, &snap, phase, armed, end_until, &mut cache).await?;
+                            }
+                        }
                     },
                     Some(Err(e)) => return Err(e.into()),
                     None => return Err(SessionError("key reader stopped".into())),
@@ -243,6 +280,15 @@ mod tests {
         // The offer is withdrawn; the receiver never polled changed().
         tx.send(Snapshot::default()).unwrap();
         assert_eq!(decide_press(Page::Stream, 15, &rx), None);
+    }
+
+    #[test]
+    fn confirm_end_ends_only_within_5_s_of_end_service() {
+        let t0 = tokio::time::Instant::now();
+        assert!(!confirm_end(None, t0), "CONFIRM END on its own does nothing");
+        let until = Some(t0 + CONFIRM_END_FOR);
+        assert!(confirm_end(until, t0 + Duration::from_secs(4)));
+        assert!(!confirm_end(until, t0 + Duration::from_secs(6)), "too late");
     }
 
     #[test]

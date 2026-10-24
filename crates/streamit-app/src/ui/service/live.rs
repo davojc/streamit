@@ -50,7 +50,7 @@ impl StreamItApp {
                             let busy = snap.job.is_some();
                             if theme::sized_button(ui, "End service", Kind::DangerOutline, 60.0, 19.0, !busy).clicked()
                             {
-                                app.send(Command::EndService);
+                                app.end_service(snap);
                             }
                         });
                     });

@@ -135,7 +135,11 @@ impl StreamItApp {
             ];
             for (text, hint, enabled, cmd) in items {
                 if ui.add_enabled(enabled, egui::Button::new(RichText::new(text).size(16.0))).clicked() {
-                    self.send(cmd);
+                    if cmd == Command::EndService {
+                        self.end_service(snap);
+                    } else {
+                        self.send(cmd);
+                    }
                     ui.close();
                 }
                 ui.label(RichText::new(hint).size(13.0).color(theme::MUTED));
