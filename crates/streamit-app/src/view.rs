@@ -317,6 +317,51 @@ pub fn cue_rows(cues: &[Cue], lengths: &HashMap<PathBuf, Duration>) -> Vec<CueRo
     cues.iter().enumerate().map(|(i, c)| cue_row(i, c, lengths)).collect()
 }
 
+/// Where the window's copy of the video list stands against the engine's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CueSync {
+    /// In step, nothing pending.
+    Idle,
+    /// An edit is waiting to be sent, or sent and not yet in the engine's list.
+    Applying,
+    /// The engine did not take our last edit (a video started): fall back to its list.
+    Reverted,
+    /// The lists differ with nothing of ours pending: take the engine's silently.
+    Resync,
+}
+
+/// `dirty`: an edit waits for the debounce. `sent_age`: how long ago the last SetCues was
+/// sent. `differs`: the window's list is not the engine's.
+pub fn cue_sync(dirty: bool, sent_age: Option<Duration>, differs: bool, settle: Duration) -> CueSync {
+    match (dirty, sent_age) {
+        (true, _) => CueSync::Applying,
+        (false, _) if !differs => CueSync::Idle,
+        (false, Some(a)) if a < settle => CueSync::Applying,
+        (false, Some(_)) => CueSync::Reverted,
+        (false, None) => CueSync::Resync,
+    }
+}
+
+pub const CUES_REVERTED_NOTICE: &str =
+    "Your change to the video list wasn't applied because a video started. Make it again when the video ends.";
+
+/// Whether the video list is still unsaved after a save attempt: the file must have been
+/// writable (backed up) and the write must have succeeded.
+pub fn cues_unsaved_after(writable: bool, save_ok: bool) -> bool {
+    !(writable && save_ok)
+}
+
+/// An unsaved list is tried again once `every` has passed since the last attempt.
+pub fn should_retry_save(unsaved: bool, since_last: Option<Duration>, every: Duration) -> bool {
+    unsaved && since_last.is_none_or(|d| d >= every)
+}
+
+/// After removing row `removed`, where the selection (`selected`, in a list now `len` long) points.
+pub fn selection_after_remove(selected: usize, removed: usize, len: usize) -> usize {
+    let s = if removed < selected { selected - 1 } else { selected };
+    s.min(len.saturating_sub(1))
+}
+
 /// What each place a video can play does, shown under the four buttons.
 pub fn destination_help(d: Destination) -> &'static str {
     match d {
@@ -378,6 +423,38 @@ mod tests {
         assert_eq!(rows[0].level_text, "−2 dB");
         assert_eq!(rows[1].level_text, "0 dB");
         assert_eq!(rows[1].length_text, "–:––", "unknown until read");
+    }
+
+    #[test]
+    fn cue_sync_decisions() {
+        let settle = Duration::from_secs(1);
+        let s = |ms| Some(Duration::from_millis(ms));
+        assert_eq!(cue_sync(true, None, true, settle), CueSync::Applying);
+        assert_eq!(cue_sync(false, s(300), true, settle), CueSync::Applying);
+        assert_eq!(cue_sync(false, s(300), false, settle), CueSync::Idle);
+        assert_eq!(cue_sync(false, s(1500), true, settle), CueSync::Reverted);
+        assert_eq!(cue_sync(false, None, true, settle), CueSync::Resync);
+        assert_eq!(cue_sync(false, None, false, settle), CueSync::Idle);
+    }
+
+    #[test]
+    fn unsaved_flag_and_retry() {
+        assert!(!cues_unsaved_after(true, true));
+        assert!(cues_unsaved_after(true, false));
+        assert!(cues_unsaved_after(false, true), "a settings file that could not be backed up is not written");
+        let every = Duration::from_secs(5);
+        assert!(!should_retry_save(false, None, every));
+        assert!(should_retry_save(true, None, every));
+        assert!(!should_retry_save(true, Some(Duration::from_secs(2)), every));
+        assert!(should_retry_save(true, Some(Duration::from_secs(5)), every));
+    }
+
+    #[test]
+    fn selection_follows_its_video_when_a_row_above_goes() {
+        assert_eq!(selection_after_remove(3, 1, 3), 2);
+        assert_eq!(selection_after_remove(1, 3, 3), 1);
+        assert_eq!(selection_after_remove(2, 2, 2), 1, "the selected one removed: last row");
+        assert_eq!(selection_after_remove(0, 0, 0), 0);
     }
 
     #[test]

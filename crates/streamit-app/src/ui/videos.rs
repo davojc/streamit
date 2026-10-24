@@ -177,7 +177,15 @@ impl StreamItApp {
             ui.spacing_mut().item_spacing.y = 10.0;
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.label(RichText::new("Videos for this service").font(theme::heading_font(30.0)));
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Videos for this service").font(theme::heading_font(30.0)));
+                        if self.cues_applying {
+                            chip(ui, "Applying…", theme::AMBER_SOFT, theme::AMBER_BORDER);
+                        }
+                        if self.cues_unsaved {
+                            chip(ui, "Not saved to disk", theme::RED_SOFT, theme::RED_BORDER);
+                        }
+                    });
                     ui.label(
                         RichText::new(format!(
                             "In playing order. Each gets a Stream Deck key, left to right. {} of {MAX_CUES}.",
@@ -237,7 +245,7 @@ impl StreamItApp {
             }
             Some(Action::Remove(i)) if i < self.cues.len() => {
                 self.cues.remove(i);
-                self.selected = self.selected.min(self.cues.len().saturating_sub(1));
+                self.selected = view::selection_after_remove(self.selected, i, self.cues.len());
                 changed = true;
             }
             _ => {}

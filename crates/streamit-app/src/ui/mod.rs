@@ -8,7 +8,7 @@ mod videos;
 use crate::discovery::{self, BmdKind, DiscoveredDevice};
 use crate::session::{Front, Mode};
 use crate::theme;
-use crate::view::{self, ServiceScreen};
+use crate::view::{self, CueSync, ServiceScreen};
 use eframe::egui::{self, Color32, Margin, RichText, Ui};
 use std::future::Future;
 use std::net::IpAddr;
@@ -29,6 +29,8 @@ use tracing::{info, warn};
 const CUE_DEBOUNCE: Duration = Duration::from_millis(400);
 /// After a SetCues, wait this long for the engine before trusting its list again.
 const CUE_SETTLE: Duration = Duration::from_secs(1);
+/// An unsaved cue list is written again this often.
+const SAVE_RETRY: Duration = Duration::from_secs(5);
 const SCAN_FOR: Duration = Duration::from_secs(4);
 const RESTART_NOTE: &str = "Restart StreamIt to apply device changes";
 const SIM_UNAVAILABLE: &str = "Not available in simulation";
@@ -187,6 +189,11 @@ pub struct StreamItApp {
     engine_cues: Vec<Cue>,
     cues_dirty_at: Option<Instant>,
     cues_sent_at: Option<Instant>,
+    /// An edit is pending or not yet in the engine's list.
+    cues_applying: bool,
+    /// The list could not be written to the settings file (yet).
+    cues_unsaved: bool,
+    cues_save_tried_at: Option<Instant>,
 
     discovered: Vec<DiscoveredDevice>,
     scan_job: Pending<Vec<DiscoveredDevice>>,
@@ -245,6 +252,9 @@ impl StreamItApp {
             broadcasts_error: None,
             cues_dirty_at: None,
             cues_sent_at: None,
+            cues_applying: false,
+            cues_unsaved: false,
+            cues_save_tried_at: None,
             discovered: Vec::new(),
             scan_job: Pending::default(),
             add_ip: String::new(),
@@ -393,31 +403,50 @@ impl StreamItApp {
             self.send(Command::SetCues(self.cues.clone()));
         }
         // The engine ignores SetCues while a video plays: fall back to its list.
-        if self.cues_dirty_at.is_none()
-            && self.cues_sent_at.is_none_or(|t| t.elapsed() >= CUE_SETTLE)
-            && self.cues != engine
-        {
-            self.cues = engine;
-            self.cues_sent_at = None;
+        let sent_age = self.cues_sent_at.map(|t| t.elapsed());
+        let sync = view::cue_sync(self.cues_dirty_at.is_some(), sent_age, self.cues != engine, CUE_SETTLE);
+        self.cues_applying = sync == CueSync::Applying;
+        match sync {
+            CueSync::Reverted => {
+                self.notice = Some(view::CUES_REVERTED_NOTICE.into());
+                self.cues = engine.clone();
+                self.cues_sent_at = None;
+            }
+            CueSync::Resync => self.cues = engine.clone(),
+            _ => {}
+        }
+        // A list that could not be written is tried again every few seconds.
+        if view::should_retry_save(self.cues_unsaved, self.cues_save_tried_at.map(|t| t.elapsed()), SAVE_RETRY) {
+            self.save_cues(&engine);
         }
     }
 
+    /// Saves the engine's list. `cues_unsaved` stays set until a write succeeds.
     fn save_cues(&mut self, cues: &[Cue]) {
-        let c = {
+        let (c, changed) = {
             let mut c = self.config.write().unwrap_or_else(|e| e.into_inner());
-            if c.cues == cues {
-                return;
+            let changed = c.cues != cues;
+            if changed {
+                c.cues = cues.to_vec();
             }
-            c.cues = cues.to_vec();
-            c.clone()
+            (c.clone(), changed)
         };
-        self.draft.cues = cues.to_vec();
-        if !self.file.writable {
+        if !changed && !self.cues_unsaved {
             return;
         }
-        if let Err(e) = c.save(&self.file.path) {
-            warn!("saving the cue list: {e:#}");
-            self.notice = Some(format!("Could not save the cue list: {e:#}"));
+        self.draft.cues = cues.to_vec();
+        self.cues_save_tried_at = Some(Instant::now());
+        let result = if self.file.writable {
+            c.save(&self.file.path).map_err(|e| format!("{e:#}"))
+        } else {
+            Err("the settings file could not be backed up".to_string())
+        };
+        self.cues_unsaved = view::cues_unsaved_after(self.file.writable, result.is_ok());
+        if let Err(e) = result {
+            warn!("saving the cue list: {e}");
+            if changed {
+                self.notice = Some(format!("Could not save the cue list: {e}"));
+            }
         }
     }
 
