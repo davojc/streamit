@@ -46,46 +46,14 @@ pub struct VideoMode {
 /// `{GST_DECKLINK_MODE_1080p2997, "HD1080 29.97p", "1080p2997"}`). Interlaced and non-1080
 /// modes are refused, because the player scales to fixed 1920x1080 progressive caps.
 const MODES: &[VideoMode] = &[
-    VideoMode {
-        nick: "1080p2398",
-        fps_num: 24000,
-        fps_den: 1001,
-    },
-    VideoMode {
-        nick: "1080p24",
-        fps_num: 24,
-        fps_den: 1,
-    },
-    VideoMode {
-        nick: "1080p25",
-        fps_num: 25,
-        fps_den: 1,
-    },
-    VideoMode {
-        nick: "1080p2997",
-        fps_num: 30000,
-        fps_den: 1001,
-    },
-    VideoMode {
-        nick: "1080p30",
-        fps_num: 30,
-        fps_den: 1,
-    },
-    VideoMode {
-        nick: "1080p50",
-        fps_num: 50,
-        fps_den: 1,
-    },
-    VideoMode {
-        nick: "1080p5994",
-        fps_num: 60000,
-        fps_den: 1001,
-    },
-    VideoMode {
-        nick: "1080p60",
-        fps_num: 60,
-        fps_den: 1,
-    },
+    VideoMode { nick: "1080p2398", fps_num: 24000, fps_den: 1001 },
+    VideoMode { nick: "1080p24", fps_num: 24, fps_den: 1 },
+    VideoMode { nick: "1080p25", fps_num: 25, fps_den: 1 },
+    VideoMode { nick: "1080p2997", fps_num: 30000, fps_den: 1001 },
+    VideoMode { nick: "1080p30", fps_num: 30, fps_den: 1 },
+    VideoMode { nick: "1080p50", fps_num: 50, fps_den: 1 },
+    VideoMode { nick: "1080p5994", fps_num: 60000, fps_den: 1001 },
+    VideoMode { nick: "1080p60", fps_num: 60, fps_den: 1 },
 ];
 
 impl VideoMode {
@@ -96,10 +64,7 @@ impl VideoMode {
 
     /// Raw video caps the DeckLink is fed in this mode.
     pub fn video_caps(&self) -> String {
-        format!(
-            "video/x-raw,width=1920,height=1080,framerate={}/{}",
-            self.fps_num, self.fps_den
-        )
+        format!("video/x-raw,width=1920,height=1080,framerate={}/{}", self.fps_num, self.fps_den)
     }
 }
 
@@ -111,11 +76,7 @@ impl Default for VideoMode {
 
 /// dB to a linear `volume` factor. At or below the Fairlight floor (-100 dB) it is 0.0 (R4).
 pub fn gain_db_to_linear(db: f32) -> f64 {
-    if db <= FLOOR_DB {
-        0.0
-    } else {
-        10f64.powf(f64::from(db) / 20.0)
-    }
+    if db <= FLOOR_DB { 0.0 } else { 10f64.powf(f64::from(db) / 20.0) }
 }
 
 /// Counter text, `M:SS`. Part seconds round up, so it reads `0:00` only at zero.
@@ -170,10 +131,7 @@ fn quoted(s: &str) -> String {
 fn video_sink(sink: SinkKind, device: u32, mode: VideoMode) -> String {
     match sink {
         SinkKind::DeckLink => {
-            format!(
-                "decklinkvideosink device-number={device} mode={}",
-                mode.nick
-            )
+            format!("decklinkvideosink device-number={device} mode={}", mode.nick)
         }
         SinkKind::Fake => "fakesink sync=true".into(),
     }
@@ -188,14 +146,7 @@ fn audio_sink(sink: SinkKind, device: u32) -> String {
 
 /// The player pipeline for a file with audio, in the default mode (1080p29.97).
 pub fn player_pipeline(path: &Path, gain_db: f32, sink: SinkKind, device: u32) -> String {
-    player_pipeline_full(
-        &file_uri(path),
-        gain_db,
-        sink,
-        device,
-        VideoMode::default(),
-        AudioSource::File,
-    )
+    player_pipeline_full(&file_uri(path), gain_db, sink, device, VideoMode::default(), AudioSource::File)
 }
 
 /// The player pipeline. Any input is converted, scaled and rate-converted to the DeckLink's
@@ -321,19 +272,10 @@ mod tests {
 
     #[test]
     fn file_uri_percent_encodes_windows_paths() {
-        assert_eq!(
-            file_uri(Path::new(r"C:\Videos\Notices 1.mp4")),
-            "file:///C:/Videos/Notices%201.mp4"
-        );
+        assert_eq!(file_uri(Path::new(r"C:\Videos\Notices 1.mp4")), "file:///C:/Videos/Notices%201.mp4");
         assert_eq!(file_uri(Path::new(r"\\?\C:\a\b.mp4")), "file:///C:/a/b.mp4");
-        assert_eq!(
-            file_uri(Path::new(r"\\server\share\x.mp4")),
-            "file://server/share/x.mp4"
-        );
-        assert_eq!(
-            file_uri(Path::new(r#"C:\a"b'#%.mp4"#)),
-            "file:///C:/a%22b%27%23%25.mp4"
-        );
+        assert_eq!(file_uri(Path::new(r"\\server\share\x.mp4")), "file://server/share/x.mp4");
+        assert_eq!(file_uri(Path::new(r#"C:\a"b'#%.mp4"#)), "file:///C:/a%22b%27%23%25.mp4");
         assert_eq!(file_uri(Path::new("/tmp/clip.mp4")), "file:///tmp/clip.mp4");
     }
 
@@ -346,16 +288,8 @@ mod tests {
 
     #[test]
     fn pipeline_converts_any_input() {
-        let p = player_pipeline(
-            Path::new(r"C:\Videos\clip.mp4"),
-            -6.0,
-            SinkKind::DeckLink,
-            0,
-        );
-        assert!(
-            p.contains(r#"uridecodebin uri="file:///C:/Videos/clip.mp4" name=dec"#),
-            "{p}"
-        );
+        let p = player_pipeline(Path::new(r"C:\Videos\clip.mp4"), -6.0, SinkKind::DeckLink, 0);
+        assert!(p.contains(r#"uridecodebin uri="file:///C:/Videos/clip.mp4" name=dec"#), "{p}");
         assert!(
             p.contains(&format!(
                 "dec. ! videoconvert ! deinterlace ! videoconvert ! queue ! videoscale ! \
@@ -382,10 +316,7 @@ mod tests {
     #[test]
     fn device_number_goes_to_both_decklink_sinks() {
         let p = player_pipeline(Path::new(r"C:\clip.mp4"), 0.0, SinkKind::DeckLink, 2);
-        assert!(
-            p.contains("decklinkvideosink device-number=2 mode=1080p2997"),
-            "{p}"
-        );
+        assert!(p.contains("decklinkvideosink device-number=2 mode=1080p2997"), "{p}");
         assert!(p.contains("decklinkaudiosink device-number=2"), "{p}");
         assert!(p.contains("volume volume=1.000000"), "{p}");
     }
@@ -407,15 +338,9 @@ mod tests {
             SinkKind::DeckLink,
             0,
             mode(),
-            AudioSource::Silence {
-                duration: Duration::from_secs(2),
-            },
+            AudioSource::Silence { duration: Duration::from_secs(2) },
         );
-        assert_eq!(
-            p.matches("dec.").count(),
-            1,
-            "only the video branch uses the decoder: {p}"
-        );
+        assert_eq!(p.matches("dec.").count(), 1, "only the video branch uses the decoder: {p}");
         assert!(
             p.contains(&format!(
                 "audiotestsrc wave=silence samplesperbuffer=480 num-buffers=200 ! {ACAPS} ! \

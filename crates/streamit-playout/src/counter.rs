@@ -35,12 +35,8 @@ impl NdiCounter {
             .map_err(other)?
             .downcast::<gst::Pipeline>()
             .map_err(|_| other("counter description did not yield a pipeline"))?;
-        let overlay = pipeline
-            .by_name("counter")
-            .ok_or_else(|| other("counter overlay missing"))?;
-        let bus = pipeline
-            .bus()
-            .ok_or_else(|| other("counter pipeline has no bus"))?;
+        let overlay = pipeline.by_name("counter").ok_or_else(|| other("counter overlay missing"))?;
+        let bus = pipeline.bus().ok_or_else(|| other("counter pipeline has no bus"))?;
 
         let changed = pipeline.set_state(gst::State::Playing).is_ok();
         // A timeout returns Ok(Async) with the pipeline not yet PLAYING: that is a failure.
@@ -63,23 +59,15 @@ impl NdiCounter {
                 return Err(other(e));
             }
         };
-        Ok(Arc::new(NdiCounter {
-            pipeline,
-            overlay,
-            watch,
-        }))
+        Ok(Arc::new(NdiCounter { pipeline, overlay, watch }))
     }
 
     fn set_text(&self, text: &str) -> Result<()> {
         if self.watch.failed() {
-            return Err(DeviceError::Disconnected(
-                "NDI counter pipeline failed".into(),
-            ));
+            return Err(DeviceError::Disconnected("NDI counter pipeline failed".into()));
         }
         if self.pipeline.current_state() != gst::State::Playing {
-            return Err(DeviceError::Disconnected(
-                "NDI counter pipeline stopped".into(),
-            ));
+            return Err(DeviceError::Disconnected("NDI counter pipeline stopped".into()));
         }
         self.overlay.set_property("text", text);
         Ok(())

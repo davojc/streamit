@@ -53,24 +53,14 @@ async fn wait_route(hub: &VideoHub, out: u16, want: u16) {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!(
-        "route_of({out}) never became {want}: {:?}",
-        hub.route_of(out).await
-    );
+    panic!("route_of({out}) never became {want}: {:?}", hub.route_of(out).await);
 }
 
 #[test]
 fn parses_routing_dump() {
     let blocks = parse_blocks(DUMP);
     let names: Vec<_> = blocks.iter().map(|b| b.name.as_str()).collect();
-    assert_eq!(
-        names,
-        [
-            "PROTOCOL PREAMBLE",
-            "VIDEOHUB DEVICE",
-            "VIDEO OUTPUT ROUTING"
-        ]
-    );
+    assert_eq!(names, ["PROTOCOL PREAMBLE", "VIDEOHUB DEVICE", "VIDEO OUTPUT ROUTING"]);
     assert_eq!(blocks[2].lines, ["10 12", "0 0"]);
 }
 
@@ -87,10 +77,7 @@ fn parses_crlf_and_bare_acks() {
 fn parses_captured_fixture() {
     let blocks = parse_blocks(FIXTURE);
     assert_eq!(blocks.len(), 6);
-    let routing = blocks
-        .iter()
-        .find(|b| b.name == "VIDEO OUTPUT ROUTING")
-        .unwrap();
+    let routing = blocks.iter().find(|b| b.name == "VIDEO OUTPUT ROUTING").unwrap();
     assert_eq!(routing.lines, ["0 0", "1 1", "10 7", "39 39"]);
 }
 
@@ -106,10 +93,7 @@ async fn dump_fills_table_one_based() {
     let _s = accept_with_dump(&l).await;
     wait_route(&hub, 11, 13).await;
     assert_eq!(hub.route_of(1).await, Ok(1));
-    assert_eq!(
-        hub.route_of(30).await,
-        Err(DeviceError::Other("unknown output".into()))
-    );
+    assert_eq!(hub.route_of(30).await, Err(DeviceError::Other("unknown output".into())));
 }
 
 #[tokio::test]
@@ -118,9 +102,7 @@ async fn unsolicited_routing_block_updates_table() {
     let hub = VideoHub::connect_with(addr, fast()).await.unwrap();
     let mut s = accept_with_dump(&l).await;
     wait_route(&hub, 11, 13).await;
-    s.write_all(b"VIDEO OUTPUT ROUTING:\r\n10 3\r\n\r\n")
-        .await
-        .unwrap();
+    s.write_all(b"VIDEO OUTPUT ROUTING:\r\n10 3\r\n\r\n").await.unwrap();
     wait_route(&hub, 11, 4).await;
 }
 
@@ -134,9 +116,7 @@ async fn route_waits_for_ack_and_errors_on_nak() {
     let h = hub.clone();
     let t = tokio::spawn(async move { h.route(11, 5).await });
     assert_eq!(read_msg(&mut s).await, "VIDEO OUTPUT ROUTING:\n10 4\n\n");
-    s.write_all(b"ACK\n\nVIDEO OUTPUT ROUTING:\n10 4\n\n")
-        .await
-        .unwrap();
+    s.write_all(b"ACK\n\nVIDEO OUTPUT ROUTING:\n10 4\n\n").await.unwrap();
     assert_eq!(t.await.unwrap(), Ok(()));
     wait_route(&hub, 11, 5).await;
 
@@ -176,10 +156,7 @@ async fn reports_disconnected_when_peer_closes_then_reconnects() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(down, "never reported Disconnected");
-    assert!(matches!(
-        hub.route(11, 2).await,
-        Err(DeviceError::Disconnected(_))
-    ));
+    assert!(matches!(hub.route(11, 2).await, Err(DeviceError::Disconnected(_))));
     let _s2 = accept_with_dump(&l).await;
     wait_route(&hub, 11, 13).await;
 }
@@ -194,10 +171,7 @@ async fn silent_peer_is_declared_dead_by_ping() {
     wait_route(&hub, 11, 13).await;
     assert_eq!(read_msg(&mut s).await, "PING:\n\n");
     // never ACK: the hub must drop the link and reconnect
-    let _s2 = tokio::time::timeout(Duration::from_secs(3), l.accept())
-        .await
-        .expect("no reconnect")
-        .unwrap();
+    let _s2 = tokio::time::timeout(Duration::from_secs(3), l.accept()).await.expect("no reconnect").unwrap();
 }
 
 #[tokio::test]
@@ -229,9 +203,8 @@ async fn timeout_then_nak_never_reports_ok() {
     assert!(matches!(a.await.unwrap(), Err(DeviceError::Timeout(_))));
 
     // The hub must drop the link and reconnect, discarding the skewed queue.
-    let mut s2 = tokio::time::timeout(Duration::from_secs(3), accept_with_dump(&l))
-        .await
-        .expect("no reconnect after timeout");
+    let mut s2 =
+        tokio::time::timeout(Duration::from_secs(3), accept_with_dump(&l)).await.expect("no reconnect after timeout");
     wait_route(&hub, 11, 13).await;
 
     // Route B is refused; nothing from the old link may leak into it.
@@ -249,14 +222,8 @@ async fn route_of_before_dump_is_disconnected() {
     let hub = VideoHub::connect_with(addr, fast()).await.unwrap();
     let (mut s, _) = l.accept().await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        hub.route_of(11).await,
-        Err(DeviceError::Disconnected("not synced".into()))
-    );
-    assert!(matches!(
-        hub.route(11, 2).await,
-        Err(DeviceError::Disconnected(_))
-    ));
+    assert_eq!(hub.route_of(11).await, Err(DeviceError::Disconnected("not synced".into())));
+    assert!(matches!(hub.route(11, 2).await, Err(DeviceError::Disconnected(_))));
     s.write_all(DUMP.as_bytes()).await.unwrap();
     wait_route(&hub, 11, 13).await;
 }
@@ -270,14 +237,9 @@ async fn reconnect_replaces_table_with_new_dump() {
     assert_eq!(hub.route_of(1).await, Ok(1));
     drop(s);
     let (mut s2, _) = l.accept().await.unwrap();
-    s2.write_all(b"VIDEO OUTPUT ROUTING:\n10 2\n\n")
-        .await
-        .unwrap();
+    s2.write_all(b"VIDEO OUTPUT ROUTING:\n10 2\n\n").await.unwrap();
     wait_route(&hub, 11, 3).await;
-    assert_eq!(
-        hub.route_of(1).await,
-        Err(DeviceError::Other("unknown output".into()))
-    );
+    assert_eq!(hub.route_of(1).await, Err(DeviceError::Other("unknown output".into())));
 }
 
 #[tokio::test]
@@ -286,8 +248,6 @@ async fn non_utf8_label_does_not_break_link() {
     let hub = VideoHub::connect_with(addr, fast()).await.unwrap();
     let mut s = accept_with_dump(&l).await;
     wait_route(&hub, 11, 13).await;
-    s.write_all(b"INPUT LABELS:\n0 Caf\xe9 Chapel\n\nVIDEO OUTPUT ROUTING:\n10 5\n\n")
-        .await
-        .unwrap();
+    s.write_all(b"INPUT LABELS:\n0 Caf\xe9 Chapel\n\nVIDEO OUTPUT ROUTING:\n10 5\n\n").await.unwrap();
     wait_route(&hub, 11, 6).await; // same connection: no reconnect happened
 }

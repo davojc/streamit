@@ -510,11 +510,8 @@ pub fn fake_devices() -> (Devices, CallLog, FakeHandles) {
     let stream = FakeSwitcher::new(Kind::Stream, log.clone());
     let screens = FakeSwitcher::new(Kind::Screens, log.clone());
     let hub = FakeRouter { log: log.clone(), fails: Failures::default(), routes: Default::default() };
-    let encoder = FakeEncoder {
-        log: log.clone(),
-        fails: Failures::default(),
-        status: Arc::new(Mutex::new(EncoderStatus::Idle)),
-    };
+    let encoder =
+        FakeEncoder { log: log.clone(), fails: Failures::default(), status: Arc::new(Mutex::new(EncoderStatus::Idle)) };
     let yt = FakeBroadcasts {
         log: log.clone(),
         fails: Failures::default(),

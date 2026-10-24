@@ -77,27 +77,30 @@ impl SimPlayer {
     /// lock, so a timer from an earlier play can never emit.
     fn spawn_end_timer(&self, gen_: u64) {
         let sim = self.sim.clone();
-        tokio::spawn(async move {
-            loop {
-                let wait = {
-                    let mut w = sim.lock();
-                    if w.player_gen != gen_ {
-                        return;
-                    }
-                    let PlayerState::Playing { duration, .. } = w.player else { return };
-                    let position = w.player.position(sim.clock.speed().factor()).unwrap_or_default();
-                    let left = duration - position;
-                    if left <= END_SLACK {
-                        // Ended: nothing is loaded any more, so a further play() is refused.
-                        w.player = PlayerState::Empty;
-                        let _ = w.player_events.send(PlayerEvent::Ended);
-                        return;
-                    }
-                    sim.clock.scale(left).min(TIMER_STEP)
-                };
-                tokio::time::sleep(wait).await;
+        tokio::spawn(
+            async move {
+                loop {
+                    let wait = {
+                        let mut w = sim.lock();
+                        if w.player_gen != gen_ {
+                            return;
+                        }
+                        let PlayerState::Playing { duration, .. } = w.player else { return };
+                        let position = w.player.position(sim.clock.speed().factor()).unwrap_or_default();
+                        let left = duration - position;
+                        if left <= END_SLACK {
+                            // Ended: nothing is loaded any more, so a further play() is refused.
+                            w.player = PlayerState::Empty;
+                            let _ = w.player_events.send(PlayerEvent::Ended);
+                            return;
+                        }
+                        sim.clock.scale(left).min(TIMER_STEP)
+                    };
+                    tokio::time::sleep(wait).await;
+                }
             }
-        }.in_current_span());
+            .in_current_span(),
+        );
     }
 }
 
@@ -128,11 +131,7 @@ impl Player for SimPlayer {
                 PlayerState::Playing { .. } => return Ok(()),
                 PlayerState::Empty => return Err(DeviceError::Other("no video loaded (simulation)".into())),
             };
-            w.player = PlayerState::Playing {
-                duration,
-                anchor_pos: Duration::ZERO,
-                anchor_at: Instant::now(),
-            };
+            w.player = PlayerState::Playing { duration, anchor_pos: Duration::ZERO, anchor_at: Instant::now() };
             w.player_gen
         };
         self.spawn_end_timer(gen_);

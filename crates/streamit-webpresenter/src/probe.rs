@@ -67,9 +67,7 @@ async fn dump(addr: SocketAddr) -> anyhow::Result<()> {
         raw.extend_from_slice(&buf[..n]);
     }
     let text = String::from_utf8_lossy(&raw);
-    println!(
-        "--- raw dump (save as crates/streamit-webpresenter/tests/fixtures/webpresenter_dump.txt) ---"
-    );
+    println!("--- raw dump (save as crates/streamit-webpresenter/tests/fixtures/webpresenter_dump.txt) ---");
     print!("{text}");
     println!("--- parsed status ---");
     for b in parse_blocks(&text) {

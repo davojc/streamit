@@ -84,10 +84,16 @@ pub struct PendingRoute {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlayerState {
     Empty,
-    Loaded { duration: Duration },
+    Loaded {
+        duration: Duration,
+    },
     /// `anchor_pos` was the position at `anchor_at`; it advances at the speed factor from
     /// there. Re-anchoring on a speed change keeps the position continuous.
-    Playing { duration: Duration, anchor_pos: Duration, anchor_at: Instant },
+    Playing {
+        duration: Duration,
+        anchor_pos: Duration,
+        anchor_at: Instant,
+    },
 }
 
 impl PlayerState {
@@ -172,12 +178,7 @@ impl SimWorld {
                 life_cycle: "ready".into(),
                 bound_stream_id: Some(SEED_STREAM.into()),
             }],
-            yt_check: BroadcastCheck {
-                bound_to_ours: true,
-                auto_start: false,
-                auto_stop: true,
-                monitor_stream: true,
-            },
+            yt_check: BroadcastCheck { bound_to_ours: true, auto_start: false, auto_stop: true, monitor_stream: true },
             yt_pending: None,
             last_go_public: None,
             player: PlayerState::Empty,
@@ -212,8 +213,7 @@ impl SimWorld {
                 self.last_go_public = Some(p.done_at - p.requested);
             }
         }
-        let due: Vec<u16> =
-            self.pending_routes.iter().filter(|(_, p)| now >= p.done_at).map(|(o, _)| *o).collect();
+        let due: Vec<u16> = self.pending_routes.iter().filter(|(_, p)| now >= p.done_at).map(|(o, _)| *o).collect();
         for o in due {
             if let Some(p) = self.pending_routes.remove(&o) {
                 self.routes.insert(o, p.input);
@@ -467,10 +467,9 @@ impl SimControl {
             player: match w.player {
                 PlayerState::Empty => PlayerView::Empty,
                 PlayerState::Loaded { duration } => PlayerView::Loaded { duration },
-                PlayerState::Playing { duration, .. } => PlayerView::Playing {
-                    position: w.player.position(speed.factor()).unwrap_or_default(),
-                    duration,
-                },
+                PlayerState::Playing { duration, .. } => {
+                    PlayerView::Playing { position: w.player.position(speed.factor()).unwrap_or_default(), duration }
+                }
             },
             counter_text: w.counter.map(counter_text),
             faults,
@@ -615,7 +614,10 @@ mod tests {
         assert!(yt.signed_in().await.unwrap());
         let up = yt.upcoming().await.unwrap();
         assert_eq!(up.len(), 1);
-        assert_eq!((up[0].id.as_str(), up[0].title.as_str(), up[0].life_cycle.as_str()), ("sim-test", "Test service", "ready"));
+        assert_eq!(
+            (up[0].id.as_str(), up[0].title.as_str(), up[0].life_cycle.as_str()),
+            ("sim-test", "Test service", "ready")
+        );
         assert_eq!(up[0].bound_stream_id.as_deref(), Some(SEED_STREAM));
         yt.fix("sim-test", streamit_core::devices::Fix::AutoStartOff).await.unwrap();
         let c = yt.check("sim-test").await.unwrap();
@@ -844,7 +846,10 @@ mod tests {
         c.set_speed(Speed::X10);
         let v = c.snapshot();
         assert_eq!(v.speed, Speed::X10);
-        assert_eq!(v.player, PlayerView::Playing { position: Duration::from_secs(5), duration: Duration::from_secs(30) });
+        assert_eq!(
+            v.player,
+            PlayerView::Playing { position: Duration::from_secs(5), duration: Duration::from_secs(30) }
+        );
         ms(1000).await;
         assert_eq!(
             c.snapshot().player,

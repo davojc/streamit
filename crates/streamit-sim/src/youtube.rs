@@ -106,7 +106,10 @@ impl Broadcasts for SimBroadcasts {
             if lc == target {
                 return Ok(None); // already there: the real client does nothing
             }
-            let allowed = matches!((lc.as_str(), to), ("ready" | "created", Phase::Testing) | ("testing", Phase::Live) | ("live", Phase::Complete));
+            let allowed = matches!(
+                (lc.as_str(), to),
+                ("ready" | "created", Phase::Testing) | ("testing", Phase::Live) | ("live", Phase::Complete)
+            );
             if !allowed {
                 return Err(invalid(&lc, target, "not allowed from this state"));
             }

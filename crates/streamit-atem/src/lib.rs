@@ -86,10 +86,7 @@ impl AtemClient {
             LinkEvent::Commands(p) => tx.send_modify(|s| {
                 for cmd in commands::split_commands(&p) {
                     if let Some(d) = commands::decode(&cmd) {
-                        if matches!(
-                            d,
-                            commands::Decoded::TransitionPosition { mix_effect: ME, .. }
-                        ) {
+                        if matches!(d, commands::Decoded::TransitionPosition { mix_effect: ME, .. }) {
                             s.transition_updates += 1;
                         }
                         s.state.apply(&d);
@@ -98,12 +95,7 @@ impl AtemClient {
             }),
         };
         let task = tokio::spawn(run_link(transport, timings, req_rx, on_event));
-        Arc::new(AtemClient {
-            shared: rx,
-            requests: req_tx,
-            auto_mark: Mutex::new(None),
-            task,
-        })
+        Arc::new(AtemClient { shared: rx, requests: req_tx, auto_mark: Mutex::new(None), task })
     }
 
     /// A copy of the current state, initialised or not.
@@ -139,10 +131,7 @@ impl AtemClient {
     /// Sends one command in its own reliable packet and waits for the ATEM's ack.
     async fn send(&self, payload: Vec<u8>) -> Result<()> {
         let (done, rx) = oneshot::channel();
-        self.requests
-            .send(SendRequest { payload, done })
-            .await
-            .map_err(|_| stopped())?;
+        self.requests.send(SendRequest { payload, done }).await.map_err(|_| stopped())?;
         rx.await.map_err(|_| stopped())?
     }
 
@@ -152,15 +141,9 @@ impl AtemClient {
             if !s.has_fairlight() {
                 return Err(DeviceError::Refused("no fairlight".into()));
             }
-            s.fairlight
-                .get(&(src.input, src.source))
-                .copied()
-                .ok_or_else(|| {
-                    DeviceError::Refused(format!(
-                        "no fairlight source {} / {} on this atem",
-                        src.input, src.source
-                    ))
-                })
+            s.fairlight.get(&(src.input, src.source)).copied().ok_or_else(|| {
+                DeviceError::Refused(format!("no fairlight source {} / {} on this atem", src.input, src.source))
+            })
         })
     }
 }
@@ -170,9 +153,7 @@ fn ready(s: &Snapshot) -> Result<()> {
         return Err(DeviceError::Disconnected("atem not connected".into()));
     }
     if !s.state.initialised {
-        return Err(DeviceError::Disconnected(
-            "atem state not yet received".into(),
-        ));
+        return Err(DeviceError::Disconnected("atem state not yet received".into()));
     }
     Ok(())
 }
@@ -187,9 +168,7 @@ fn fader_hundredths(db: f32) -> Result<i32> {
         return Err(DeviceError::Refused("fader gain is not a number".into()));
     }
     if db > FADER_MAX_DB {
-        return Err(DeviceError::Refused(format!(
-            "fader gain {db} dB is above +10 dB"
-        )));
+        return Err(DeviceError::Refused(format!("fader gain {db} dB is above +10 dB")));
     }
     let db = db.max(FADER_FLOOR_DB);
     Ok((db * 100.0).round() as i32)
@@ -199,19 +178,13 @@ fn fader_hundredths(db: f32) -> Result<i32> {
 impl Switcher for AtemClient {
     async fn program(&self) -> Result<u16> {
         self.read(|s| {
-            s.program
-                .get(&ME)
-                .copied()
-                .ok_or_else(|| DeviceError::Other("atem reported no program input".into()))
+            s.program.get(&ME).copied().ok_or_else(|| DeviceError::Other("atem reported no program input".into()))
         })
     }
 
     async fn preview(&self) -> Result<u16> {
         self.read(|s| {
-            s.preview
-                .get(&ME)
-                .copied()
-                .ok_or_else(|| DeviceError::Other("atem reported no preview input".into()))
+            s.preview.get(&ME).copied().ok_or_else(|| DeviceError::Other("atem reported no preview input".into()))
         })
     }
 
@@ -269,12 +242,10 @@ impl StreamSwitcher for AtemClient {
     async fn set_media_player_still(&self, player: u8, still: u16) -> Result<()> {
         let count = self.read(|s| Ok(s.media_player_count.unwrap_or(0)))?;
         if player == 0 || player > count {
-            return Err(DeviceError::Refused(format!(
-                "media player {player} does not exist (this atem has {count})"
-            )));
+            return Err(DeviceError::Refused(format!("media player {player} does not exist (this atem has {count})")));
         }
-        let still = u8::try_from(still)
-            .map_err(|_| DeviceError::Refused(format!("still index {still} is out of range")))?;
+        let still =
+            u8::try_from(still).map_err(|_| DeviceError::Refused(format!("still index {still} is out of range")))?;
         self.send(Mpss::still(player - 1, still).encode()).await
     }
 
@@ -289,8 +260,7 @@ impl StreamSwitcher for AtemClient {
     async fn set_audio_level(&self, src: AudioSourceId, db: f32) -> Result<()> {
         self.fairlight(src)?;
         let hundredths = fader_hundredths(db)?;
-        self.send(Cfsp::fader_gain(src.input, src.source, hundredths).encode())
-            .await
+        self.send(Cfsp::fader_gain(src.input, src.source, hundredths).encode()).await
     }
 
     async fn set_audio_on(&self, src: AudioSourceId, on: bool) -> Result<()> {
@@ -304,8 +274,7 @@ impl StreamSwitcher for AtemClient {
                 if on { "on" } else { "off" }
             )));
         }
-        self.send(Cfsp::mix_option(src.input, src.source, option).encode())
-            .await
+        self.send(Cfsp::mix_option(src.input, src.source, option).encode()).await
     }
 }
 
@@ -318,10 +287,7 @@ mod tests {
     use tokio::time::Instant;
 
     const SESSION: u16 = 0x8001;
-    const MIC: AudioSourceId = AudioSourceId {
-        input: 1001,
-        source: -65280,
-    };
+    const MIC: AudioSourceId = AudioSourceId { input: 1001, source: -65280 };
 
     /// A fake switcher that has answered the hello; sends numbered reliable packets.
     struct Atem {
@@ -338,10 +304,7 @@ mod tests {
         }
 
         fn push(&mut self, payload: &[u8]) {
-            self.io
-                .to_client
-                .send(atem_packet(SESSION, self.next_id, payload))
-                .unwrap();
+            self.io.to_client.send(atem_packet(SESSION, self.next_id, payload)).unwrap();
             self.next_id += 1;
         }
 
@@ -388,35 +351,20 @@ mod tests {
     async fn initialised(fairlight: bool) -> (Atem, Arc<AtemClient>) {
         let (mut atem, client) = Atem::start().await;
         atem.dump(fairlight);
-        client
-            .wait_initialised(Duration::from_secs(1))
-            .await
-            .unwrap();
+        client.wait_initialised(Duration::from_secs(1)).await.unwrap();
         (atem, client)
     }
 
     #[tokio::test(start_paused = true)]
     async fn program_is_disconnected_until_incm() {
         let (mut atem, client) = Atem::start().await;
-        assert!(matches!(
-            client.program().await,
-            Err(DeviceError::Disconnected(_))
-        ));
+        assert!(matches!(client.program().await, Err(DeviceError::Disconnected(_))));
         atem.push(&frame(b"PrgI", &[0, 0, 0, 3]));
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(matches!(
-            client.program().await,
-            Err(DeviceError::Disconnected(_))
-        ));
-        assert!(matches!(
-            client.set_preview(2).await,
-            Err(DeviceError::Disconnected(_))
-        ));
+        assert!(matches!(client.program().await, Err(DeviceError::Disconnected(_))));
+        assert!(matches!(client.set_preview(2).await, Err(DeviceError::Disconnected(_))));
         atem.push(&frame(b"InCm", &[1, 0, 0, 0]));
-        client
-            .wait_initialised(Duration::from_secs(1))
-            .await
-            .unwrap();
+        client.wait_initialised(Duration::from_secs(1)).await.unwrap();
         assert_eq!(client.program().await, Ok(3));
     }
 
@@ -475,10 +423,7 @@ mod tests {
     async fn wait_transition_done_immediately_when_idle() {
         let (_atem, client) = initialised(false).await;
         let t0 = Instant::now();
-        assert_eq!(
-            client.wait_transition_done(Duration::from_secs(5)).await,
-            Ok(())
-        );
+        assert_eq!(client.wait_transition_done(Duration::from_secs(5)).await, Ok(()));
         assert_eq!(Instant::now(), t0);
     }
 
@@ -488,8 +433,7 @@ mod tests {
         atem.push(&frame(b"TrPs", &[0, 1, 30, 0, 0, 0, 0, 0]));
         tokio::time::sleep(Duration::from_millis(10)).await;
         let c = client.clone();
-        let wait =
-            tokio::spawn(async move { c.wait_transition_done(Duration::from_secs(5)).await });
+        let wait = tokio::spawn(async move { c.wait_transition_done(Duration::from_secs(5)).await });
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(!wait.is_finished());
         atem.push(&frame(b"TrPs", &[0, 0, 0, 0, 0, 0, 0, 0]));
@@ -501,9 +445,7 @@ mod tests {
         let (mut atem, client) = initialised(false).await;
         atem.push(&frame(b"TrPs", &[0, 1, 30, 0, 0, 0, 0, 0]));
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let r = client
-            .wait_transition_done(Duration::from_millis(300))
-            .await;
+        let r = client.wait_transition_done(Duration::from_millis(300)).await;
         assert!(matches!(r, Err(DeviceError::Timeout(_))), "{r:?}");
     }
 
@@ -518,8 +460,7 @@ mod tests {
         atem.ack(id);
         call.await.unwrap().unwrap();
         let c = client.clone();
-        let wait =
-            tokio::spawn(async move { c.wait_transition_done(Duration::from_secs(5)).await });
+        let wait = tokio::spawn(async move { c.wait_transition_done(Duration::from_secs(5)).await });
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!wait.is_finished());
         atem.push(&frame(b"TrPs", &[0, 1, 30, 0, 0, 0, 0, 0]));
@@ -541,18 +482,9 @@ mod tests {
         atem.ack(id);
         assert_eq!(call.await.unwrap(), Ok(()));
         // Topology says two players; still indexes are one byte.
-        assert!(matches!(
-            client.set_media_player_still(0, 1).await,
-            Err(DeviceError::Refused(_))
-        ));
-        assert!(matches!(
-            client.set_media_player_still(3, 1).await,
-            Err(DeviceError::Refused(_))
-        ));
-        assert!(matches!(
-            client.set_media_player_still(1, 256).await,
-            Err(DeviceError::Refused(_))
-        ));
+        assert!(matches!(client.set_media_player_still(0, 1).await, Err(DeviceError::Refused(_))));
+        assert!(matches!(client.set_media_player_still(3, 1).await, Err(DeviceError::Refused(_))));
+        assert!(matches!(client.set_media_player_still(1, 256).await, Err(DeviceError::Refused(_))));
     }
 
     #[tokio::test(start_paused = true)]
@@ -562,44 +494,23 @@ mod tests {
         atem.push(&fasp(MIC, -10000, 3, 2));
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(client.audio_level(MIC).await, Ok(-100.0));
-        let other = AudioSourceId {
-            input: 1002,
-            source: -65280,
-        };
-        assert!(matches!(
-            client.audio_level(other).await,
-            Err(DeviceError::Refused(_))
-        ));
+        let other = AudioSourceId { input: 1002, source: -65280 };
+        assert!(matches!(client.audio_level(other).await, Err(DeviceError::Refused(_))));
     }
 
     #[tokio::test(start_paused = true)]
     async fn set_audio_level_sends_cfsp_with_only_the_fader_bit() {
         let (mut atem, client) = initialised(true).await;
-        for (db, wire) in [
-            (-10.0f32, -1000),
-            (f32::NEG_INFINITY, -10000),
-            (-250.0, -10000),
-            (3.456, 346),
-        ] {
+        for (db, wire) in [(-10.0f32, -1000), (f32::NEG_INFINITY, -10000), (-250.0, -10000), (3.456, 346)] {
             let c = client.clone();
             let call = tokio::spawn(async move { c.set_audio_level(MIC, db).await });
             let (id, payload) = atem.next_command().await;
-            assert_eq!(
-                payload,
-                Cfsp::fader_gain(1001, -65280, wire).encode(),
-                "{db}"
-            );
+            assert_eq!(payload, Cfsp::fader_gain(1001, -65280, wire).encode(), "{db}");
             atem.ack(id);
             assert_eq!(call.await.unwrap(), Ok(()));
         }
-        assert!(matches!(
-            client.set_audio_level(MIC, 10.5).await,
-            Err(DeviceError::Refused(_))
-        ));
-        assert!(matches!(
-            client.set_audio_level(MIC, f32::NAN).await,
-            Err(DeviceError::Refused(_))
-        ));
+        assert!(matches!(client.set_audio_level(MIC, 10.5).await, Err(DeviceError::Refused(_))));
+        assert!(matches!(client.set_audio_level(MIC, f32::NAN).await, Err(DeviceError::Refused(_))));
     }
 
     #[tokio::test(start_paused = true)]
@@ -614,16 +525,10 @@ mod tests {
             assert_eq!(call.await.unwrap(), Ok(()));
         }
         // A source that only supports Audio Follow Video cannot be switched On.
-        let afv = AudioSourceId {
-            input: 1,
-            source: -65280,
-        };
+        let afv = AudioSourceId { input: 1, source: -65280 };
         atem.push(&fasp(afv, 0, 4, 4));
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(matches!(
-            client.set_audio_on(afv, true).await,
-            Err(DeviceError::Refused(_))
-        ));
+        assert!(matches!(client.set_audio_on(afv, true).await, Err(DeviceError::Refused(_))));
     }
 
     #[tokio::test(start_paused = true)]
@@ -644,10 +549,7 @@ mod tests {
         assert_eq!(client.program().await, Ok(1));
         // Nothing more from the switcher: after 3 s the link is lost.
         tokio::time::sleep(Duration::from_millis(3100)).await;
-        assert!(matches!(
-            client.program().await,
-            Err(DeviceError::Disconnected(_))
-        ));
+        assert!(matches!(client.program().await, Err(DeviceError::Disconnected(_))));
         assert!(!client.snapshot().connected);
     }
 }

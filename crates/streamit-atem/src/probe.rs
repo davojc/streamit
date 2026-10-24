@@ -34,9 +34,9 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
     }
 
     let atem = AtemClient::connect(addr).await?;
-    atem.wait_initialised(Duration::from_secs(5)).await.map_err(|e| {
-        anyhow!("{e} (is {addr} an ATEM, and is ATEM Software Control able to reach it?)")
-    })?;
+    atem.wait_initialised(Duration::from_secs(5))
+        .await
+        .map_err(|e| anyhow!("{e} (is {addr} an ATEM, and is ATEM Software Control able to reach it?)"))?;
 
     match cmd {
         "state" => {}
@@ -60,10 +60,7 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
             let player: u8 = arg(args, 2)?;
             let index: u16 = arg(args, 3)?;
             atem.set_media_player_still(player, index).await?;
-            println!(
-                "media player {player} (input {}) <- still {index} (acked)",
-                atem.media_player_input(player)
-            );
+            println!("media player {player} (input {}) <- still {index} (acked)", atem.media_player_input(player));
         }
         "level" => {
             let src = AudioSourceId { input: arg(args, 2)?, source: arg(args, 3)? };

@@ -352,11 +352,8 @@ pub async fn play_reporting(
         if mics_down { fade(&*d.stream, &sa.mic_sources, Target::duck(sa.duck_db), sa.fade).await } else { Ok(()) }
     };
     let screens_and_play = async {
-        let screens = if dest.screens_picture() {
-            Some(cut(&*d.screens, c.screens_atem.decklink_input).await)
-        } else {
-            None
-        };
+        let screens =
+            if dest.screens_picture() { Some(cut(&*d.screens, c.screens_atem.decklink_input).await) } else { None };
         (screens, d.player.play().await)
     };
     let (faded, (screens, played)) = tokio::join!(fade_down, screens_and_play);
@@ -475,12 +472,13 @@ pub async fn play_reporting(
             Err(e) => note(&mut problems, format!("Could not fade the mics up: {e}")),
         }
     }
-    if video_audio && !audio_off_first && let Err(e) = d.stream.set_audio_on(in8, false).await {
+    if video_audio
+        && !audio_off_first
+        && let Err(e) = d.stream.set_audio_on(in8, false).await
+    {
         note(&mut problems, format!("Could not turn off input 8 audio: {e}"));
     }
-    if cut_short
-        && let Err(e) = d.player.stop().await
-    {
+    if cut_short && let Err(e) = d.player.stop().await {
         note(&mut problems, format!("Could not stop the video: {e}"));
     }
     if let Some(p) = prev {
@@ -530,13 +528,7 @@ mod tests {
     }
 
     fn cue(destination: Destination) -> Cue {
-        Cue {
-            path: PathBuf::from("hymn.mp4"),
-            name: "Hymn".into(),
-            destination,
-            gain_db: -2.0,
-            return_input: None,
-        }
+        Cue { path: PathBuf::from("hymn.mp4"), name: "Hymn".into(), destination, gain_db: -2.0, return_input: None }
     }
 
     /// Fakes as they stand in a service: Cam 8 routed to input 8, mics live at -3 dB.
@@ -735,10 +727,7 @@ mod tests {
         let (r, _) = run.task.await.unwrap();
         assert_eq!(r, RollinOutcome::Refused("Input 8 is on air".into()));
         // Only the load, and the stop that un-prerolls the DeckLink.
-        assert_eq!(
-            log.calls(),
-            vec![Call::PlayerLoad(PathBuf::from("hymn.mp4"), -2.0), Call::PlayerStop]
-        );
+        assert_eq!(log.calls(), vec![Call::PlayerLoad(PathBuf::from("hymn.mp4"), -2.0), Call::PlayerStop]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -747,10 +736,7 @@ mod tests {
         let run = spawn_play(&d, &Config::default(), cue(Destination::OnlineOnly));
         let (r, _) = run.task.await.unwrap();
         assert_eq!(r, RollinOutcome::Refused("VideoHub not configured".into()));
-        assert_eq!(
-            log.calls(),
-            vec![Call::PlayerLoad(PathBuf::from("hymn.mp4"), -2.0), Call::PlayerStop]
-        );
+        assert_eq!(log.calls(), vec![Call::PlayerLoad(PathBuf::from("hymn.mp4"), -2.0), Call::PlayerStop]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -885,9 +871,15 @@ mod tests {
         until(&log, Call::PlayerPlay).await;
         h.player.emit(PlayerEvent::Error("decode".into()));
         let (r, _) = run.task.await.unwrap();
-        assert!(matches!(&r, RollinOutcome::Failed { recover_needed: false, reason } if reason.contains("decode")), "{r:?}");
+        assert!(
+            matches!(&r, RollinOutcome::Failed { recover_needed: false, reason } if reason.contains("decode")),
+            "{r:?}"
+        );
         let calls = log.calls();
-        assert_in_order(&after_play(&calls), &[Call::StreamSetAudioOn(IN8, false), Call::ScreensAuto, Call::StreamAuto, Call::PlayerStop]);
+        assert_in_order(
+            &after_play(&calls),
+            &[Call::StreamSetAudioOn(IN8, false), Call::ScreensAuto, Call::StreamAuto, Call::PlayerStop],
+        );
         assert_eq!(calls.last(), Some(&Call::HubRoute { output: OUT, input: CAM8 }));
         assert_eq!(h.stream.program().await.unwrap(), 1);
     }
@@ -925,7 +917,10 @@ mod tests {
         for c in [Call::StreamSetPreview(8), Call::StreamAuto, Call::ScreensAuto, Call::PlayerPlay] {
             assert!(!calls.contains(&c), "{c:?} in {calls:?}");
         }
-        assert!(!calls.iter().any(|c| matches!(c, Call::StreamSetAudioLevel(..) | Call::StreamSetAudioOn(..))), "{calls:?}");
+        assert!(
+            !calls.iter().any(|c| matches!(c, Call::StreamSetAudioLevel(..) | Call::StreamSetAudioOn(..))),
+            "{calls:?}"
+        );
         assert!(calls.contains(&Call::PlayerStop), "{calls:?}");
         assert_eq!(calls.last(), Some(&Call::HubRoute { output: OUT, input: CAM8 }));
         assert_eq!(h.hub.route_of(OUT).await.unwrap(), CAM8);

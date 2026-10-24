@@ -31,8 +31,8 @@ pub mod flag {
 
 /// Upstream: `COMMAND_CONNECT_HELLO` in src/lib/atemSocketChild.ts.
 pub const COMMAND_CONNECT_HELLO: [u8; 20] = [
-    0x10, 0x14, 0x53, 0xab, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3a, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00,
+    0x10, 0x14, 0x53, 0xab, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3a, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00,
 ];
 
 /// The 12-byte packet header. Bytes 8-9 (upstream: "client packet id") are not used and are
@@ -91,15 +91,9 @@ pub fn covered_by_ack(ack: u16, pkt: u16) -> bool {
 
 fn ack_packet(session_id: u16, id: u16) -> Vec<u8> {
     // Upstream `_sendAck`.
-    Header {
-        flags: flag::ACK_REPLY,
-        length: HEADER_LEN as u16,
-        session_id,
-        ack_id: id,
-        ..Header::default()
-    }
-    .encode()
-    .to_vec()
+    Header { flags: flag::ACK_REPLY, length: HEADER_LEN as u16, session_id, ack_id: id, ..Header::default() }
+        .encode()
+        .to_vec()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,11 +189,7 @@ impl Session {
 
     /// Sends the hello that opens a session.
     pub fn start(&mut self, now: Instant, out: &mut Vec<Output>) {
-        self.restart(
-            now,
-            out,
-            DeviceError::Disconnected("atem link restarted".into()),
-        );
+        self.restart(now, out, DeviceError::Disconnected("atem link restarted".into()));
     }
 
     /// Upstream `restartConnection`: drop the session and say hello again.
@@ -256,8 +246,7 @@ impl Session {
 
         if h.flags & flag::ACK_REQUEST != 0 && u32::from(h.packet_id) < MAX_PACKET_ID {
             let id = h.packet_id;
-            let distance =
-                (u32::from(id) + MAX_PACKET_ID - u32::from(self.last_rx_id)) % MAX_PACKET_ID;
+            let distance = (u32::from(id) + MAX_PACKET_ID - u32::from(self.last_rx_id)) % MAX_PACKET_ID;
             if distance == 1 {
                 self.last_rx_id = id;
                 if dg.len() > HEADER_LEN {
@@ -276,9 +265,7 @@ impl Session {
                 }
                 out.push(Output::Send(ack_packet(self.session_id, self.last_rx_id)));
             } else if distance > 1 && distance <= MAX_OUT_OF_ORDER_PACKETS {
-                self.out_of_order
-                    .entry(id)
-                    .or_insert_with(|| dg[HEADER_LEN..].to_vec());
+                self.out_of_order.entry(id).or_insert_with(|| dg[HEADER_LEN..].to_vec());
             } else if covered_by_ack(self.last_rx_id, id) {
                 // A retransmit of something already acked: ack again.
                 out.push(Output::Send(ack_packet(self.session_id, self.last_rx_id)));
@@ -305,11 +292,7 @@ impl Session {
     fn retransmit_from(&mut self, from: u16, now: Instant, out: &mut Vec<Output>) {
         let Some(idx) = self.in_flight.iter().position(|p| p.id == from) else {
             tracing::debug!("atem asked for packet {from}, which is not in flight; restarting");
-            self.restart(
-                now,
-                out,
-                DeviceError::Disconnected("atem link restarted".into()),
-            );
+            self.restart(now, out, DeviceError::Disconnected("atem link restarted".into()));
             return;
         };
         for p in &mut self.in_flight[idx..] {
@@ -323,28 +306,16 @@ impl Session {
 
     /// Sends `payload` in a reliable (ack-requested) packet. `token` comes back in `Acked` or `Failed`.
     /// Upstream `sendPacket`.
-    pub fn send_reliable(
-        &mut self,
-        payload: &[u8],
-        token: Option<u64>,
-        now: Instant,
-        out: &mut Vec<Output>,
-    ) {
+    pub fn send_reliable(&mut self, payload: &[u8], token: Option<u64>, now: Instant, out: &mut Vec<Output>) {
         if self.conn != Conn::Established {
             if let Some(t) = token {
-                out.push(Output::Failed(
-                    t,
-                    DeviceError::Disconnected("atem not connected".into()),
-                ));
+                out.push(Output::Failed(t, DeviceError::Disconnected("atem not connected".into())));
             }
             return;
         }
         if HEADER_LEN + payload.len() > MAX_PACKET_LEN {
             if let Some(t) = token {
-                out.push(Output::Failed(
-                    t,
-                    DeviceError::Other("atem packet too long".into()),
-                ));
+                out.push(Output::Failed(t, DeviceError::Other("atem packet too long".into())));
             }
             return;
         }
@@ -361,24 +332,14 @@ impl Session {
         .to_vec();
         bytes.extend_from_slice(payload);
         out.push(Output::Send(bytes.clone()));
-        self.in_flight.push(InFlight {
-            id,
-            token,
-            bytes,
-            last_sent: now,
-            resent: 0,
-        });
+        self.in_flight.push(InFlight { id, token, bytes, last_sent: now, resent: 0 });
     }
 
     /// Runs the timers: resends, pings, hello retries and the lost-link watchdog.
     pub fn poll(&mut self, now: Instant, out: &mut Vec<Output>) {
         if self.conn != Conn::Established {
             if now >= self.hello_at + self.t.hello_retry {
-                self.restart(
-                    now,
-                    out,
-                    DeviceError::Disconnected("atem not connected".into()),
-                );
+                self.restart(now, out, DeviceError::Disconnected("atem not connected".into()));
             }
             return;
         }
@@ -406,11 +367,7 @@ impl Session {
             } else {
                 // Upstream resets the connection so the stream cannot stay stuck behind the gap.
                 tracing::warn!("atem never acked packet {}; reconnecting", p.id);
-                self.restart(
-                    now,
-                    out,
-                    DeviceError::Timeout("atem did not ack the command".into()),
-                );
+                self.restart(now, out, DeviceError::Timeout("atem did not ack the command".into()));
                 return;
             }
         }
@@ -468,8 +425,7 @@ pub async fn run_link<T: Transport>(
     mut on_event: impl FnMut(LinkEvent) + Send,
 ) {
     let mut session = Session::new(timings, Instant::now());
-    let mut pending: std::collections::HashMap<u64, oneshot::Sender<Result<()>>> =
-        std::collections::HashMap::new();
+    let mut pending: std::collections::HashMap<u64, oneshot::Sender<Result<()>>> = std::collections::HashMap::new();
     let mut next_token: u64 = 0;
     let mut out = Vec::new();
     session.start(Instant::now(), &mut out);
@@ -531,10 +487,7 @@ pub struct UdpTransport {
 
 impl UdpTransport {
     pub async fn bind(remote: std::net::SocketAddr) -> std::io::Result<UdpTransport> {
-        Ok(UdpTransport {
-            remote,
-            socket: Self::open(remote).await?,
-        })
+        Ok(UdpTransport { remote, socket: Self::open(remote).await? })
     }
 
     async fn open(remote: std::net::SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
@@ -590,16 +543,8 @@ pub(crate) mod fake {
         let (outbound, from_client) = mpsc::unbounded_channel();
         let resets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         (
-            FakeTransport {
-                inbound: Mutex::new(inbound),
-                outbound,
-                resets: resets.clone(),
-            },
-            FakeAtem {
-                to_client,
-                from_client,
-                resets,
-            },
+            FakeTransport { inbound: Mutex::new(inbound), outbound, resets: resets.clone() },
+            FakeAtem { to_client, from_client, resets },
         )
     }
 
@@ -616,16 +561,15 @@ pub(crate) mod fake {
             }
         }
         async fn reset(&mut self) -> std::io::Result<()> {
-            self.resets
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.resets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
 
     /// Upstream socket-child.spec.ts: the ATEM's answer to the hello, session 0x531b, packet id 0.
     pub const HELLO_REPLY: [u8; 20] = [
-        0x10, 0x14, 0x53, 0x1b, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd1, 0x00, 0x00, 0x02, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00,
+        0x10, 0x14, 0x53, 0x1b, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd1, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
     ];
 
     /// A reliable packet from the ATEM.
@@ -693,12 +637,7 @@ mod tests {
             packet_id: 0x7fff,
         };
         let b = h.encode();
-        assert_eq!(
-            b,
-            [
-                0x89, 0x23, 0x80, 0x01, 0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x7f, 0xff
-            ]
-        );
+        assert_eq!(b, [0x89, 0x23, 0x80, 0x01, 0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x7f, 0xff]);
         assert_eq!(Header::parse(&b), Some(h));
         assert_eq!(Header::parse(&b[..11]), None);
     }
@@ -720,8 +659,8 @@ mod tests {
         s.start(Instant::now(), &mut out);
         // Copied from upstream COMMAND_CONNECT_HELLO.
         let upstream: [u8; 20] = [
-            0x10, 0x14, 0x53, 0xab, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3a, 0x00, 0x00, 0x01, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x10, 0x14, 0x53, 0xab, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3a, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
         ];
         assert_eq!(out, vec![Output::Send(upstream.to_vec())]);
         assert!(!s.is_established());
@@ -738,13 +677,7 @@ mod tests {
         s.handle_datagram(&HELLO_REPLY, now, &mut out);
         assert!(s.is_established());
         // Upstream socket-child.spec.ts: the ack of the hello reply.
-        assert_eq!(
-            out,
-            vec![
-                Output::Connected,
-                Output::Send(vec![0x80, 0x0c, 0x53, 0x1b, 0, 0, 0, 0, 0, 0, 0, 0]),
-            ]
-        );
+        assert_eq!(out, vec![Output::Connected, Output::Send(vec![0x80, 0x0c, 0x53, 0x1b, 0, 0, 0, 0, 0, 0, 0, 0]),]);
         out.clear();
 
         // The ATEM switches to its real session id after the hello.
@@ -799,24 +732,13 @@ mod tests {
         out.clear();
         s.send_reliable(&[0xaa, 0xbb], Some(7), now, &mut out);
         // Upstream sendPacket: AckRequest << 11 | length, session, zeros, packet id 1.
-        assert_eq!(
-            sends(&out),
-            vec![vec![
-                0x08, 0x0e, 0x80, 0x34, 0, 0, 0, 0, 0, 0, 0x00, 0x01, 0xaa, 0xbb
-            ]]
-        );
+        assert_eq!(sends(&out), vec![vec![0x08, 0x0e, 0x80, 0x34, 0, 0, 0, 0, 0, 0, 0x00, 0x01, 0xaa, 0xbb]]);
         out.clear();
         s.handle_datagram(&atem_ack(0x8034, 1), now, &mut out);
         assert_eq!(out, vec![Output::Acked(7)]);
     }
 
-    async fn start_link(
-        timings: Timings,
-    ) -> (
-        FakeAtem,
-        mpsc::Sender<SendRequest>,
-        mpsc::UnboundedReceiver<LinkEvent>,
-    ) {
+    async fn start_link(timings: Timings) -> (FakeAtem, mpsc::Sender<SendRequest>, mpsc::UnboundedReceiver<LinkEvent>) {
         let (t, atem) = pair();
         let (req_tx, req_rx) = mpsc::channel(8);
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
@@ -826,17 +748,9 @@ mod tests {
         (atem, req_tx, ev_rx)
     }
 
-    async fn send(
-        req: &mpsc::Sender<SendRequest>,
-        payload: &[u8],
-    ) -> oneshot::Receiver<Result<()>> {
+    async fn send(req: &mpsc::Sender<SendRequest>, payload: &[u8]) -> oneshot::Receiver<Result<()>> {
         let (done, rx) = oneshot::channel();
-        req.send(SendRequest {
-            payload: payload.to_vec(),
-            done,
-        })
-        .await
-        .unwrap();
+        req.send(SendRequest { payload: payload.to_vec(), done }).await.unwrap();
         rx
     }
 
@@ -928,15 +842,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn retries_hello_every_second_until_answered() {
         let (mut atem, _req, _ev) = start_link(Timings::default()).await;
-        assert_eq!(
-            atem.from_client.recv().await.unwrap(),
-            COMMAND_CONNECT_HELLO
-        );
+        assert_eq!(atem.from_client.recv().await.unwrap(), COMMAND_CONNECT_HELLO);
         let t0 = Instant::now();
-        assert_eq!(
-            atem.from_client.recv().await.unwrap(),
-            COMMAND_CONNECT_HELLO
-        );
+        assert_eq!(atem.from_client.recv().await.unwrap(), COMMAND_CONNECT_HELLO);
         assert_eq!(Instant::now() - t0, Duration::from_secs(1));
         assert_eq!(atem.resets.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
@@ -960,10 +868,7 @@ mod tests {
         }
         .encode();
         s.handle_datagram(&req, now, &mut out);
-        let resent: Vec<Vec<u8>> = sends(&out)
-            .iter()
-            .map(|d| d[HEADER_LEN..].to_vec())
-            .collect();
+        let resent: Vec<Vec<u8>> = sends(&out).iter().map(|d| d[HEADER_LEN..].to_vec()).collect();
         assert_eq!(resent, vec![b"a".to_vec(), b"b".to_vec()]);
     }
 }

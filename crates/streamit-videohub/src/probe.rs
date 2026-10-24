@@ -68,9 +68,8 @@ async fn route(addr: SocketAddr, out: u16, inp: u16) -> anyhow::Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let now = now.ok_or_else(|| {
-        anyhow!("no routing dump received (is the hub reachable, is the output number valid?)")
-    })?;
+    let now =
+        now.ok_or_else(|| anyhow!("no routing dump received (is the hub reachable, is the output number valid?)"))?;
     println!("before: output {out} <- input {now}");
     hub.route(out, inp).await?;
     tokio::time::sleep(Duration::from_millis(300)).await;

@@ -39,11 +39,7 @@ impl AtemState {
     pub fn apply(&mut self, d: &Decoded) {
         match *d {
             Decoded::Version(v) => self.protocol_version = Some(v),
-            Decoded::Topology {
-                mix_effects,
-                media_players,
-                ..
-            } => {
+            Decoded::Topology { mix_effects, media_players, .. } => {
                 self.mix_effects = Some(mix_effects);
                 self.media_player_count = Some(media_players);
             }
@@ -54,43 +50,15 @@ impl AtemState {
             Decoded::PreviewInput { mix_effect, source } => {
                 self.preview.insert(mix_effect, source);
             }
-            Decoded::TransitionPosition {
-                mix_effect,
-                in_transition,
-                ..
-            } => {
+            Decoded::TransitionPosition { mix_effect, in_transition, .. } => {
                 self.in_transition.insert(mix_effect, in_transition);
             }
-            Decoded::MediaPlayerSource {
-                player,
-                source_type,
-                still_index,
-                clip_index,
-            } => {
-                self.media_players.insert(
-                    player,
-                    MediaPlayer {
-                        source_type,
-                        still_index,
-                        clip_index,
-                    },
-                );
+            Decoded::MediaPlayerSource { player, source_type, still_index, clip_index } => {
+                self.media_players.insert(player, MediaPlayer { source_type, still_index, clip_index });
             }
-            Decoded::FairlightSource {
-                index,
-                source,
-                fader_gain,
-                supported_mix_options,
-                mix_option,
-            } => {
-                self.fairlight.insert(
-                    (index, source),
-                    FairlightSource {
-                        fader_gain,
-                        mix_option,
-                        supported_mix_options,
-                    },
-                );
+            Decoded::FairlightSource { index, source, fader_gain, supported_mix_options, mix_option } => {
+                self.fairlight
+                    .insert((index, source), FairlightSource { fader_gain, mix_option, supported_mix_options });
             }
         }
     }
@@ -106,9 +74,7 @@ impl AtemState {
 
     /// Fader gain in dB of one Fairlight source, if the ATEM has reported it.
     pub fn fader_db(&self, src: AudioSourceId) -> Option<f32> {
-        self.fairlight
-            .get(&(src.input, src.source))
-            .map(|f| f.fader_gain as f32 / 100.0)
+        self.fairlight.get(&(src.input, src.source)).map(|f| f.fader_gain as f32 / 100.0)
     }
 
     pub fn has_fairlight(&self) -> bool {
@@ -154,10 +120,7 @@ mod tests {
     #[test]
     fn level_reads_from_fasp() {
         let mut s = AtemState::default();
-        let src = AudioSourceId {
-            input: 1001,
-            source: -65280,
-        };
+        let src = AudioSourceId { input: 1001, source: -65280 };
         assert_eq!(s.fader_db(src), None);
         assert!(!s.has_fairlight());
 
@@ -171,17 +134,8 @@ mod tests {
         s.apply_payload(&frame(b"FASP", &body));
         assert!(s.has_fairlight());
         assert_eq!(s.fader_db(src), Some(-12.5));
-        assert_eq!(
-            s.fairlight.get(&(1001, -65280)).map(|f| f.mix_option),
-            Some(2)
-        );
-        assert_eq!(
-            s.fader_db(AudioSourceId {
-                input: 1001,
-                source: -255
-            }),
-            None
-        );
+        assert_eq!(s.fairlight.get(&(1001, -65280)).map(|f| f.mix_option), Some(2));
+        assert_eq!(s.fader_db(AudioSourceId { input: 1001, source: -255 }), None);
     }
 
     #[test]
@@ -192,13 +146,6 @@ mod tests {
         s.apply_payload(&frame(b"TrPs", &[0, 0, 0, 0, 0, 0, 0, 0]));
         assert_eq!(s.in_transition.get(&0), Some(&false));
         s.apply_payload(&frame(b"MPCE", &[1, 1, 4, 0]));
-        assert_eq!(
-            s.media_players.get(&1),
-            Some(&MediaPlayer {
-                source_type: 1,
-                still_index: 4,
-                clip_index: 0
-            })
-        );
+        assert_eq!(s.media_players.get(&1), Some(&MediaPlayer { source_type: 1, still_index: 4, clip_index: 0 }));
     }
 }
