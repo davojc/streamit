@@ -2,7 +2,25 @@
 
 Run this on the real kit, against a **private test broadcast**. Never run it on a real service broadcast.
 
-Do Part A once. Do Part B in order. Write the results in Part C.
+Do Part 0 at the desk any time. Do Part A once. Do Part B in order. Write the results in Part C.
+
+## Part 0. Practise in simulation
+
+Do this first, at the desk, with no kit. Nothing real is touched and no broadcast is needed. Part B is the real rehearsal.
+
+1. Open StreamIt. Go to Settings, then Equipment, then the Simulation card. Press **Switch to simulation**. The amber banner appears and a Simulation tab is added.
+2. On the Simulation tab, set the speed. 4× is good for drills. Press **Reset simulation** between drills.
+3. Run to the step the drill needs: **Prepare**, then the countdown, then live, then play a video from the Service tab.
+4. When you finish, press **Leave simulation** on the Simulation card. It works only when the stage is Idle or Ended.
+
+If the Stream Deck is down, use the **MORE** menu in the window (Start service now, Go public now, End broadcast, End service).
+
+Drills. Each fault button breaks one thing. Press it again to put it right.
+
+- **VideoHub unplugged mid-video.** Play a video. Press **Unplug VideoHub**. Let the video end, or press **Stop video**. A warning appears. Press **Unplug VideoHub** again to plug it back in, then press **Recover**. Pass if the warning clears and Camera 8 is back on input 8.
+- **YouTube refuses public.** Press **YouTube refuses public**. Start the countdown, or press **Start service now**. The picture still cuts on time. A warning appears with **Retry going public**. Press **YouTube refuses public** again to let it through, then press **Retry going public**. Pass if the broadcast shows as public.
+- **Mic fade fails at T-0.** Press **Mic fade fails**. Start the countdown and let it reach T-0. A warning appears. Press **Mic fade fails** again to fix it, then press **Recover**. Pass if the mics come up.
+- **Crash & restart mid-video.** Play a video. Press **Crash & restart app**. StreamIt restarts against the same pretend equipment and changes nothing by itself. Press **Recover**. Pass if the right input is on air and the mics are right.
 
 ## Part A. Before the rehearsal
 
@@ -147,7 +165,7 @@ cargo run -p streamit-playout --features gst --example playout-probe -- counter 
 ```
 
 - `play` look for: the first frame of the clip is held while the clip is loaded (before "playing"). The clip plays smoothly at 29.97 with no stutter or dropped frames. The audio arrives on Fairlight input 8 of the Stream ATEM, on input 8 of the Screens ATEM, and on the Dante desk. After "stopped" the DeckLink input is black and silent.
-- `counter`: in ProPresenter, add the NDI source `StreamIt Countdown`. Look for: a large yellow `2:05`, centred on black, for 10 s. Then it counts down once a second to `0:00`, then clears to plain black.
+- `counter`: on any NDI receiver, add the NDI source `StreamIt Countdown`. Look for: a large yellow `2:05`, centred on black, for 10 s. Then it counts down once a second to `0:00`, then clears to plain black.
 
 #### Stream Deck XL
 
@@ -193,8 +211,8 @@ Select the private test broadcast in the Run tab. Keep it private until check 3.
    *Pass if:* the opening still is on air and silent. The Web Presenter is streaming. The stage reaches READY within 60 s. The broadcast is in `testing` in YouTube Studio.
 
 3. **Countdown.**
-   Press COUNT DOWN. Watch the hall screen, ProPresenter, and YouTube Studio.
-   *Pass if:* the hall shows the countdown. The NDI counter is yellow in ProPresenter. The broadcast goes public at T-10s. **Measure the go-public latency:** the time in seconds from the moment the countdown reaches T-10s to the moment YouTube Studio shows the broadcast as Public. Write it in Part C.
+   Press COUNT DOWN. Watch the hall screen, your NDI receiver, and YouTube Studio.
+   *Pass if:* the hall shows the countdown. The NDI counter is yellow on the NDI receiver. The broadcast goes public at T-10s. **Measure the go-public latency:** the time in seconds from the moment the countdown reaches T-10s to the moment YouTube Studio shows the broadcast as Public. Write it in Part C.
 
 4. **T-0.**
    Before T-0, put Camera 5 on the Stream ATEM preview. Let the countdown reach T-0.

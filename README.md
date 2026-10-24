@@ -37,10 +37,36 @@ The binary is `target\release\streamit.exe`; with no arguments it opens the wind
 
 Startup never changes a device: StreamIt connects to each device and listens, reads the state, checks the YouTube broadcast, then opens the window and lights the Stream Deck. A device that is unreachable shows red and is retried in the background; every device's health is polled every 2 s.
 
-- **Run tab**: the broadcast dropdown with its checks (bound to our stream key, Auto Start off, Auto Stop on, monitor stream on) and a **Fix** button for each failed check; the device status row (hover for the reason); the stage, the latest warning and ignored presses; every Stream Deck key as a button (a press does exactly what the deck key does, and dim keys are not offered); and the cue list (Add videos, name, destination, level, optional return input, Up / Down / Remove, at most 14). The cue list is locked while a video plays.
-- **Settings tab**: Blackmagic devices found on the network (mDNS) with a role dropdown each, plus **Add by IP**; every config field; the YouTube OAuth client id and secret, **Sign in** (opens the browser), and the stream key picker (**Load stream keys**). **Save** writes `%APPDATA%\StreamIt\config.toml`. The mics' live levels (captured by Prepare and by each video) are kept in `levels.toml` next to it, so after a restart Go Live and Recover fade the mics up to them rather than to 0 dB. Timings, inputs and audio settings apply at once. **Device addresses and roles, the YouTube client and stream key, and the playout/NDI settings apply when you restart StreamIt.**
+- **Service tab**: the four steps along the top (Prepare, Countdown, Live, End service) and one screen for each. Before the service it has the big **Prepare** button, the YouTube checks (bound to our stream key, Auto Start off, Auto Stop on, monitor stream on, with a **Fix** button on each failed check) and the device status. During the countdown, **Start service now** goes public and cuts to the camera in one go. It does not wait for YouTube, and if going public fails you get a **Retry going public** button. While live, each video has a **Play** button, and **Stop video** and **Unmute mics** appear while one plays. The latest warning and a **Recover** button show when StreamIt can put something right.
+- **MORE menu**: in the window, it holds Start service now, Go public now, End broadcast and End service. Use it when the Stream Deck is down. The Stream Deck keys are unchanged (GO LIVE and GO PUBLIC are still two keys); GO LIVE does the same as Start service now.
+- **Videos tab**: the countdown video (**Change…**) and the cue list (**Add videos…**, name, where it plays, level, optional return input, move up, move down, remove; at most 14). The cue list cannot be edited while a video plays. While a video plays (countdown or roll-in) the NDI counter shows the time left as `M:SS`.
+- **Settings tab**: Blackmagic devices found on the network (mDNS) with a role dropdown each, plus **Search again** and **Add by IP**; every config field; the YouTube OAuth client id and secret, **Sign in** (opens the browser), and the stream key picker (**Load stream keys**). **Save** writes `%APPDATA%\StreamIt\config.toml`. The mics' live levels (captured by Prepare and by each video) are kept in `levels.toml` next to it, so after a restart Go Live and Recover fade the mics up to them rather than to 0 dB. Timings, inputs and audio settings apply at once. **Device addresses and roles, the YouTube client and stream key, and the playout/NDI settings apply when you restart StreamIt.**
 
 The window opens no console. Logs are written daily to `%APPDATA%\StreamIt\logs\streamit.<date>.log` (every command, device health change, device error and engine warning; never tokens or the client secret). Set `RUST_LOG=debug` for more detail.
+
+### Practise with simulation
+
+Simulation runs the real StreamIt against pretend equipment and a pretend YouTube, so you can practise a whole service with nothing connected. It never touches the real kit or YouTube, even if the network is up.
+
+- **Switch it on:** Settings, then Equipment, then the Simulation card, then **Switch to simulation**. **Leave simulation** is on the same card. The button only works when no service is running (the stage is Idle or Ended). Otherwise it is greyed out and says "Finish or end the service first". If StreamIt is still checking the equipment, it says "Still checking the equipment — try again in a moment".
+- **You cannot miss it:** every screen has a striped amber banner ("SIMULATION — nothing here is live. No equipment or YouTube is touched."). Clicking it takes you to the Simulation card. The window title ends "— SIMULATION", and the Stream Deck phase key shows SIM under the stage. The Stream Deck still works, so you practise on the real keys.
+- **Always starts real:** StreamIt starts in real mode every time, even if you closed it while simulating. Switching back to real does the normal startup, which only reads the equipment.
+- **What is pretend** (at 1×):
+  - An ATEM mix takes 1 s. Until it finishes, the ATEM still reports the old source.
+  - A VideoHub route takes effect after 1 s.
+  - The Web Presenter goes from Connecting to Streaming after 3 s.
+  - YouTube health becomes Good 5 s after streaming starts. Going testing, live or complete takes 2 to 3 s.
+  - A video plays for the real length of its mp4 or mov file, or 30 s if the length cannot be read.
+  - The NDI counter is not sent anywhere. Its value shows on the Simulation tab.
+  - Router numbers you have not set (output feeding ATEM input 8, DeckLink router input, fallback normal input) are filled in as 11, 39 and 13 for the simulation only. They are not saved.
+- **Your settings are used:** inputs, timings and the cue list come from your real settings file, so practice matches the real set-up. **Save** still writes the real settings; the simulation picks the changes up the next time you open it. **Sign in** and **Load stream keys** are off in simulation.
+- **Simulation tab** (only in simulation): you play the vision mixer for the Stream ATEM (program and preview buttons, **Cut**, **Auto**, mic level, input 8 audio), and see the other pretend equipment and the pretend YouTube.
+- **Speed:** 1×, 4× or 10×. It speeds up the pretend equipment, video playback, and the VideoHub settle, closing hold and mic fade times. The real service always runs at 1×.
+- **Make something go wrong:** each button breaks one thing, and pressing it again puts it right. They are Unplug VideoHub, Unplug Stream ATEM, Unplug Web Presenter, YouTube refuses public, YouTube very slow (calls take 20 s), Next video won’t load and Mic fade fails. **Crash & restart app** restarts StreamIt's engine against the pretend equipment as it stands, so you can practise **Recover**.
+- **Reset simulation** puts every pretend device back to how it was before the service.
+- **Separate files:** the pretend mic levels are kept in `sim-levels.toml` next to `config.toml`, so they never change your real `levels.toml`. Simulation logs go to `%APPDATA%\StreamIt\logs\sim-streamit.<date>.log`, not the real `streamit.<date>.log`.
+
+`docs/rehearsal.md` Part 0 has a recovery drill for each fault button.
 
 ### Building with GStreamer (playout PC)
 
@@ -185,7 +211,7 @@ A file with no audio track plays with silence, so the DeckLink audio stays clock
 cargo run -p streamit-playout --features gst --example playout-probe -- counter 125
 ```
 
-In ProPresenter, add the NDI source `StreamIt Countdown`: it should show a large yellow `2:05`, centred on black, for 10 s, then count down once a second to `0:00`, then clear to plain black.
+On any NDI receiver, add the NDI source `StreamIt Countdown`: it should show a large yellow `2:05`, centred on black, for 10 s, then count down once a second to `0:00`, then clear to plain black.
 
 ### YouTube
 

@@ -55,7 +55,7 @@ Current addresses come from the existing Companion export (`companion/`). The ap
 | Blackmagic VideoHub | **40×40** | 192.168.4.100 (TCP 9990) | Routes SDI sources. The output feeding Stream ATEM input 8 normally carries **Camera 8**. It is switched to the DeckLink only while a video plays. | Switch the input-8 route to the DeckLink before a video and back to Camera 8 afterwards. It takes about 1 second and shows black in between. |
 | Blackmagic Web Presenter | **Web Presenter 4K** | 192.168.4.93 (control port 9977) | Encodes the Stream ATEM output and streams it to YouTube | Start / stop streaming, read streaming status |
 | Blackmagic DeckLink (local) | **DeckLink SDI 4K** | SDI playout of the countdown and roll-ins, with embedded audio (also de-embedded to Dante outside the app) | Play files |
-| NDI (from this PC) | — | Countdown counter for ProPresenter on another machine | Send a rendered "time remaining" counter (not the video) |
+| NDI (from this PC) | — | Countdown counter for any NDI receiver on another machine | Send a rendered "time remaining" counter (not the video) |
 | YouTube (Data API v3) | — | The broadcast | List upcoming broadcasts, check the stream is healthy, make the broadcast public, end it |
 | StreamDeck (USB) | **Stream Deck XL** (4 rows × 8 keys = 32 keys) | Operator controls | StreamIt drives it directly. Companion must not run on this PC. |
 
@@ -131,7 +131,7 @@ Settings are stored on disk and persist between runs.
 ### Stage 2 — Countdown (one StreamDeck button)
 1. **DeckLink:** start playing the countdown video. T-0 is the moment the video ends.
 2. **Screens ATEM:** switch program to the DeckLink input. The hall sees the countdown.
-3. **NDI:** send a time-remaining counter for ProPresenter, driven from the real playback position.
+3. **NDI:** send a time-remaining counter for any NDI receiver, driven from the real playback position.
 4. **Stream ATEM:** no change. Online viewers still see the static opening holding image, in silence.
 5. **At the go-public offset (T-10s):** the app moves the YouTube broadcast from testing to **live**. The public and the recording start here, on the static image. If this fails, the app retries and shows a red key. A manual **Go Public** key is always available.
 6. If Stage 1 is not READY when Countdown is pressed, the app **warns but continues**.
