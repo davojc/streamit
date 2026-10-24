@@ -17,7 +17,8 @@
 //!
 //! Config rule: the real session's engine shares the window's config (Settings saves
 //! apply to it as before). The simulation engine gets its own copy, the effective config
-//! of [`sim_config`], rebuilt from the real config at each switch and never saved.
+//! of [`sim_config`], rebuilt from the real config at each switch and never saved; its
+//! `SimControl` shares it and rewrites the settle, hold and fade on each speed change.
 //! Settings saves while simulating still write the real file (and the window's copy);
 //! the simulation picks them up the next time it is opened.
 use crate::logging::simulation_span;
@@ -86,9 +87,10 @@ pub struct Built {
     pub probes: Option<Probes>,
     /// The pretend world's handle, for the Simulation tab.
     pub sim: Option<SimControl>,
-    /// The config the engine runs on when it is not the real one (simulation's effective
-    /// copy). Never saved.
-    pub config: Option<Config>,
+    /// The config the engine runs on when it is not the real one: simulation's effective
+    /// copy, shared with its `SimControl` (which rescales its waits with the speed).
+    /// Never saved.
+    pub config: Option<Arc<RwLock<Config>>>,
     /// The fields `config` filled in with a simulated default.
     pub sim_defaults: Vec<&'static str>,
     /// Background device tasks to stop with the session.
@@ -154,8 +156,8 @@ impl DeviceFactory for SimFactory {
             devices,
             health,
             probes: Some(probes),
+            config: Some(sim.shared_config()),
             sim: Some(sim),
-            config: Some(config),
             sim_defaults,
             tasks: Vec::new(),
         }
@@ -163,9 +165,12 @@ impl DeviceFactory for SimFactory {
 }
 
 /// The simulation's effective config: `c` with each unset (0) VideoHub number replaced
-/// by its simulated default, and the names of the fields replaced (ruling S4).
+/// by its simulated default, and the names of the fields replaced (ruling S4). Its
+/// YouTube stream is the pretend one the pretend broadcast is bound to, so a restart
+/// finds that broadcast again; Settings still shows (and saves) the real stream id.
 pub fn sim_config(c: &Config) -> (Config, Vec<&'static str>) {
     let mut e = c.clone();
+    e.youtube.stream_id = Some(streamit_sim::SEED_STREAM.into());
     let mut defaulted = Vec::new();
     let hub = &mut e.videohub;
     for (field, value, default) in [
@@ -485,10 +490,7 @@ impl Inner {
             Mode::Simulation => &inner.sim,
         };
         let built = factory.build(&real).instrument(span.clone()).await;
-        let config = match built.config {
-            Some(effective) => Arc::new(RwLock::new(effective)),
-            None => inner.config.clone(),
-        };
+        let config = built.config.unwrap_or_else(|| inner.config.clone());
         let kit = Kit {
             devices: built.devices,
             config,
@@ -1127,6 +1129,10 @@ mod tests {
             (11, 39, 13)
         );
         assert_eq!(d, vec!["videohub.input8_output", "videohub.decklink_input", "videohub.fallback_normal_input"]);
+        // The pretend broadcast is bound to the pretend stream, so the effective config
+        // names that stream, whatever the real one is (never saved).
+        c.youtube.stream_id = Some("real-stream".into());
+        assert_eq!(sim_config(&c).0.youtube.stream_id.as_deref(), Some(streamit_sim::SEED_STREAM));
         c.videohub.input8_output = 4;
         c.videohub.fallback_normal_input = 5;
         let (e, d) = sim_config(&c);
@@ -1182,6 +1188,57 @@ mod tests {
         // The new engine takes presses.
         front.tx.send(Command::Recover).await.unwrap();
         wait_for(&front, "Recover to run", |s| s.job == Some("Recover")).await;
+    }
+
+    /// I3: "Crash & restart app" after going public finds the pretend broadcast again
+    /// (bound to the simulation's own stream), so the restart lands on Live, not Idle.
+    #[tokio::test(start_paused = true)]
+    async fn restart_after_going_public_keeps_the_broadcast() {
+        let (s, front, ..) = start_with("restartpublic", Arc::new(Spy::default()), Arc::new(SimFactory)).await;
+        s.switch(Mode::Simulation).await.unwrap();
+        wait_for(&front, "the pretend broadcast", |s| s.simulation && s.broadcast.is_some()).await;
+        let sim = front.sim.borrow().clone().unwrap();
+        sim.set_speed(Speed::X10);
+        front.tx.send(Command::Prepare).await.unwrap();
+        wait_for(&front, "Prepared", |s| matches!(s.stage, Stage::Prepared(_)) && s.job.is_none()).await;
+        front.tx.send(Command::GoLive).await.unwrap();
+        wait_for(&front, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        assert_eq!(sim.snapshot().yt_life_cycle.as_deref(), Some("live"));
+        s.restart_engine().await.unwrap();
+        let snap = wait_for(&front, "Live again", |s| s.simulation && s.stage == Stage::Live).await;
+        assert_eq!(snap.broadcast.as_ref().map(|b| b.id.as_str()), Some(SEED_BROADCAST), "{snap:?}");
+        tokio::time::sleep(Duration::from_secs(10)).await; // the startup check has finished
+        let snap = front.rx.borrow().clone();
+        assert_eq!((snap.stage.clone(), snap.job), (Stage::Live, None));
+        assert!(snap.offers.is_empty(), "live, public and on a camera: nothing to offer: {:?}", snap.offers);
+        assert!(!snap.mics_ducked);
+    }
+
+    /// I4: the speed scales the closing hold (and the VideoHub settle and mic fade) the
+    /// simulation engine waits on: at 10× the 10 s hold takes 1 s.
+    #[tokio::test(start_paused = true)]
+    async fn speed_scales_the_closing_hold_and_settle() {
+        let (s, front, ..) = start_with("holdspeed", Arc::new(Spy::default()), Arc::new(SimFactory)).await;
+        s.switch(Mode::Simulation).await.unwrap();
+        wait_for(&front, "the pretend broadcast", |s| s.simulation && s.broadcast.is_some()).await;
+        let sim = front.sim.borrow().clone().unwrap();
+        sim.set_speed(Speed::X10);
+        let real = Config::default();
+        assert_eq!(real.timings.closing_hold, Duration::from_secs(10));
+        let shared = sim.shared_config();
+        assert_eq!(shared.read().unwrap().videohub.settle, Duration::from_millis(150));
+        assert_eq!(sim.config().videohub.settle, real.videohub.settle, "Settings shows the real value");
+        front.tx.send(Command::Prepare).await.unwrap();
+        wait_for(&front, "Prepared", |s| matches!(s.stage, Stage::Prepared(_)) && s.job.is_none()).await;
+        front.tx.send(Command::GoLive).await.unwrap();
+        wait_for(&front, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        front.tx.send(Command::EndService).await.unwrap();
+        wait_for(&front, "the closing hold", |s| matches!(s.stage, Stage::Ending { .. })).await;
+        let hold = Instant::now();
+        wait_for(&front, "Ended", |s| s.stage == Stage::Ended).await;
+        let took = hold.elapsed();
+        // The hold, then pretend YouTube's last transition (0.25 s at 10×).
+        assert!(took >= Duration::from_secs(1) && took < Duration::from_secs(2), "{took:?}");
     }
 
     /// A video running when the app "crashes" is aborted: it never runs its return path.

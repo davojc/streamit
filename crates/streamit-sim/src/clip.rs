@@ -5,10 +5,17 @@ use std::time::Duration;
 /// What an unreadable (or zero-length) file is taken to last.
 pub const FALLBACK: Duration = Duration::from_secs(30);
 
-/// The movie duration from the file's header, or 30 s on any failure. Reads only the
-/// header (the media data is skipped), so it is cheap enough to call inline.
+/// The movie duration from the file's header, or 30 s on any failure (the pretend
+/// player's length). Reads only the header (the media data is skipped), so it is cheap
+/// enough to call inline.
 pub fn clip_length(path: &Path) -> Duration {
-    read(path).filter(|d| !d.is_zero()).unwrap_or(FALLBACK)
+    read_length(path).unwrap_or(FALLBACK)
+}
+
+/// The movie duration from the file's header; `None` when the file is missing, is not a
+/// readable mp4/mov, or says it lasts no time at all. For showing a real length.
+pub fn read_length(path: &Path) -> Option<Duration> {
+    read(path).filter(|d| !d.is_zero())
 }
 
 /// Never panics: the `mp4` crate's own `duration()` divides by the timescale (zero in a

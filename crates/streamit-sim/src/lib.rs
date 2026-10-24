@@ -11,14 +11,14 @@ pub mod others;
 pub mod switcher;
 pub mod youtube;
 
-pub use clip::clip_length;
+pub use clip::{clip_length, read_length};
 pub use clock::{SimClock, Speed};
 pub use others::{SimCounter, SimEncoder, SimPlayer};
 pub use switcher::{SimRouter, SimSwitcher, Which, media_player_input};
 pub use youtube::SimBroadcasts;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 use streamit_core::config::{AudioSourceId, Config};
 use streamit_core::devices::{
@@ -394,12 +394,36 @@ pub fn counter_text(remaining: Duration) -> String {
 #[derive(Clone)]
 pub struct SimControl {
     sim: SimHandle,
+    /// The effective config as built, unscaled: what Settings shows.
     cfg: Config,
+    /// The config the simulation engine runs on: `cfg` with the VideoHub settle, closing
+    /// hold and mic fade divided by the speed, rewritten on every speed change.
+    effective: Arc<RwLock<Config>>,
 }
 
 impl SimControl {
     pub fn new(cfg: &Config, speed: Speed) -> Self {
-        Self { sim: SimHandle::new(cfg, speed), cfg: cfg.clone() }
+        Self::from_handle(SimHandle::new(cfg, speed), cfg.clone())
+    }
+
+    fn from_handle(sim: SimHandle, cfg: Config) -> Self {
+        let c = Self { sim, effective: Arc::new(RwLock::new(cfg.clone())), cfg };
+        c.scale_config();
+        c
+    }
+
+    /// The config to give the simulation engine. Shared: speed changes reach it.
+    pub fn shared_config(&self) -> Arc<RwLock<Config>> {
+        self.effective.clone()
+    }
+
+    /// Rewrites the shared config's settle, hold and fade as the real values over the speed.
+    fn scale_config(&self) {
+        let f = self.sim.clock.speed().factor();
+        let mut e = self.effective.write().unwrap_or_else(|e| e.into_inner());
+        e.videohub.settle = self.cfg.videohub.settle / f;
+        e.timings.closing_hold = self.cfg.timings.closing_hold / f;
+        e.stream_atem.fade = self.cfg.stream_atem.fade / f;
     }
 
     pub fn handle(&self) -> &SimHandle {
@@ -488,15 +512,20 @@ impl SimControl {
         self.sim.set_fault(f, on);
     }
 
-    /// Changes the speed; a video that is playing keeps its position and carries on at the new rate.
+    /// Changes the speed; a video that is playing keeps its position and carries on at the
+    /// new rate. The engine's VideoHub settle, closing hold and mic fade follow from its
+    /// next sequence (one already waiting keeps the wait it started with).
     pub fn set_speed(&self, speed: Speed) {
-        let mut w = self.sim.lock();
-        let old = self.sim.clock.speed().factor();
-        if let PlayerState::Playing { duration, .. } = w.player {
-            let anchor_pos = w.player.position(old).unwrap_or_default();
-            w.player = PlayerState::Playing { duration, anchor_pos, anchor_at: Instant::now() };
+        {
+            let mut w = self.sim.lock();
+            let old = self.sim.clock.speed().factor();
+            if let PlayerState::Playing { duration, .. } = w.player {
+                let anchor_pos = w.player.position(old).unwrap_or_default();
+                w.player = PlayerState::Playing { duration, anchor_pos, anchor_at: Instant::now() };
+            }
+            self.sim.clock.set_speed(speed);
         }
-        self.sim.clock.set_speed(speed);
+        self.scale_config();
     }
 
     /// Back to the seeded world: faults cleared, video stopped, counter cleared. The
@@ -507,6 +536,8 @@ impl SimControl {
         fresh.player_events = w.player_events.clone();
         fresh.player_gen = w.player_gen + 1; // any running end timer is now stale
         *w = fresh;
+        drop(w);
+        self.scale_config();
     }
 }
 
@@ -618,7 +649,7 @@ mod tests {
         let t = Instant::now();
         yt.health().await.unwrap();
         assert_eq!(t.elapsed(), Duration::from_secs(20));
-        SimControl { sim: sim.clone(), cfg: cfg() }.set_speed(Speed::X10);
+        SimControl::from_handle(sim.clone(), cfg()).set_speed(Speed::X10);
         let t = Instant::now();
         yt.life_cycle("sim-test").await.unwrap();
         assert_eq!(t.elapsed(), Duration::from_secs(2));
@@ -696,7 +727,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn counter_records_last_value_and_formats_on_read() {
         let sim = SimHandle::new(&cfg(), Speed::X1);
-        let c = SimControl { sim: sim.clone(), cfg: cfg() };
+        let c = SimControl::from_handle(sim.clone(), cfg());
         assert_eq!(c.snapshot().counter_text, None);
         sim.counter().show(Duration::from_millis(61_500)).await.unwrap();
         assert_eq!(c.snapshot().counter_text.as_deref(), Some("1:02"));
@@ -713,6 +744,48 @@ mod tests {
         let fake = dir.join("fake.mp4");
         std::fs::write(&fake, "this is not a movie").unwrap();
         assert_eq!(clip_length(&fake), Duration::from_secs(30));
+    }
+
+    /// The app's Videos tab reads lengths with no fallback, so it can say why it has none.
+    #[test]
+    fn read_length_has_no_fallback() {
+        let dir = clip::test_support::temp_dir("read-length");
+        assert_eq!(read_length(&dir.join("missing.mp4")), None);
+        let fake = dir.join("fake.mp4");
+        std::fs::write(&fake, "this is not a movie").unwrap();
+        assert_eq!(read_length(&fake), None);
+        let f = dir.join("clip.mp4");
+        std::fs::write(&f, clip::test_support::mp4_bytes(12_000)).unwrap();
+        assert_eq!(read_length(&f), Some(Duration::from_secs(12)));
+        std::fs::write(&f, clip::test_support::mp4_bytes(0)).unwrap();
+        assert_eq!(read_length(&f), None, "a zero length is not a length");
+    }
+
+    /// The speed scales the config durations the engine waits on: VideoHub settle,
+    /// closing hold and mic fade, in the config the simulation engine shares.
+    #[tokio::test(start_paused = true)]
+    async fn speed_scales_settle_hold_and_fade() {
+        let c = SimControl::new(&cfg(), Speed::X1);
+        let shared = c.shared_config();
+        let real = cfg();
+        let read = || {
+            let e = shared.read().unwrap();
+            (e.videohub.settle, e.timings.closing_hold, e.stream_atem.fade)
+        };
+        assert_eq!(read(), (real.videohub.settle, real.timings.closing_hold, real.stream_atem.fade));
+        c.set_speed(Speed::X10);
+        assert_eq!(read(), (Duration::from_millis(150), Duration::from_secs(1), Duration::from_millis(100)));
+        c.set_speed(Speed::X4);
+        assert_eq!(read(), (Duration::from_millis(375), Duration::from_millis(2500), Duration::from_millis(250)));
+        c.reset();
+        assert_eq!(read().1, Duration::from_millis(2500), "a reset keeps the speed, so the scaled values too");
+        c.set_speed(Speed::X1);
+        assert_eq!(read(), (real.videohub.settle, real.timings.closing_hold, real.stream_atem.fade));
+        // The unscaled values are what Settings shows.
+        assert_eq!(c.config().timings.closing_hold, real.timings.closing_hold);
+        // Built at a speed: scaled from the start.
+        let fast = SimControl::new(&cfg(), Speed::X10);
+        assert_eq!(fast.shared_config().read().unwrap().timings.closing_hold, Duration::from_secs(1));
     }
 
     #[test]
