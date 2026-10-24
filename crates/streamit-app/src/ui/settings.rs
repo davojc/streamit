@@ -734,6 +734,7 @@ impl StreamItApp {
                 .clicked()
             {
                 let (id, secret, ctx) = (id.clone(), secret.clone(), ui.ctx().clone());
+                self.save_youtube();
                 self.signin_status = "Waiting for you to approve in the browser...".into();
                 self.signin_job.start(&self.rt, &ctx, async move {
                     Auth::sign_in(&id, &secret).await.map(|_| ()).map_err(|e| e.to_string())
@@ -744,6 +745,9 @@ impl StreamItApp {
             }
             ui.label(&self.signin_status);
         });
+        if !simulating && !self.channel_status.is_empty() {
+            ui.label(RichText::new(&self.channel_status).strong());
+        }
         ui.horizontal(|ui| {
             let busy = self.streams_job.running;
             if theme::button_enabled(ui, have_client && !busy && !simulating, "Load stream keys", Kind::Plain)
@@ -766,15 +770,20 @@ impl StreamItApp {
                 .map(label)
                 .or(current.clone())
                 .unwrap_or_else(|| "(none)".into());
+            let mut picked = false;
             ui.add_enabled_ui(!simulating, |ui| {
                 egui::ComboBox::from_id_salt("stream").selected_text(selected).width(320.0).show_ui(ui, |ui| {
                     for s in &self.streams {
                         if ui.selectable_label(current.as_ref() == Some(&s.id), label(s)).clicked() {
                             self.draft.youtube.stream_id = Some(s.id.clone());
+                            picked = true;
                         }
                     }
                 });
             });
+            if picked {
+                self.save_youtube();
+            }
             ui.label(&self.streams_status);
         });
     }
@@ -829,7 +838,7 @@ impl StreamItApp {
     // ---- Save / Discard
 
     /// The draft differs from the saved settings (cues are saved on their own).
-    fn settings_dirty(&self) -> bool {
+    pub(super) fn settings_dirty(&self) -> bool {
         let saved = self.config.read().unwrap_or_else(|e| e.into_inner()).clone();
         let mut d = self.draft.clone();
         d.cues = saved.cues.clone();
@@ -853,12 +862,13 @@ impl StreamItApp {
         });
     }
 
-    pub(super) fn save_settings(&mut self) {
+    /// Saves the draft. True when it reached the file.
+    pub(super) fn save_settings(&mut self) -> bool {
         match parse_inputs(&self.live_inputs_text) {
             Ok(v) => self.draft.stream_atem.live_inputs = v,
             Err(e) => {
                 self.notice = Some(e);
-                return;
+                return false;
             }
         }
         let c = {
@@ -870,7 +880,7 @@ impl StreamItApp {
         };
         if !self.file.writable {
             self.notice = Some("Not saved: the settings file could not be backed up (see the log).".into());
-            return;
+            return false;
         }
         match c.save(&self.file.path) {
             Ok(()) => {
@@ -887,12 +897,51 @@ impl StreamItApp {
                     (false, true) => format!("Saved. {RESTART_NOTE}."),
                     (false, false) => "Saved. Timings and other settings apply now.".into(),
                 });
+                true
             }
             Err(e) => {
                 warn!("saving settings: {e:#}");
                 self.notice = Some(format!("Could not save: {e:#}"));
+                false
             }
         }
+    }
+
+    /// Writes the draft's YouTube client and stream key to the shared settings and the
+    /// file straight away, leaving the other unsaved edits alone. Sign-in stores its token
+    /// for this client, so the client is kept with it without waiting for Save.
+    fn save_youtube(&mut self) {
+        let c = {
+            let mut shared = self.config.write().unwrap_or_else(|e| e.into_inner());
+            shared.youtube = self.draft.youtube.clone();
+            shared.clone()
+        };
+        if !self.file.writable {
+            self.notice = Some("Not saved: the settings file could not be backed up (see the log).".into());
+            return;
+        }
+        match c.save(&self.file.path) {
+            Ok(()) => info!(path = %self.file.path.display(), "YouTube settings saved"),
+            Err(e) => {
+                warn!("saving the YouTube settings: {e:#}");
+                self.notice = Some(format!("Could not save the YouTube settings: {e:#}"));
+            }
+        }
+    }
+
+    /// Asks YouTube which channel the saved client's sign-in belongs to.
+    pub(super) fn load_channel(&mut self) {
+        let y = self.config.read().unwrap_or_else(|e| e.into_inner()).youtube.clone();
+        if y.client_id.trim().is_empty() || y.client_secret.trim().is_empty() {
+            self.channel_status = String::new();
+            return;
+        }
+        self.channel_status = "Checking which channel is signed in...".into();
+        self.channel_job.start(&self.rt, &self.ctx, async move {
+            let auth = Auth::load(&y.client_id, &y.client_secret).map_err(|e| e.to_string())?;
+            let base = url::Url::parse(API_BASE).map_err(|e| e.to_string())?;
+            YouTubeClient::new(base, auth, None).channel_title().await.map_err(|e| e.to_string())
+        });
     }
 
     pub(super) fn scan(&mut self) {

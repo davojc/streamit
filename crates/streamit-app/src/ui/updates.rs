@@ -134,6 +134,9 @@ impl StreamItApp {
                 self.updates.state = UpdateState::Installing(r.clone());
                 self.updates.install.start(&self.rt, &self.ctx, update::install(r));
             }
+            (UpdateAction::Restart, UpdateState::Installed(..)) if self.settings_dirty() => {
+                self.notice = Some("Save or discard your settings changes first, then restart.".into());
+            }
             (UpdateAction::Restart, UpdateState::Installed(r, exe)) => match update::start(&exe) {
                 Ok(()) => {
                     info!(version = %r.version, "restarting into the update");

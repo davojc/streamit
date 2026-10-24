@@ -434,3 +434,31 @@ async fn list_streams_without_sign_in_is_refused() {
     let c = YouTubeClient::new(Url::parse(&s.uri()).unwrap(), auth, None);
     assert_eq!(c.list_streams().await, Err(DeviceError::Refused("sign-in required".into())));
 }
+
+#[tokio::test]
+async fn channel_title_reads_the_signed_in_channel() {
+    let s = MockServer::start().await;
+    token_ok(&s).await;
+    Mock::given(method("GET"))
+        .and(path("/youtube/v3/channels"))
+        .and(query_param("part", "snippet"))
+        .and(query_param("mine", "true"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"items":[{"id":"UC1","snippet":{"title":"St Mary's"}}]})),
+        )
+        .mount(&s)
+        .await;
+    assert_eq!(client(&s, None).channel_title().await, Ok(Some("St Mary's".into())));
+}
+
+#[tokio::test]
+async fn channel_title_is_none_for_an_account_without_a_channel() {
+    let s = MockServer::start().await;
+    token_ok(&s).await;
+    Mock::given(method("GET"))
+        .and(path("/youtube/v3/channels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[]})))
+        .mount(&s)
+        .await;
+    assert_eq!(client(&s, None).channel_title().await, Ok(None));
+}

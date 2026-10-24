@@ -104,6 +104,24 @@ fn service_at_risk(s: &Snapshot) -> bool {
     !matches!(s.stage, Stage::Idle | Stage::Ended) || s.job.is_some() || s.playing.is_some()
 }
 
+/// What closing the window asks first, if anything. The service comes first; unsaved
+/// Settings edits are asked about once the service question is out of the way.
+#[derive(Debug, PartialEq)]
+enum CloseAsk {
+    Service,
+    UnsavedSettings,
+}
+
+fn close_ask(at_risk: bool, service_ok: bool, dirty: bool, unsaved_ok: bool) -> Option<CloseAsk> {
+    if at_risk && !service_ok {
+        Some(CloseAsk::Service)
+    } else if dirty && !unsaved_ok {
+        Some(CloseAsk::UnsavedSettings)
+    } else {
+        None
+    }
+}
+
 pub struct StreamItApp {
     rt: Handle,
     /// For the real ↔ simulation switch and "Crash & restart app"; both run on `rt`.
@@ -134,6 +152,10 @@ pub struct StreamItApp {
     /// The close button was pressed during a service: ask first.
     confirm_close: bool,
     close_confirmed: bool,
+    /// Closing with unsaved Settings edits is asking whether to save them.
+    confirm_unsaved: bool,
+    /// "Close without saving" was chosen: unsaved Settings edits no longer stop a close.
+    unsaved_ok: bool,
     /// "Start service now" from Idle was clicked once in the More menu: the next click sends it.
     confirm_start_now: bool,
     /// The config the devices were built from.
@@ -169,6 +191,9 @@ pub struct StreamItApp {
     live_inputs_text: String,
     signin_job: Pending<Result<(), String>>,
     signin_status: String,
+    channel_job: Pending<Result<Option<String>, String>>,
+    /// Which channel the YouTube sign-in belongs to, for the Settings YouTube card.
+    channel_status: String,
     streams: Vec<StreamSummary>,
     streams_job: Pending<Result<Vec<StreamSummary>, String>>,
     streams_status: String,
@@ -218,6 +243,8 @@ impl StreamItApp {
             ctx: ctx.clone(),
             confirm_close: false,
             close_confirmed: false,
+            confirm_unsaved: false,
+            unsaved_ok: false,
             confirm_start_now: false,
             live_inputs_text: join_inputs(&draft.stream_atem.live_inputs),
             cues: startup.cues.clone(),
@@ -242,6 +269,8 @@ impl StreamItApp {
             add_kind: None,
             signin_job: Pending::default(),
             signin_status: String::new(),
+            channel_job: Pending::default(),
+            channel_status: String::new(),
             streams: Vec::new(),
             streams_job: Pending::default(),
             streams_status: String::new(),
@@ -253,6 +282,7 @@ impl StreamItApp {
             updates: updates::Updates::default(),
         };
         app.load_broadcasts();
+        app.load_channel();
         app.scan();
         app.check_for_update();
         app
@@ -319,6 +349,7 @@ impl StreamItApp {
                     // Manager; refresh the engine and the broadcast list.
                     self.send(Command::Refresh);
                     self.load_broadcasts();
+                    self.load_channel();
                     if device_settings(&self.draft) != device_settings(&self.startup) {
                         format!("Signed in. {RESTART_NOTE} (YouTube settings changed).")
                     } else {
@@ -326,6 +357,16 @@ impl StreamItApp {
                     }
                 }
                 Err(e) => format!("Sign-in failed: {e}"),
+            };
+        }
+        if let Some(r) = self.channel_job.take() {
+            self.channel_status = match r {
+                Ok(Some(title)) => format!("Signed in to the channel \"{title}\"."),
+                Ok(None) => {
+                    "Signed in, but this account has no YouTube channel. Sign in again and pick the channel.".into()
+                }
+                Err(e) if e.contains("sign-in required") => "Not signed in.".into(),
+                Err(e) => format!("Could not read the signed-in channel: {e}"),
             };
         }
         if let Some(r) = self.streams_job.take() {
@@ -478,14 +519,25 @@ impl StreamItApp {
 
 impl StreamItApp {
     /// The window's close button during a service asks first; it closes only on an
-    /// explicit confirm.
+    /// explicit confirm. Then, with unsaved Settings edits, it asks whether to save them.
     fn close_guard(&mut self, ui: &mut Ui, snap: &Snapshot) {
         let ctx = ui.ctx().clone();
-        if ctx.input(|i| i.viewport().close_requested()) && !self.close_confirmed && service_at_risk(snap) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            info!("close requested during a service; asking for confirmation");
-            self.confirm_close = true;
+        if ctx.input(|i| i.viewport().close_requested()) {
+            match close_ask(service_at_risk(snap), self.close_confirmed, self.settings_dirty(), self.unsaved_ok) {
+                Some(CloseAsk::Service) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    info!("close requested during a service; asking for confirmation");
+                    self.confirm_close = true;
+                }
+                Some(CloseAsk::UnsavedSettings) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    info!("close requested with unsaved settings; asking whether to save");
+                    self.confirm_unsaved = true;
+                }
+                None => {}
+            }
         }
+        self.unsaved_guard(&ctx);
         if !self.confirm_close {
             return;
         }
@@ -512,6 +564,37 @@ impl StreamItApp {
                     self.close_confirmed = true;
                     self.confirm_close = false;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+        });
+    }
+
+    /// Closing with unsaved Settings edits: save them, throw them away, or stay open.
+    fn unsaved_guard(&mut self, ctx: &egui::Context) {
+        if !self.confirm_unsaved {
+            return;
+        }
+        egui::Modal::new(egui::Id::unique("confirm_unsaved")).show(ctx, |ui| {
+            ui.heading("Save your settings changes?");
+            ui.label("The Settings tab has changes that are not saved. If you close without saving, they are lost.");
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new("Save and close").strong()).clicked() {
+                    self.confirm_unsaved = false;
+                    if self.save_settings() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else {
+                        // The notice says why; stay open on the Settings tab.
+                        self.tab = Tab::Settings;
+                    }
+                }
+                if ui.button("Close without saving").clicked() {
+                    warn!("closing with unsaved settings (discarded)");
+                    self.confirm_unsaved = false;
+                    self.unsaved_ok = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                if ui.button("Keep StreamIt open").clicked() {
+                    self.confirm_unsaved = false;
                 }
             });
         });
@@ -669,6 +752,16 @@ fn new_cue(path: &Path) -> Cue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_asks_about_the_service_then_unsaved_settings() {
+        assert_eq!(close_ask(false, false, false, false), None, "nothing to lose: just close");
+        assert_eq!(close_ask(true, false, true, false), Some(CloseAsk::Service), "the service comes first");
+        assert_eq!(close_ask(true, true, true, false), Some(CloseAsk::UnsavedSettings), "then the settings");
+        assert_eq!(close_ask(false, false, true, false), Some(CloseAsk::UnsavedSettings));
+        assert_eq!(close_ask(false, false, true, true), None, "Close without saving was chosen");
+        assert_eq!(close_ask(true, true, false, false), None);
+    }
 
     #[test]
     fn closing_is_risky_only_during_a_service() {

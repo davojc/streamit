@@ -141,7 +141,9 @@ impl Auth {
             .authorize_url(CsrfToken::new_random)
             .add_scope(Scope::new(SCOPE.into()))
             .add_extra_param("access_type", "offline")
-            .add_extra_param("prompt", "consent")
+            // select_account: Google always shows the account chooser, which is where a
+            // brand account's channel is picked. consent: always return a refresh token.
+            .add_extra_param("prompt", "select_account consent")
             .set_pkce_challenge(challenge)
             .url();
         open(&url);

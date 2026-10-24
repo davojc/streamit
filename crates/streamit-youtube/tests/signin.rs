@@ -41,6 +41,7 @@ async fn loopback_sign_in_exchanges_code_with_pkce_and_stores_refresh_token() {
     assert_eq!(q["scope"], "https://www.googleapis.com/auth/youtube");
     assert_eq!(q["code_challenge_method"], "S256");
     assert_eq!(q["access_type"], "offline");
+    assert_eq!(q["prompt"], "select_account consent", "the chooser is where a brand account is picked");
     assert!(q["redirect_uri"].starts_with("http://127.0.0.1:"));
     assert_eq!(auth.signed_in().await, Ok(true));
 }

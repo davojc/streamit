@@ -107,6 +107,13 @@ impl YouTubeClient {
             .collect())
     }
 
+    /// The title of the channel the sign-in belongs to (a brand account's channel when that
+    /// was picked at sign-in), or `None` when the account has no channel.
+    pub async fn channel_title(&self) -> Result<Option<String>> {
+        let v = self.call(Method::GET, "channels", &[("part", "snippet"), ("mine", "true")], None).await?;
+        Ok(v["items"][0]["snippet"]["title"].as_str().map(String::from))
+    }
+
     /// One `liveBroadcasts.list` page filtered by `broadcastStatus` (`upcoming` or `active`).
     async fn list_broadcasts(&self, status: &str) -> Result<Vec<BroadcastSummary>> {
         let v = self
