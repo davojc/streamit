@@ -1,13 +1,16 @@
 //! What the screens show, worked out from the snapshot and the settings. No egui here:
 //! the drawing lives in `ui/`, so these choices can be tested.
+use crate::session::{Mode, REFUSED};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use streamit_core::config::Config;
+use streamit_core::devices::{EncoderStatus, Health};
 use streamit_core::engine::{DeviceHealth, DeviceKind, FlashKey, Snapshot};
 use streamit_core::golive::{Readiness, Stage};
 use streamit_core::recovery::Offer;
 use streamit_core::rollin::{Cue, CueState, Destination};
+use streamit_sim::{Fault, Input8Source, PlayerView, Speed};
 
 /// The colour family of a badge, a dot or a step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,6 +404,126 @@ pub fn fmt_hhmmss(d: Duration) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
 }
 
+// ---------------------------------------------------------------- Settings (screen 6)
+
+/// The Simulation card's button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwitchState {
+    pub label: &'static str,
+    pub enabled: bool,
+    /// Why it is disabled.
+    pub reason: Option<&'static str>,
+}
+
+/// Mirrors `Sessions::switch`: allowed only at Idle or Ended with no sequence running.
+pub fn switch_state(s: &Snapshot, mode: Mode) -> SwitchState {
+    let label = match mode {
+        Mode::Real => "Switch to simulation",
+        Mode::Simulation => "Leave simulation",
+    };
+    let enabled = matches!(s.stage, Stage::Idle | Stage::Ended) && s.job.is_none();
+    SwitchState { label, enabled, reason: (!enabled).then_some(REFUSED) }
+}
+
+/// Under a VideoHub number the simulation filled in itself (ruling S4), what it uses.
+pub fn sim_default_note(defaulted: &[&'static str], field: &str, value: u16) -> Option<String> {
+    defaulted.contains(&field).then(|| format!("Simulation uses {value} (simulated default)"))
+}
+
+// ---------------------------------------------------------------- Simulation (screen 7)
+
+/// The faults the "Make something go wrong" buttons toggle, in the mockup's order.
+pub const FAULTS: [Fault; 7] = [
+    Fault::Unplug(DeviceKind::VideoHub),
+    Fault::Unplug(DeviceKind::StreamAtem),
+    Fault::Unplug(DeviceKind::WebPresenter),
+    Fault::YouTubeRefusesPublic,
+    Fault::YouTubeSlow,
+    Fault::NextVideoFails,
+    Fault::MicFadeFails,
+];
+
+pub fn fault_label(f: Fault) -> &'static str {
+    match f {
+        Fault::Unplug(DeviceKind::VideoHub) => "Unplug VideoHub",
+        Fault::Unplug(DeviceKind::StreamAtem) => "Unplug Stream ATEM",
+        Fault::Unplug(DeviceKind::WebPresenter) => "Unplug Web Presenter",
+        Fault::Unplug(_) => "Unplug",
+        Fault::YouTubeRefusesPublic => "YouTube refuses public",
+        Fault::YouTubeSlow => "YouTube very slow",
+        Fault::NextVideoFails => "Next video won’t load",
+        Fault::MicFadeFails => "Mic fade fails",
+    }
+}
+
+/// The Stream ATEM sources the Simulation tab offers: inputs 1–5, 8 and media player 1.
+pub fn sim_sources(media_player_input: u16) -> [u16; 7] {
+    [1, 2, 3, 4, 5, 8, media_player_input]
+}
+
+pub fn source_label(input: u16, media_player_input: u16) -> String {
+    if input == media_player_input { "MP1".into() } else { input.to_string() }
+}
+
+/// What input 8 carries: the DeckLink, Cam 8 on its normal router input, or another input.
+pub fn input8_text(src: Input8Source, cam8_input: u16) -> String {
+    match src {
+        Input8Source::DeckLink => "DeckLink".into(),
+        Input8Source::Other(0) => "Nothing routed".into(),
+        Input8Source::Other(n) if n == cam8_input => format!("Cam 8 (router in {n})"),
+        Input8Source::Other(n) => format!("Router in {n}"),
+    }
+}
+
+pub fn player_text(p: &PlayerView) -> String {
+    match p {
+        PlayerView::Empty => "idle".into(),
+        PlayerView::Loaded { duration } => format!("loaded · {}", fmt_mmss(*duration)),
+        PlayerView::Playing { position, duration } => {
+            format!("playing {} / {}", fmt_mmss_floor(*position), fmt_mmss(*duration))
+        }
+    }
+}
+
+pub fn encoder_text(e: &EncoderStatus) -> String {
+    match e {
+        EncoderStatus::Unknown(s) => s.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The pretend broadcast's life cycle, saying whether viewers can see it.
+pub fn yt_state_text(life_cycle: Option<&str>) -> String {
+    match life_cycle {
+        None => "no broadcast".into(),
+        Some("live") => "live (public)".into(),
+        Some("testing") => "testing (not public)".into(),
+        Some(other) => other.into(),
+    }
+}
+
+pub fn health_text(h: &Health) -> String {
+    match h {
+        Health::Good => "good".into(),
+        Health::NotReceiving => "not receiving".into(),
+        Health::Bad(why) => format!("bad: {why}"),
+    }
+}
+
+/// How long the last go-public took. Pretend delays are scaled by the speed (a 3 s
+/// transition takes 0.3 s at 10×), so the time is labelled with the current speed.
+pub fn went_public_text(d: Option<Duration>, speed: Speed) -> String {
+    match d {
+        Some(d) => format!("{:.1} s at {}×", d.as_secs_f32(), speed.factor()),
+        None => "—".into(),
+    }
+}
+
+/// How full the mic bar is: −40 dB (or off) empty, +6 dB full.
+pub fn mic_fraction(db: f32) -> f32 {
+    ((db + 40.0) / 46.0).clamp(0.0, 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,5 +798,95 @@ mod tests {
         assert_eq!((fmt_db(-2.0), fmt_db(0.04), fmt_db(3.0)), ("−2 dB".into(), "0 dB".into(), "+3 dB".into()));
         assert_eq!(fmt_hhmmss(Duration::from_secs(32 * 60 + 15)), "00:32:15");
         assert_eq!(fmt_mmss_floor(Duration::from_millis(72_800)), "1:12");
+    }
+
+    // ---- Settings and the Simulation tab (Task 9)
+
+    #[test]
+    fn switch_disabled_with_reason_while_live() {
+        let live = Snapshot { stage: Stage::Live, ..Snapshot::default() };
+        let st = switch_state(&live, Mode::Real);
+        assert_eq!(
+            st,
+            SwitchState {
+                label: "Switch to simulation",
+                enabled: false,
+                reason: Some("Finish or end the service first")
+            }
+        );
+        // A job running in Idle (a video) also blocks it.
+        let video = Snapshot { job: Some("a video"), ..Snapshot::default() };
+        assert!(!switch_state(&video, Mode::Real).enabled);
+        let prepared = Snapshot { stage: Stage::Prepared(Readiness::Ready), ..Snapshot::default() };
+        assert!(!switch_state(&prepared, Mode::Simulation).enabled);
+        let idle = switch_state(&Snapshot::default(), Mode::Real);
+        assert_eq!((idle.enabled, idle.reason), (true, None));
+        let ended = Snapshot { stage: Stage::Ended, ..Snapshot::default() };
+        assert!(switch_state(&ended, Mode::Real).enabled);
+    }
+
+    #[test]
+    fn switch_label_flips_in_simulation() {
+        assert_eq!(switch_state(&Snapshot::default(), Mode::Real).label, "Switch to simulation");
+        assert_eq!(switch_state(&Snapshot::default(), Mode::Simulation).label, "Leave simulation");
+        let live = Snapshot { stage: Stage::Live, simulation: true, ..Snapshot::default() };
+        assert_eq!(switch_state(&live, Mode::Simulation).label, "Leave simulation");
+    }
+
+    #[test]
+    fn went_public_is_pretend_time_at_the_speed() {
+        assert_eq!(went_public_text(Some(Duration::from_secs(3)), Speed::X1), "3.0 s at 1×");
+        assert_eq!(went_public_text(Some(Duration::from_millis(300)), Speed::X10), "0.3 s at 10×");
+        assert_eq!(went_public_text(None, Speed::X4), "—");
+    }
+
+    #[test]
+    fn simulation_tab_texts() {
+        assert_eq!(FAULTS.len(), 7, "seven faults, plus Crash & restart app");
+        let labels: Vec<&str> = FAULTS.iter().map(|f| fault_label(*f)).collect();
+        assert_eq!(
+            labels,
+            [
+                "Unplug VideoHub",
+                "Unplug Stream ATEM",
+                "Unplug Web Presenter",
+                "YouTube refuses public",
+                "YouTube very slow",
+                "Next video won’t load",
+                "Mic fade fails",
+            ]
+        );
+        assert_eq!(sim_sources(3010), [1, 2, 3, 4, 5, 8, 3010]);
+        assert_eq!((source_label(8, 3010), source_label(3010, 3010)), ("8".to_string(), "MP1".to_string()));
+        assert_eq!(input8_text(Input8Source::Other(13), 13), "Cam 8 (router in 13)");
+        assert_eq!(input8_text(Input8Source::Other(20), 13), "Router in 20");
+        assert_eq!(input8_text(Input8Source::Other(0), 13), "Nothing routed");
+        assert_eq!(input8_text(Input8Source::DeckLink, 13), "DeckLink");
+        assert_eq!(player_text(&PlayerView::Empty), "idle");
+        assert_eq!(player_text(&PlayerView::Loaded { duration: Duration::from_secs(30) }), "loaded · 0:30");
+        let playing =
+            PlayerView::Playing { position: Duration::from_millis(12_500), duration: Duration::from_secs(30) };
+        assert_eq!(player_text(&playing), "playing 0:12 / 0:30");
+        assert_eq!(yt_state_text(Some("live")), "live (public)");
+        assert_eq!(yt_state_text(Some("testing")), "testing (not public)");
+        assert_eq!(yt_state_text(Some("ready")), "ready");
+        assert_eq!(yt_state_text(None), "no broadcast");
+        assert_eq!(health_text(&Health::Good), "good");
+        assert_eq!(health_text(&Health::NotReceiving), "not receiving");
+        assert_eq!(encoder_text(&EncoderStatus::Streaming), "Streaming");
+        assert_eq!(mic_fraction(-100.0), 0.0);
+        assert_eq!(mic_fraction(6.0), 1.0);
+        assert!(mic_fraction(-3.0) > 0.5 && mic_fraction(-3.0) < 1.0);
+    }
+
+    #[test]
+    fn simulated_defaults_are_named_in_settings() {
+        let fields = vec!["videohub.input8_output", "videohub.decklink_input"];
+        assert_eq!(
+            sim_default_note(&fields, "videohub.input8_output", 11),
+            Some("Simulation uses 11 (simulated default)".into())
+        );
+        assert_eq!(sim_default_note(&fields, "videohub.fallback_normal_input", 13), None);
+        assert_eq!(sim_default_note(&[], "videohub.input8_output", 11), None);
     }
 }

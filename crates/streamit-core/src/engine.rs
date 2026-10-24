@@ -346,6 +346,12 @@ impl Engine {
                 Wake::Aux(a) => self.apply_aux(a),
             }
         }
+        // A sequence still running stops with the engine, part-way, as it would if the app
+        // stopped (an engine is only stopped mid-sequence by "Crash & restart app").
+        if let Some(r) = self.running.take() {
+            warn!(job = r.job.name(), "engine stopping with a sequence running: aborting it");
+            r.handle.abort();
+        }
         info!("engine stopped: the command channel closed");
     }
 
@@ -2424,6 +2430,24 @@ mod tests {
 
     fn has(s: &Snapshot, text: &str) -> bool {
         s.activity.iter().any(|a| a.text == text)
+    }
+
+    /// Closing the command channel mid-video (a "crash") aborts the video: its return
+    /// path never runs, and the engine's snapshot closes.
+    #[tokio::test(start_paused = true)]
+    async fn stopping_the_engine_aborts_its_running_sequence() {
+        let (d, log, h) = rig();
+        h.player.set_duration(Duration::from_secs(60));
+        let EngineHandle { tx, mut rx } = Engine::spawn(d, cfg(vec![cue("a", Destination::HallOnly)]));
+        tx.send(Command::PlayCue(0)).await.unwrap();
+        until_call(&log, Call::PlayerPlay).await;
+        let before = log.calls().len();
+        drop(tx);
+        let closed = tokio::time::timeout(Duration::from_secs(5), async { while rx.changed().await.is_ok() {} }).await;
+        assert!(closed.is_ok(), "the engine and its sequence let go of the snapshot");
+        h.player.emit(PlayerEvent::Ended);
+        sleep(Duration::from_secs(30)).await;
+        assert_eq!(log.calls().len(), before, "no return path ran: {:?}", &log.calls()[before..]);
     }
 
     #[tokio::test(start_paused = true)]

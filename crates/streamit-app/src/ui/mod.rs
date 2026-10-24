@@ -1,26 +1,29 @@
 //! The window: the header (stage badge, broadcast, equipment, tabs), the simulation
-//! banner, and the tabs: Service (`service.rs`), Videos, Settings and, in simulation
-//! only, Simulation. Every press becomes the same `Command` the Stream Deck would send.
-//! The Settings tab is v1's, restyled later.
+//! banner, and the tabs: Service (`service/`), Videos (`videos.rs`), Settings
+//! (`settings.rs`) and, in simulation only, Simulation (`simulation.rs`). Every press
+//! becomes the same `Command` the Stream Deck would send.
 mod service;
+mod settings;
+mod simulation;
 mod videos;
 
-use crate::discovery::{self, BmdKind, DiscoveredDevice};
-use crate::session::{Front, Mode};
+use crate::discovery::{BmdKind, DiscoveredDevice};
+use crate::session::{Front, Mode, Sessions, SwitchRefused};
 use crate::theme;
 use crate::view::{self, CueSync, ServiceScreen};
 use eframe::egui::{self, Color32, Margin, RichText, Ui};
+use settings::{RESTART_NOTE, Section, device_settings, join_inputs};
 use std::future::Future;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use streamit_core::config::{AudioSourceId, Config};
+use streamit_core::config::Config;
 use streamit_core::devices::{BroadcastSummary, Broadcasts};
 use streamit_core::engine::{Command, Snapshot};
 use streamit_core::golive::Stage;
 use streamit_core::rollin::{Cue, Destination, MAX_CUES};
-use streamit_youtube::{API_BASE, Auth, StreamSummary, YouTubeClient};
+use streamit_sim::SimControl;
+use streamit_youtube::StreamSummary;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
@@ -31,8 +34,6 @@ const CUE_DEBOUNCE: Duration = Duration::from_millis(400);
 const CUE_SETTLE: Duration = Duration::from_secs(1);
 /// An unsaved cue list is written again this often.
 const SAVE_RETRY: Duration = Duration::from_secs(5);
-const SCAN_FOR: Duration = Duration::from_secs(4);
-const RESTART_NOTE: &str = "Restart StreamIt to apply device changes";
 const SIM_UNAVAILABLE: &str = "Not available in simulation";
 
 /// Says why a control that would touch real equipment or YouTube is off in simulation.
@@ -89,59 +90,6 @@ enum Tab {
     Simulation,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Role {
-    StreamAtem,
-    ScreensAtem,
-    VideoHub,
-    WebPresenter,
-}
-
-const ROLES: [(Role, &str); 4] = [
-    (Role::StreamAtem, "Stream ATEM"),
-    (Role::ScreensAtem, "Screens ATEM"),
-    (Role::VideoHub, "VideoHub"),
-    (Role::WebPresenter, "Web Presenter"),
-];
-
-fn role_address(c: &mut Config, r: Role) -> &mut Option<String> {
-    match r {
-        Role::StreamAtem => &mut c.stream_atem.address,
-        Role::ScreensAtem => &mut c.screens_atem.address,
-        Role::VideoHub => &mut c.videohub.address,
-        Role::WebPresenter => &mut c.web_presenter.address,
-    }
-}
-
-fn roles_for(kind: Option<BmdKind>) -> Vec<(Role, &'static str)> {
-    ROLES
-        .iter()
-        .copied()
-        .filter(|(r, _)| match kind {
-            Some(BmdKind::Atem) => matches!(r, Role::StreamAtem | Role::ScreensAtem),
-            Some(BmdKind::VideoHub) => *r == Role::VideoHub,
-            Some(BmdKind::WebPresenter) => *r == Role::WebPresenter,
-            None => true,
-        })
-        .collect()
-}
-
-/// The settings that are only read when the devices are built at startup.
-fn device_settings(c: &Config) -> impl PartialEq + use<> {
-    (
-        (
-            c.stream_atem.address.clone(),
-            c.screens_atem.address.clone(),
-            c.videohub.address.clone(),
-            c.web_presenter.address.clone(),
-        ),
-        c.youtube.clone(),
-        // The countdown file is read when the countdown starts, so it is not listed.
-        (c.playout.decklink_device, c.playout.video_mode.clone()),
-        c.ndi.clone(),
-    )
-}
-
 /// Where the settings live, and whether the window may write them (false when an
 /// unreadable file could not be backed up).
 pub struct ConfigFile {
@@ -157,6 +105,8 @@ fn service_at_risk(s: &Snapshot) -> bool {
 
 pub struct StreamItApp {
     rt: Handle,
+    /// For the real ↔ simulation switch and "Crash & restart app"; both run on `rt`.
+    sessions: Arc<Sessions>,
     tx: mpsc::Sender<Command>,
     snap: watch::Receiver<Snapshot>,
     /// The current session's YouTube (real or pretend); the broadcast list reloads when
@@ -165,6 +115,16 @@ pub struct StreamItApp {
     mode: watch::Receiver<Mode>,
     /// True while one session is being stopped and the next opened.
     switching: watch::Receiver<bool>,
+    /// The pretend world, while simulating (the Simulation tab).
+    sim: watch::Receiver<Option<SimControl>>,
+    /// Settings the simulation filled in with a simulated default.
+    sim_defaults: watch::Receiver<Vec<&'static str>>,
+    switch_job: Pending<Result<(), SwitchRefused>>,
+    restart_job: Pending<Result<(), SwitchRefused>>,
+    /// The Settings section last picked, and the one to scroll to on the next frame.
+    section: Section,
+    scroll_to: Option<Section>,
+    show_add_ip: bool,
     /// The mode the window title was last set for.
     titled: Option<Mode>,
     config: Arc<RwLock<Config>>,
@@ -220,9 +180,11 @@ pub struct StreamItApp {
 }
 
 impl StreamItApp {
+    #[allow(clippy::too_many_arguments)] // called once, from main
     pub fn new(
         ctx: &egui::Context,
         rt: Handle,
+        sessions: Arc<Sessions>,
         s: Front,
         config: Arc<RwLock<Config>>,
         file: ConfigFile,
@@ -233,11 +195,19 @@ impl StreamItApp {
         let draft = startup.clone();
         let mut app = StreamItApp {
             rt,
+            sessions,
             tx: s.tx,
             snap: s.rx,
             yt: s.yt,
             mode: s.mode,
             switching: s.switching,
+            sim: s.sim,
+            sim_defaults: s.sim_defaults,
+            switch_job: Pending::default(),
+            restart_job: Pending::default(),
+            section: Section::default(),
+            scroll_to: None,
+            show_add_ip: false,
             titled: None,
             config,
             file,
@@ -315,13 +285,9 @@ impl StreamItApp {
         }
     }
 
-    fn scan(&mut self) {
-        self.scan_job.start(&self.rt, &self.ctx, async move {
-            tokio::task::spawn_blocking(|| discovery::browse(SCAN_FOR)).await.unwrap_or_default()
-        });
-    }
-
     fn poll_jobs(&mut self) {
+        Self::take_switch_result(&mut self.switch_job, &mut self.notice);
+        Self::take_switch_result(&mut self.restart_job, &mut self.notice);
         if let Some(r) = self.broadcasts_job.take() {
             match r {
                 Ok(list) => {
@@ -501,41 +467,6 @@ impl StreamItApp {
         }
     }
 
-    fn save_settings(&mut self) {
-        match parse_inputs(&self.live_inputs_text) {
-            Ok(v) => self.draft.stream_atem.live_inputs = v,
-            Err(e) => {
-                self.notice = Some(e);
-                return;
-            }
-        }
-        let c = {
-            let mut shared = self.config.write().unwrap_or_else(|e| e.into_inner());
-            let mut c = self.draft.clone();
-            c.cues = shared.cues.clone();
-            *shared = c.clone();
-            c
-        };
-        if !self.file.writable {
-            self.notice = Some("Not saved: the settings file could not be backed up (see the log).".into());
-            return;
-        }
-        match c.save(&self.file.path) {
-            Ok(()) => {
-                info!(path = %self.file.path.display(), "settings saved");
-                let restart = device_settings(&c) != device_settings(&self.startup);
-                self.notice = Some(if restart {
-                    format!("Saved. {RESTART_NOTE}.")
-                } else {
-                    "Saved. Timings and other settings apply now.".into()
-                });
-            }
-            Err(e) => {
-                warn!("saving settings: {e:#}");
-                self.notice = Some(format!("Could not save: {e:#}"));
-            }
-        }
-    }
 }
 
 impl StreamItApp {
@@ -605,6 +536,8 @@ impl eframe::App for StreamItApp {
             egui::Panel::top("sim_banner").frame(egui::Frame::new()).show_separator_line(false).show(ui, |ui| {
                 if theme::sim_banner(ui) {
                     self.tab = Tab::Settings;
+                    self.section = Section::Equipment;
+                    self.scroll_to = Some(Section::Equipment);
                 }
             });
         }
@@ -642,8 +575,8 @@ impl eframe::App for StreamItApp {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
                     Tab::Service => self.service_tab(ui, &snap, &config, viewport),
                     Tab::Videos => self.videos_tab(ui, &snap, &config),
-                    Tab::Settings => theme::panel().show(ui, |ui| self.settings_tab(ui)).inner,
-                    Tab::Simulation => simulation_tab(ui),
+                    Tab::Settings => self.settings_tab(ui, &snap),
+                    Tab::Simulation => self.simulation_tab(ui, &snap, &config),
                 });
             });
     }
@@ -702,18 +635,6 @@ impl StreamItApp {
     }
 }
 
-/// Task 9 builds this tab; for now it only says where the controls will be.
-fn simulation_tab(ui: &mut Ui) {
-    theme::panel().show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        theme::lbl(ui, "Simulation");
-        ui.label(
-            RichText::new("The pretend equipment controls arrive here in a later update. Leave simulation in Settings › Equipment.")
-                .color(theme::SOFT),
-        );
-    });
-}
-
 // ---------------------------------------------------------------- Videos tab (videos.rs)
 
 fn new_cue(path: &Path) -> Cue {
@@ -726,366 +647,9 @@ fn new_cue(path: &Path) -> Cue {
     }
 }
 
-// ---------------------------------------------------------------- Settings tab
-
-fn join_inputs(v: &[u16]) -> String {
-    v.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
-}
-
-fn parse_inputs(s: &str) -> Result<Vec<u16>, String> {
-    s.split(',')
-        .map(str::trim)
-        .filter(|x| !x.is_empty())
-        .map(|x| x.parse::<u16>().map_err(|_| format!("Live inputs: {x:?} is not an input number")))
-        .collect()
-}
-
-fn address(ui: &mut Ui, label: &str, a: &mut Option<String>) {
-    ui.label(label);
-    let mut s = a.clone().unwrap_or_default();
-    if ui.add(egui::TextEdit::singleline(&mut s).hint_text("not set").desired_width(160.0)).changed() {
-        *a = (!s.trim().is_empty()).then(|| s.trim().to_string());
-    }
-    ui.end_row();
-}
-
-fn num<N: egui::emath::Numeric>(ui: &mut Ui, label: &str, v: &mut N) {
-    ui.label(label);
-    ui.add(egui::DragValue::new(v));
-    ui.end_row();
-}
-
-fn millis(ui: &mut Ui, label: &str, d: &mut Duration) {
-    ui.label(label);
-    let mut ms = d.as_millis() as u64;
-    if ui.add(egui::DragValue::new(&mut ms).range(0..=600_000).speed(10).suffix(" ms")).changed() {
-        *d = Duration::from_millis(ms);
-    }
-    ui.end_row();
-}
-
-impl StreamItApp {
-    fn settings_tab(&mut self, ui: &mut Ui) {
-        ui.label(
-            RichText::new(format!(
-                "{RESTART_NOTE}: device addresses and roles, the YouTube client and stream key, \
-                 and the playout and NDI settings are read when StreamIt starts. Timings, inputs \
-                 and audio settings apply as soon as you Save."
-            ))
-            .strong(),
-        );
-        if device_settings(&self.config.read().unwrap_or_else(|e| e.into_inner())) != device_settings(&self.startup) {
-            ui.label(RichText::new(format!("Saved device changes are waiting: {RESTART_NOTE}.")).color(Color32::RED));
-        }
-        ui.horizontal(|ui| {
-            if ui.button(RichText::new("Save").strong().size(16.0)).clicked() {
-                self.save_settings();
-            }
-            if ui.button("Revert to saved").clicked() {
-                self.draft = self.config.read().unwrap_or_else(|e| e.into_inner()).clone();
-                self.live_inputs_text = join_inputs(&self.draft.stream_atem.live_inputs);
-            }
-        });
-        ui.separator();
-        self.devices_section(ui);
-        ui.separator();
-        self.youtube_section(ui);
-        ui.separator();
-        self.config_fields(ui);
-    }
-
-    fn devices_section(&mut self, ui: &mut Ui) {
-        ui.heading("Devices on the network");
-        ui.horizontal(|ui| {
-            let busy = self.scan_job.running;
-            // Simulation never touches the network: no mDNS scan.
-            let simulating = *self.mode.borrow() == Mode::Simulation;
-            if ui.add_enabled(!busy && !simulating, egui::Button::new("Scan")).sim_tip(simulating).clicked() {
-                self.scan();
-            }
-            if busy {
-                ui.spinner();
-                ui.label("Looking for Blackmagic devices...");
-            }
-        });
-        let mut assign: Option<(IpAddr, Option<Role>)> = None;
-        egui::Grid::new("found").striped(true).show(ui, |ui| {
-            ui.label("Name");
-            ui.label("Model");
-            ui.label("Address");
-            ui.label("Kind");
-            ui.label("Role");
-            ui.end_row();
-            for d in &self.discovered {
-                ui.label(&d.name);
-                ui.label(&d.model);
-                ui.label(d.address.to_string());
-                ui.label(d.kind.map(BmdKind::label).unwrap_or("unknown"));
-                let ip = d.address.to_string();
-                let current = ROLES
-                    .iter()
-                    .find(|(r, _)| role_address(&mut self.draft, *r).as_deref() == Some(ip.as_str()))
-                    .map(|(r, name)| (*r, *name));
-                egui::ComboBox::from_id_salt(("role", ip.clone()))
-                    .selected_text(current.map(|(_, n)| n).unwrap_or("(none)"))
-                    .show_ui(ui, |ui| {
-                        if ui.selectable_label(current.is_none(), "(none)").clicked() {
-                            assign = Some((d.address, None));
-                        }
-                        for (r, name) in roles_for(d.kind) {
-                            if ui.selectable_label(current.map(|c| c.0) == Some(r), name).clicked() {
-                                assign = Some((d.address, Some(r)));
-                            }
-                        }
-                    });
-                ui.end_row();
-            }
-        });
-        if let Some((ip, role)) = assign {
-            let ip = ip.to_string();
-            for (r, _) in ROLES {
-                let a = role_address(&mut self.draft, r);
-                if a.as_deref() == Some(ip.as_str()) && Some(r) != role {
-                    *a = None;
-                }
-            }
-            if let Some(r) = role {
-                *role_address(&mut self.draft, r) = Some(ip);
-            }
-        }
-        ui.horizontal(|ui| {
-            ui.label("Add by IP:");
-            ui.add(egui::TextEdit::singleline(&mut self.add_ip).hint_text("192.168.4.x").desired_width(120.0));
-            egui::ComboBox::from_id_salt("add_kind")
-                .selected_text(self.add_kind.map(BmdKind::label).unwrap_or("any"))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.add_kind, None, "any");
-                    for k in [BmdKind::Atem, BmdKind::VideoHub, BmdKind::WebPresenter] {
-                        ui.selectable_value(&mut self.add_kind, Some(k), k.label());
-                    }
-                });
-            if ui.button("Add").clicked() {
-                match self.add_ip.trim().parse::<IpAddr>() {
-                    Ok(address) if !self.discovered.iter().any(|d| d.address == address) => {
-                        self.discovered.push(DiscoveredDevice {
-                            name: "Added by IP".into(),
-                            model: String::new(),
-                            address,
-                            kind: self.add_kind,
-                        });
-                        self.add_ip.clear();
-                    }
-                    Ok(_) => self.notice = Some("That address is already in the list.".into()),
-                    Err(_) => self.notice = Some(format!("{:?} is not an IP address.", self.add_ip.trim())),
-                }
-            }
-        });
-    }
-
-    fn youtube_section(&mut self, ui: &mut Ui) {
-        ui.heading("YouTube");
-        egui::Grid::new("yt").show(ui, |ui| {
-            ui.label("OAuth client id");
-            ui.add(egui::TextEdit::singleline(&mut self.draft.youtube.client_id).desired_width(420.0));
-            ui.end_row();
-            ui.label("OAuth client secret");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.draft.youtube.client_secret).password(true).desired_width(420.0),
-            );
-            ui.end_row();
-            ui.label("Stream key id");
-            let mut s = self.draft.youtube.stream_id.clone().unwrap_or_default();
-            if ui.add(egui::TextEdit::singleline(&mut s).hint_text("pick below").desired_width(420.0)).changed() {
-                self.draft.youtube.stream_id = (!s.trim().is_empty()).then(|| s.trim().to_string());
-            }
-            ui.end_row();
-        });
-        let (id, secret) = (self.draft.youtube.client_id.clone(), self.draft.youtube.client_secret.clone());
-        let have_client = !id.trim().is_empty() && !secret.trim().is_empty();
-        // Both build a real YouTube client: never in simulation.
-        let simulating = *self.mode.borrow() == Mode::Simulation;
-        ui.horizontal(|ui| {
-            let busy = self.signin_job.running;
-            if ui
-                .add_enabled(have_client && !busy && !simulating, egui::Button::new("Sign in"))
-                .sim_tip(simulating)
-                .clicked()
-            {
-                let (id, secret, ctx) = (id.clone(), secret.clone(), ui.ctx().clone());
-                self.signin_status = "Waiting for you to approve in the browser...".into();
-                self.signin_job.start(&self.rt, &ctx, async move {
-                    Auth::sign_in(&id, &secret).await.map(|_| ()).map_err(|e| e.to_string())
-                });
-            }
-            if busy {
-                ui.spinner();
-            }
-            ui.label(&self.signin_status);
-        });
-        ui.horizontal(|ui| {
-            let busy = self.streams_job.running;
-            if ui
-                .add_enabled(have_client && !busy && !simulating, egui::Button::new("Load stream keys"))
-                .sim_tip(simulating)
-                .clicked()
-            {
-                let (id, secret, ctx) = (id.clone(), secret.clone(), ui.ctx().clone());
-                self.streams_job.start(&self.rt, &ctx, async move {
-                    let auth = Auth::load(&id, &secret).map_err(|e| e.to_string())?;
-                    let base = url::Url::parse(API_BASE).map_err(|e| e.to_string())?;
-                    YouTubeClient::new(base, auth, None).list_streams().await.map_err(|e| e.to_string())
-                });
-            }
-            let current = self.draft.youtube.stream_id.clone();
-            let label = |s: &StreamSummary| format!("{}  {}", s.title, s.key_name);
-            let selected = self
-                .streams
-                .iter()
-                .find(|s| Some(&s.id) == current.as_ref())
-                .map(label)
-                .or(current.clone())
-                .unwrap_or_else(|| "(none)".into());
-            egui::ComboBox::from_id_salt("stream").selected_text(selected).width(320.0).show_ui(ui, |ui| {
-                for s in &self.streams {
-                    if ui.selectable_label(current.as_ref() == Some(&s.id), label(s)).clicked() {
-                        self.draft.youtube.stream_id = Some(s.id.clone());
-                    }
-                }
-            });
-            ui.label(&self.streams_status);
-        });
-    }
-
-    fn config_fields(&mut self, ui: &mut Ui) {
-        let c = &mut self.draft;
-        ui.heading("Stream ATEM");
-        egui::Grid::new("stream_atem").show(ui, |ui| {
-            address(ui, "Address", &mut c.stream_atem.address);
-            num(ui, "Media player", &mut c.stream_atem.media_player);
-            num(ui, "Opening still (0-based slot)", &mut c.stream_atem.opening_still);
-            num(ui, "Closing still (0-based slot)", &mut c.stream_atem.closing_still);
-            num(ui, "DeckLink input", &mut c.stream_atem.decklink_input);
-            ui.label("Live inputs (comma separated)");
-            ui.text_edit_singleline(&mut self.live_inputs_text);
-            ui.end_row();
-            num(ui, "Default live input", &mut c.stream_atem.default_live_input);
-            ui.label("Mics during a video (-100 = off)");
-            ui.add(egui::DragValue::new(&mut c.stream_atem.duck_db).range(-100.0..=0.0).speed(0.5).suffix(" dB"));
-            ui.end_row();
-            millis(ui, "Mic fade", &mut c.stream_atem.fade);
-        });
-        ui.label("Mic sources (Fairlight input / source):");
-        let mut remove = None;
-        for (i, m) in c.stream_atem.mic_sources.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut m.input));
-                ui.add(egui::DragValue::new(&mut m.source));
-                if ui.button("Remove").clicked() {
-                    remove = Some(i);
-                }
-            });
-        }
-        if let Some(i) = remove {
-            c.stream_atem.mic_sources.remove(i);
-        }
-        if ui.button("Add mic source").clicked() {
-            c.stream_atem.mic_sources.push(AudioSourceId { input: 1001, source: -65280 });
-        }
-
-        ui.heading("Screens ATEM");
-        egui::Grid::new("screens_atem").show(ui, |ui| {
-            address(ui, "Address", &mut c.screens_atem.address);
-            num(ui, "DeckLink input", &mut c.screens_atem.decklink_input);
-            num(ui, "Input at T-0", &mut c.screens_atem.t0_input);
-        });
-
-        ui.heading("VideoHub");
-        egui::Grid::new("videohub").show(ui, |ui| {
-            address(ui, "Address", &mut c.videohub.address);
-            num(ui, "Output feeding ATEM input 8 (0 = not set)", &mut c.videohub.input8_output);
-            num(ui, "DeckLink router input (0 = not set)", &mut c.videohub.decklink_input);
-            millis(ui, "Settle time", &mut c.videohub.settle);
-            num(ui, "Fallback normal input (0 = not set)", &mut c.videohub.fallback_normal_input);
-        });
-
-        ui.heading("Web Presenter");
-        egui::Grid::new("webpresenter").show(ui, |ui| {
-            address(ui, "Address", &mut c.web_presenter.address);
-        });
-
-        ui.heading("Timings");
-        egui::Grid::new("timings").show(ui, |ui| {
-            millis(ui, "Go public before T-0", &mut c.timings.go_public_offset);
-            millis(ui, "Closing hold", &mut c.timings.closing_hold);
-        });
-
-        ui.heading("Playout");
-        egui::Grid::new("playout").show(ui, |ui| {
-            num(ui, "DeckLink device", &mut c.playout.decklink_device);
-            ui.label("Video mode");
-            ui.text_edit_singleline(&mut c.playout.video_mode);
-            ui.end_row();
-            ui.label("Countdown video");
-            ui.horizontal(|ui| {
-                let mut s = c.playout.countdown_file.display().to_string();
-                if ui.add(egui::TextEdit::singleline(&mut s).desired_width(360.0)).changed() {
-                    c.playout.countdown_file = PathBuf::from(s);
-                }
-                if ui.add_enabled(!self.countdown_job.running, egui::Button::new("Browse...")).clicked() {
-                    self.countdown_job.start(&self.rt, &self.ctx, async {
-                        rfd::AsyncFileDialog::new()
-                            .add_filter("Video", &["mp4", "mov", "m4v", "mkv"])
-                            .pick_file()
-                            .await
-                            .map(|f| f.path().to_path_buf())
-                    });
-                }
-            });
-            ui.end_row();
-        });
-
-        ui.heading("NDI counter");
-        egui::Grid::new("ndi").show(ui, |ui| {
-            ui.label("Source name");
-            ui.text_edit_singleline(&mut c.ndi.source_name);
-            ui.end_row();
-            ui.label("Numbers colour");
-            egui::color_picker::color_edit_button_srgb(ui, &mut c.ndi.fg);
-            ui.end_row();
-            ui.label("Background colour");
-            egui::color_picker::color_edit_button_srgb(ui, &mut c.ndi.bg);
-            ui.end_row();
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn live_inputs_parse() {
-        assert_eq!(parse_inputs("1, 2,3"), Ok(vec![1, 2, 3]));
-        assert_eq!(parse_inputs(""), Ok(vec![]));
-        assert!(parse_inputs("1, x").is_err());
-    }
-
-    #[test]
-    fn device_changes_need_a_restart_but_timings_do_not() {
-        let a = Config::default();
-        let mut b = a.clone();
-        b.timings.closing_hold = Duration::from_secs(3);
-        b.videohub.input8_output = 7;
-        assert!(device_settings(&a) == device_settings(&b));
-        b.videohub.address = Some("10.0.0.1".into());
-        assert!(device_settings(&a) != device_settings(&b));
-        let mut c = a.clone();
-        c.youtube.stream_id = Some("s".into());
-        assert!(device_settings(&a) != device_settings(&c));
-        let mut d = a.clone();
-        d.playout.countdown_file = PathBuf::from("other.mp4");
-        assert!(device_settings(&a) == device_settings(&d), "the countdown file is read live");
-    }
 
     #[test]
     fn closing_is_risky_only_during_a_service() {

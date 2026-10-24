@@ -101,7 +101,7 @@ fn run_app() -> anyhow::Result<()> {
         .await;
         // The deck holds the front, so it keeps working across a mode switch.
         DeckSurface::run(EngineHandle { tx: front.tx.clone(), rx: front.rx.clone() });
-        (sessions, front)
+        (Arc::new(sessions), front)
     });
 
     let options = eframe::NativeOptions {
@@ -112,12 +112,22 @@ fn run_app() -> anyhow::Result<()> {
         ..Default::default()
     };
     let handle = rt.handle().clone();
+    let window_sessions = sessions.clone();
     let result = eframe::run_native(
         "StreamIt",
         options,
         Box::new(move |cc| {
             let file = ui::ConfigFile { path, writable };
-            Ok(Box::new(ui::StreamItApp::new(&cc.egui_ctx, handle, front, shared, file, config, load_error)))
+            Ok(Box::new(ui::StreamItApp::new(
+                &cc.egui_ctx,
+                handle,
+                window_sessions,
+                front,
+                shared,
+                file,
+                config,
+                load_error,
+            )))
         }),
     );
     info!("window closed; StreamIt stopping");

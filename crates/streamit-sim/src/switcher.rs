@@ -10,6 +10,12 @@ use tokio::time::Instant;
 /// A pretend mix and a pretend route both take this long at 1x.
 pub(crate) const PRETEND_DELAY: Duration = Duration::from_secs(1);
 
+/// The pretend switcher's input number for media player `player` (as on an ATEM: 3010
+/// for player 1).
+pub fn media_player_input(player: u8) -> u16 {
+    3000 + 10 * player as u16
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Which {
     Stream,
@@ -100,7 +106,7 @@ impl StreamSwitcher for SimSwitcher {
     }
 
     fn media_player_input(&self, player: u8) -> u16 {
-        3000 + 10 * player as u16
+        media_player_input(player)
     }
 
     async fn audio_level(&self, src: AudioSourceId) -> Result<f32> {

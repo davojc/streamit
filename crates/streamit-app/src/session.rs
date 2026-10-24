@@ -45,6 +45,8 @@ pub const CHECKING: &str = "Still checking the equipment — try again in a mome
 pub const SIM_FAILED: &str = "The simulation could not start; StreamIt is back in real mode";
 /// Neither mode could be opened: nothing more can be switched.
 pub const BROKEN: &str = "StreamIt could not reopen the equipment: restart StreamIt";
+/// "Crash & restart app" is a simulation control.
+pub const RESTART_REAL: &str = "Crash & restart is only available in simulation";
 /// Longest a switch waits for presses already on their way to reach the engine.
 pub const DRAIN_WAIT: Duration = Duration::from_secs(2);
 /// How long the engine is given to act on the last press it took.
@@ -188,7 +190,10 @@ pub struct Paths {
 
 impl Paths {
     pub fn beside(config: &Path) -> Paths {
-        Paths { levels: streamit_core::config::levels_path(config), sim_levels: config.with_file_name("sim-levels.toml") }
+        Paths {
+            levels: streamit_core::config::levels_path(config),
+            sim_levels: config.with_file_name("sim-levels.toml"),
+        }
     }
 
     pub fn levels_for(&self, mode: Mode) -> &Path {
@@ -209,10 +214,8 @@ pub struct Front {
     pub rx: watch::Receiver<Snapshot>,
     pub mode: watch::Receiver<Mode>,
     /// The pretend world, while simulating.
-    #[allow(dead_code)] // read by the Simulation tab (Task 9)
     pub sim: watch::Receiver<Option<SimControl>>,
     /// Settings the simulation filled with a simulated default (empty in real mode).
-    #[allow(dead_code)] // read by Settings (Task 9)
     pub sim_defaults: watch::Receiver<Vec<&'static str>>,
     /// The current session's YouTube, for the window's broadcast list.
     pub yt: watch::Receiver<Arc<dyn Broadcasts>>,
@@ -241,19 +244,28 @@ struct Outputs {
     switching: watch::Sender<bool>,
 }
 
+/// One mode's device layer, kept for the whole session (an engine restart reuses it).
+struct Kit {
+    devices: Devices,
+    /// The config the engine runs on: the shared real one, or simulation's own copy.
+    config: Arc<RwLock<Config>>,
+    sim: Option<SimControl>,
+    sim_defaults: Vec<&'static str>,
+    device_tasks: Vec<AbortHandle>,
+}
+
 /// One running session.
 struct Session {
     mode: Mode,
+    kit: Kit,
     /// The engine's command sender. Only this, the gate (`Outputs::target`) and the
     /// health poll hold it, so the engine stops once the session is closed.
     tx: mpsc::Sender<Command>,
     span: Span,
     /// The snapshot forwarding, snapshot log and health poll.
     tasks: Vec<JoinHandle<()>>,
-    device_tasks: Vec<AbortHandle>,
     /// The engine's snapshot: closed once the engine and all its tasks have stopped.
     engine: watch::Receiver<Snapshot>,
-    sim: Option<SimControl>,
     /// Where this session's engine saves the mic levels.
     #[cfg_attr(not(test), allow(dead_code))]
     levels_file: PathBuf,
@@ -331,7 +343,6 @@ impl Sessions {
     /// checked again once every press already on its way has reached the engine.
     /// Stops the old session's engine, health poll and device tasks, then builds the new
     /// devices and spawns the new engine. Switching to the current mode does nothing.
-    #[cfg_attr(not(test), allow(dead_code))] // called from Settings › Equipment (Task 7)
     pub async fn switch(&self, to: Mode) -> Result<(), SwitchRefused> {
         let mut current = self.current.lock().await;
         let Some(old) = current.take() else {
@@ -386,6 +397,41 @@ impl Sessions {
         };
         out.switching.send_replace(false);
         result
+    }
+
+    /// "Crash & restart app" (simulation only): the engine stops as if the app had crashed
+    /// (a sequence it was running is aborted part-way) and a new one starts on the same
+    /// pretend devices, as they stand, with the normal read-only startup. Unlike a switch
+    /// it does not wait for an idle moment. The gate discipline is the switch's: the gate
+    /// closes, presses already on their way are let reach the old engine (and die with
+    /// it), the engine is swapped and the gate reopens; presses meanwhile are dropped.
+    pub async fn restart_engine(&self) -> Result<(), SwitchRefused> {
+        let mut current = self.current.lock().await;
+        let Some(old) = current.take() else {
+            return Err(SwitchRefused(BROKEN.into()));
+        };
+        if old.mode != Mode::Simulation || old.kit.sim.is_none() {
+            *current = Some(old);
+            return Err(SwitchRefused(RESTART_REAL.into()));
+        }
+        let out = &self.inner.out;
+        out.target.send_replace(None);
+        if !drained(&out.inflight, &old.tx).await {
+            info!("crash & restart: the engine is still in its startup check; restarting anyway");
+        }
+        out.switching.send_replace(true);
+        let Session { mode, kit, tx, span, tasks, engine, .. } = old;
+        span.in_scope(|| warn!("crash & restart: stopping the engine as if StreamIt had crashed"));
+        stop_engine(out, mode, tx, tasks, engine).await;
+        // The pretend devices are all there from the start, as SimFactory builds them.
+        let probes = Probes::ready(kit.devices.clone());
+        let hub_output = kit.config.read().unwrap_or_else(|e| e.into_inner()).videohub.input8_output;
+        let health = probes.poll(hub_output).instrument(span.clone()).await;
+        let s = Inner::start(&self.inner, mode, span, kit, health, Some(probes)).await;
+        s.span.in_scope(|| info!("crash & restart: the engine started again"));
+        *current = Some(s);
+        out.switching.send_replace(false);
+        Ok(())
     }
 
     /// The levels file the current engine saves to.
@@ -443,6 +489,27 @@ impl Inner {
             Some(effective) => Arc::new(RwLock::new(effective)),
             None => inner.config.clone(),
         };
+        let kit = Kit {
+            devices: built.devices,
+            config,
+            sim: built.sim,
+            sim_defaults: built.sim_defaults,
+            device_tasks: built.tasks,
+        };
+        Inner::start(&inner, mode, span, kit, built.health, built.probes).await
+    }
+
+    /// Starts an engine on `kit` (with its snapshot log and health poll) and points the
+    /// front at it. The engine's startup is the normal read-only check.
+    async fn start(
+        inner: &Inner,
+        mode: Mode,
+        span: Span,
+        kit: Kit,
+        health: Vec<(DeviceKind, DeviceHealth)>,
+        probes: Option<Probes>,
+    ) -> Session {
+        let config = kit.config.clone();
         let levels_file = inner.paths.levels_for(mode).to_path_buf();
         let (engine, tx, mut tasks) = {
             let _in = span.enter();
@@ -454,7 +521,7 @@ impl Inner {
             });
             info!(path = %levels_file.display(), mics = levels.0.len(), "mic levels loaded");
             let engine = Engine::spawn_with(
-                built.devices.clone(),
+                kit.devices.clone(),
                 config.clone(),
                 levels,
                 Some(levels_file.clone()),
@@ -463,20 +530,20 @@ impl Inner {
             let snap_log = spawn_snapshot_log(engine.rx.clone());
             (engine.rx, engine.tx, vec![snap_log])
         };
-        for (kind, health) in &built.health {
-            let _ = tx.send(Command::DeviceHealth(*kind, health.clone())).await;
+        for (kind, h) in &health {
+            let _ = tx.send(Command::DeviceHealth(*kind, h.clone())).await;
         }
-        if let Some(probes) = built.probes {
+        if let Some(probes) = probes {
             let _in = span.enter();
-            tasks.push(wiring::spawn_health_poll(probes, config, tx.clone(), engine.clone(), &built.health));
+            tasks.push(wiring::spawn_health_poll(probes, config, tx.clone(), engine.clone(), &health));
         }
         let out = &inner.out;
         tasks.push(spawn_forward(engine.clone(), out.snap.clone()));
-        out.yt.send_replace(built.devices.yt.clone());
-        out.sim.send_replace(built.sim.clone());
-        out.sim_defaults.send_replace(built.sim_defaults);
+        out.yt.send_replace(kit.devices.yt.clone());
+        out.sim.send_replace(kit.sim.clone());
+        out.sim_defaults.send_replace(kit.sim_defaults.clone());
         out.mode.send_replace(mode);
-        let session = Session { mode, tx, span, tasks, device_tasks: built.tasks, engine, sim: built.sim, levels_file };
+        let session = Session { mode, kit, tx, span, tasks, engine, levels_file };
         // Opening the gate also tells the new engine the Stream Deck's health (the router
         // remembers it; the deck reports only changes).
         out.target.send_replace(Some(session.route()));
@@ -490,32 +557,47 @@ impl Inner {
     /// engine, the poll and the front) is dropped; the pretend player's end timer ends
     /// when the world is reset.
     async fn close(&self, s: Session) {
-        let Session { mode, tx, tasks, device_tasks, engine, sim, .. } = s;
+        let Session { mode, kit, tx, tasks, engine, .. } = s;
         self.out.target.send_replace(None);
-        drop(tx);
         self.out.yt.send_replace(Absent::new("switching mode"));
         self.out.sim.send_replace(None);
-        for t in &tasks {
+        for t in &kit.device_tasks {
             t.abort();
         }
-        for t in tasks {
-            let _ = t.await;
-        }
-        for t in &device_tasks {
-            t.abort();
-        }
-        if let Some(sim) = &sim {
+        if let Some(sim) = &kit.sim {
             sim.reset();
         }
-        let mut engine = engine;
-        let stopped = tokio::time::timeout(STOP_WAIT, async { while engine.changed().await.is_ok() {} }).await;
-        if stopped.is_err() {
-            error!(
-                mode = ?mode,
-                "the old engine has not stopped within {} s: its side tasks keep the old devices until they finish",
-                STOP_WAIT.as_secs()
-            );
-        }
+        drop(kit);
+        stop_engine(&self.out, mode, tx, tasks, engine).await;
+    }
+}
+
+/// Stops an engine (the gate already closed, so no command reaches it): its snapshot
+/// log, forwarding and health poll stop, its command channel closes, and the engine
+/// aborts any sequence it was running. Waits up to `STOP_WAIT` for the engine and its
+/// side tasks to let go of the devices.
+async fn stop_engine(
+    out: &Outputs,
+    mode: Mode,
+    tx: mpsc::Sender<Command>,
+    tasks: Vec<JoinHandle<()>>,
+    mut engine: watch::Receiver<Snapshot>,
+) {
+    out.target.send_replace(None);
+    drop(tx);
+    for t in &tasks {
+        t.abort();
+    }
+    for t in tasks {
+        let _ = t.await;
+    }
+    let stopped = tokio::time::timeout(STOP_WAIT, async { while engine.changed().await.is_ok() {} }).await;
+    if stopped.is_err() {
+        error!(
+            mode = ?mode,
+            "the old engine has not stopped within {} s: its side tasks keep the old devices until they finish",
+            STOP_WAIT.as_secs()
+        );
     }
 }
 
@@ -632,6 +714,7 @@ fn spawn_snapshot_log(mut rx: watch::Receiver<Snapshot>) -> JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::view;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex, Weak};
     use streamit_core::audio::LiveLevels;
@@ -639,7 +722,9 @@ mod tests {
     use streamit_core::devices::StreamSwitcher;
     use streamit_core::fakes::{CallLog, fake_devices};
     use streamit_core::golive::Stage;
+    use streamit_core::recovery::Offer;
     use streamit_sim::{Input8Source, SEED_BROADCAST};
+    use tokio::time::Instant;
 
     const WAIT: Duration = Duration::from_secs(120);
 
@@ -1061,5 +1146,173 @@ mod tests {
         assert_eq!(std::fs::read(&config).unwrap(), saved);
         let real = shared.read().unwrap().videohub.clone();
         assert_eq!((real.input8_output, real.decklink_input, real.fallback_normal_input), (0, 0, 0));
+    }
+
+    /// "Crash & restart app": the engine restarts on the pretend world as it stands (not
+    /// reset), and its normal read-only startup sees the DeckLink on air and offers Recover.
+    #[tokio::test(start_paused = true)]
+    async fn restart_engine_keeps_sim_world_and_reassesses() {
+        let (s, front, ..) = start_with("restart", Arc::new(Spy::default()), Arc::new(SimFactory)).await;
+        s.switch(Mode::Simulation).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await; // past the startup check
+        let snap = front.rx.borrow().clone();
+        assert!(snap.simulation && !snap.offers.contains(&Offer::Recover), "{snap:?}");
+        let sim = front.sim.borrow().clone().unwrap();
+        let decklink = Config::default().stream_atem.decklink_input;
+        sim.set_program(decklink); // the video was on the stream when the app "crashed"
+        s.restart_engine().await.unwrap();
+        assert_eq!(*front.mode.borrow(), Mode::Simulation);
+        assert!(!*front.switching.borrow());
+        let after = front.sim.borrow().clone().expect("the Simulation tab keeps its handle");
+        assert_eq!(after.snapshot().stream_program, decklink, "the pretend world was not reset");
+        let snap = wait_for(&front, "Recover offered", |s| s.simulation && s.offers.contains(&Offer::Recover)).await;
+        assert_eq!((snap.stage, snap.job), (Stage::Idle, None));
+        // The new engine takes presses.
+        front.tx.send(Command::Recover).await.unwrap();
+        wait_for(&front, "Recover to run", |s| s.job == Some("Recover")).await;
+    }
+
+    /// A video running when the app "crashes" is aborted: it never runs its return path.
+    #[tokio::test(start_paused = true)]
+    async fn restart_engine_aborts_the_running_job() {
+        let c = Config {
+            cues: vec![streamit_core::rollin::Cue {
+                path: PathBuf::from("missing.mp4"), // unreadable: plays for 30 s
+                name: "v".into(),
+                destination: streamit_core::rollin::Destination::OnlineOnly,
+                gain_db: 0.0,
+                return_input: None,
+            }],
+            ..Config::default()
+        };
+        let (s, front, ..) = start_cfg("restartjob", Arc::new(Spy::default()), Arc::new(SimFactory), c.clone()).await;
+        s.switch(Mode::Simulation).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        front.tx.send(Command::PlayCue(0)).await.unwrap();
+        wait_for(&front, "the video to play", |s| s.playing == Some(0)).await;
+        let sim = front.sim.borrow().clone().unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await; // the pretend mix to input 8
+        assert_eq!(sim.snapshot().stream_program, c.stream_atem.decklink_input, "the video is on the stream");
+        assert_eq!(front.rx.borrow().job, Some("a video"));
+        s.restart_engine().await.unwrap();
+        let snap = wait_for(&front, "Recover offered", |s| s.offers.contains(&Offer::Recover)).await;
+        assert_eq!((snap.job, snap.playing), (None, None));
+        tokio::time::sleep(Duration::from_secs(60)).await; // past the video's end
+        assert_eq!(
+            sim.snapshot().stream_program,
+            c.stream_atem.decklink_input,
+            "the aborted video never cut back to the camera"
+        );
+        assert_eq!(front.rx.borrow().job, None);
+    }
+
+    /// A press queued at the gate when the restart begins reaches neither engine.
+    #[tokio::test(start_paused = true)]
+    async fn press_at_restart_reaches_no_engine() {
+        let (s, front, ..) = start_with("restartgate", Arc::new(Spy::default()), Arc::new(SimFactory)).await;
+        s.switch(Mode::Simulation).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        // One thread: the router has not run between these two lines.
+        front.tx.send(Command::Prepare).await.unwrap();
+        s.restart_engine().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let snap = front.rx.borrow().clone();
+        assert!(snap.simulation);
+        assert_eq!((snap.stage, snap.job), (Stage::Idle, None), "the press was dropped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_engine_only_in_simulation() {
+        let real = Arc::new(Spy::default());
+        let (s, front, ..) = start_with("restartreal", real.clone(), Arc::new(SimFactory)).await;
+        assert_eq!(s.restart_engine().await, Err(SwitchRefused(RESTART_REAL.into())));
+        assert_eq!(real.builds(), 1);
+        assert_eq!(*front.mode.borrow(), Mode::Real);
+    }
+
+    /// Task 9 step 4, driven as the window and the deck drive it (egui ignores synthetic
+    /// clicks): switch to simulation, Prepare, Countdown at 10×, Live, play a video, End
+    /// service, leave simulation. Every step completes and shows in the activity list.
+    #[tokio::test(start_paused = true)]
+    async fn simulation_rehearsal_end_to_end() {
+        let real = Arc::new(Spy::default());
+        let c = Config {
+            cues: vec![streamit_core::rollin::Cue {
+                path: PathBuf::from("notices.mp4"), // unreadable: plays for 30 s (3 s at 10×)
+                name: "Notices".into(),
+                destination: streamit_core::rollin::Destination::HallAndOnline,
+                gain_db: 0.0,
+                return_input: None,
+            }],
+            ..Config::default()
+        };
+        let (s, front, ..) = start_cfg("rehearsal", real.clone(), Arc::new(SimFactory), c).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let idle = front.rx.borrow().clone();
+        assert_eq!(view::switch_state(&idle, *front.mode.borrow()).label, "Switch to simulation");
+
+        // 1. Switch to simulation.
+        s.switch(Mode::Simulation).await.unwrap();
+        assert_eq!(*front.mode.borrow(), Mode::Simulation);
+        let sim = front.sim.borrow().clone().unwrap();
+        wait_for(&front, "the pretend broadcast", |s| s.simulation && s.broadcast.is_some()).await;
+
+        // 2. Prepare.
+        front.tx.send(Command::Prepare).await.unwrap();
+        wait_for(&front, "Prepare to run", |s| s.job == Some("Prepare")).await;
+        let prepared = wait_for(&front, "Prepared", |s| matches!(s.stage, Stage::Prepared(_)) && s.job.is_none()).await;
+        assert!(!view::switch_state(&prepared, Mode::Simulation).enabled, "no leaving mid-service");
+        assert_eq!(s.switch(Mode::Real).await, refused());
+
+        // 3. Countdown at 10×.
+        sim.set_speed(Speed::X10);
+        front.tx.send(Command::Countdown).await.unwrap();
+        wait_for(&front, "the countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        let counting = Instant::now();
+
+        // 4. Live: the 30 s countdown video ends after 3 s at 10×.
+        wait_for(&front, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        assert!(counting.elapsed() < Duration::from_secs(10), "the countdown ran at 10×: {:?}", counting.elapsed());
+        wait_for(&front, "public", |s| s.activity.iter().any(|a| a.text.starts_with("YouTube public"))).await;
+        let v = sim.snapshot();
+        assert_eq!(v.yt_life_cycle.as_deref(), Some("live"));
+        assert!(view::went_public_text(v.last_go_public, v.speed).ends_with("at 10×"));
+
+        // 5. Play a video.
+        front.tx.send(Command::PlayCue(0)).await.unwrap();
+        wait_for(&front, "the video to play", |s| s.playing == Some(0)).await;
+        wait_for(&front, "the video to end", |s| s.playing.is_none() && s.job.is_none()).await;
+
+        // 6. End service.
+        front.tx.send(Command::EndService).await.unwrap();
+        let ended = wait_for(&front, "Ended", |s| s.stage == Stage::Ended && s.job.is_none()).await;
+        let texts: Vec<&str> = ended.activity.iter().rev().map(|a| a.text.as_str()).collect();
+        for want in [
+            "Ready for the countdown",
+            "Countdown started (0:30)",
+            "Video 1 · Notices · started",
+            "Video 1 · Notices · ended",
+            "Ending the service",
+            "Service ended",
+        ] {
+            assert!(texts.contains(&want), "{want:?} missing from the activity list: {texts:#?}");
+        }
+        assert!(texts.iter().any(|t| t.starts_with("YouTube public")), "{texts:#?}");
+        let at = |want: &str| texts.iter().position(|t| *t == want).unwrap();
+        assert!(at("Ready for the countdown") < at("Countdown started (0:30)"));
+        assert!(at("Countdown started (0:30)") < at("Video 1 · Notices · started"));
+        assert!(at("Video 1 · Notices · ended") < at("Ending the service"));
+        assert!(at("Ending the service") < at("Service ended"));
+
+        // 7. Leave simulation: the normal read-only startup on the real equipment.
+        assert_eq!(view::switch_state(&ended, Mode::Simulation).label, "Leave simulation");
+        assert!(view::switch_state(&ended, Mode::Simulation).enabled);
+        s.switch(Mode::Real).await.unwrap();
+        assert_eq!(*front.mode.borrow(), Mode::Real);
+        assert!(front.sim.borrow().is_none());
+        let snap = wait_for(&front, "a real snapshot", |s| !s.simulation).await;
+        assert_eq!(snap.stage, Stage::Idle);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(real.calls(), vec![], "nothing in the rehearsal touched the real equipment");
     }
 }

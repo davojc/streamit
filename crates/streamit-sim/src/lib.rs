@@ -14,7 +14,7 @@ pub mod youtube;
 pub use clip::clip_length;
 pub use clock::{SimClock, Speed};
 pub use others::{SimCounter, SimEncoder, SimPlayer};
-pub use switcher::{SimRouter, SimSwitcher, Which};
+pub use switcher::{SimRouter, SimSwitcher, Which, media_player_input};
 pub use youtube::SimBroadcasts;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
