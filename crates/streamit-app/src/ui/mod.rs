@@ -200,6 +200,9 @@ pub struct StreamItApp {
     discovered: Vec<DiscoveredDevice>,
     scan_job: Pending<Vec<DiscoveredDevice>>,
     add_ip: String,
+    /// The cue list and cue typed in the Lighting panel's "Fire cue" row.
+    light_list: u32,
+    light_cue: String,
     add_kind: Option<BmdKind>,
     live_inputs_text: String,
     signin_job: Pending<Result<(), String>>,
@@ -285,6 +288,8 @@ impl StreamItApp {
             discovered: Vec::new(),
             scan_job: Pending::default(),
             add_ip: String::new(),
+            light_list: 1,
+            light_cue: String::new(),
             add_kind: None,
             signin_job: Pending::default(),
             signin_status: String::new(),

@@ -67,8 +67,9 @@ pub struct CountdownView {
     pub show_retry_public: bool,
 }
 
-/// Every device, in the order the screens list them.
-pub const ALL_KINDS: [DeviceKind; 8] = [
+/// Every device, in the order the screens list them. The lighting console shows only once
+/// one is set up (see `shown_kinds`).
+pub const ALL_KINDS: [DeviceKind; 9] = [
     DeviceKind::StreamAtem,
     DeviceKind::ScreensAtem,
     DeviceKind::VideoHub,
@@ -77,7 +78,14 @@ pub const ALL_KINDS: [DeviceKind; 8] = [
     DeviceKind::DeckLink,
     DeviceKind::Ndi,
     DeviceKind::StreamDeck,
+    DeviceKind::Lighting,
 ];
+
+/// The devices to list: all of them, but the lighting console only when it is set up (its
+/// health is then reported).
+pub fn shown_kinds(s: &Snapshot) -> Vec<DeviceKind> {
+    ALL_KINDS.into_iter().filter(|k| *k != DeviceKind::Lighting || s.device_status.contains_key(k)).collect()
+}
 
 pub fn kind_name(k: DeviceKind) -> &'static str {
     match k {
@@ -89,6 +97,7 @@ pub fn kind_name(k: DeviceKind) -> &'static str {
         DeviceKind::DeckLink => "DeckLink",
         DeviceKind::Ndi => "NDI counter",
         DeviceKind::StreamDeck => "Stream Deck",
+        DeviceKind::Lighting => "Lighting",
     }
 }
 
@@ -126,9 +135,9 @@ pub fn header(s: &Snapshot, _c: &Config) -> HeaderView {
         .map(|t| fmt_hhmmss(SystemTime::now().duration_since(t).unwrap_or_default()));
     let broadcast = s.broadcast.as_ref().map(|b| b.title.clone()).unwrap_or_else(|| "No broadcast selected".into());
     // The worst problem first (red before amber, then list order), and how many more.
-    let problems: Vec<(DeviceKind, Tone, String)> = ALL_KINDS
-        .iter()
-        .filter_map(|&k| match device_state(s, k) {
+    let problems: Vec<(DeviceKind, Tone, String)> = shown_kinds(s)
+        .into_iter()
+        .filter_map(|k| match device_state(s, k) {
             (tone, Some(why)) => Some((k, tone, why)),
             _ => None,
         })

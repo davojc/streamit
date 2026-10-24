@@ -181,6 +181,24 @@ pub trait Counter: Send + Sync {
     async fn clear(&self) -> Result<()>;
 }
 
+/// What a lighting console reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LightingStatus {
+    /// The show file open on the console.
+    pub show: Option<String>,
+    /// The active cue as the console describes it (e.g. "1/5 Sermon 3.0 100%").
+    pub active_cue: Option<String>,
+}
+
+/// A lighting console (ETC Eos family over OSC).
+#[async_trait]
+pub trait Lighting: Send + Sync {
+    /// Fires cue `cue` (e.g. "5" or "5.5") in cue list `list`.
+    async fn fire_cue(&self, list: u32, cue: &str) -> Result<()>;
+    /// `Ok` while the console answers; the show and active cue when it has said them.
+    async fn status(&self) -> Result<LightingStatus>;
+}
+
 #[derive(Clone)]
 pub struct Devices {
     pub stream: Arc<dyn StreamSwitcher>,
@@ -190,4 +208,5 @@ pub struct Devices {
     pub yt: Arc<dyn Broadcasts>,
     pub player: Arc<dyn Player>,
     pub counter: Arc<dyn Counter>,
+    pub lights: Arc<dyn Lighting>,
 }

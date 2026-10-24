@@ -219,7 +219,7 @@ fn equipment(ui: &mut Ui, snap: &Snapshot) {
         theme::lbl(ui, "Equipment");
         ui.add_space(4.0);
         ui.columns(2, |cols| {
-            for (n, k) in view::ALL_KINDS.iter().enumerate() {
+            for (n, k) in view::shown_kinds(snap).iter().enumerate() {
                 let ui = &mut cols[n % 2];
                 let (tone, why) = view::device_state(snap, *k);
                 ui.horizontal(|ui| {

@@ -165,6 +165,34 @@ impl SimCounter {
     }
 }
 
+/// A pretend ETC Eos console: firing a cue makes it the active one at once.
+#[derive(Clone)]
+pub struct SimLighting {
+    sim: SimHandle,
+}
+
+impl SimLighting {
+    pub fn new(sim: SimHandle) -> Self {
+        Self { sim }
+    }
+}
+
+#[async_trait]
+impl Lighting for SimLighting {
+    async fn fire_cue(&self, list: u32, cue: &str) -> Result<()> {
+        let mut w = self.sim.lock();
+        w.check_plugged(DeviceKind::Lighting)?;
+        w.lighting_cue = Some(format!("{list}/{}", cue.trim()));
+        Ok(())
+    }
+
+    async fn status(&self) -> Result<LightingStatus> {
+        let w = self.sim.lock();
+        w.check_plugged(DeviceKind::Lighting)?;
+        Ok(LightingStatus { show: Some("Pretend show".into()), active_cue: w.lighting_cue.clone() })
+    }
+}
+
 #[async_trait]
 impl Counter for SimCounter {
     async fn show(&self, remaining: Duration) -> Result<()> {

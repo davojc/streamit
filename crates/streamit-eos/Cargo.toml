@@ -1,0 +1,13 @@
+[package]
+name = "streamit-eos"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+streamit-core = { path = "../streamit-core" }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros", "rt"] }

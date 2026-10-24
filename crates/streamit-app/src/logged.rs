@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use streamit_core::config::AudioSourceId;
 use streamit_core::devices::{
-    BroadcastCheck, BroadcastSummary, Broadcasts, Counter, Encoder, EncoderStatus, Fix, Health, LabelKind, Phase,
-    Player, PlayerEvent, Result, Router, StreamSwitcher, Switcher,
+    BroadcastCheck, BroadcastSummary, Broadcasts, Counter, Encoder, EncoderStatus, Fix, Health, LabelKind, Lighting,
+    LightingStatus, Phase, Player, PlayerEvent, Result, Router, StreamSwitcher, Switcher,
 };
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -201,6 +201,16 @@ impl<T: Counter + ?Sized> Counter for Logged<T> {
     }
     async fn clear(&self) -> Result<()> {
         done(self.device, "clear()".into(), self.inner.clear().await)
+    }
+}
+
+#[async_trait]
+impl<T: Lighting + ?Sized> Lighting for Logged<T> {
+    async fn fire_cue(&self, list: u32, cue: &str) -> Result<()> {
+        done(self.device, format!("fire_cue({list}/{cue})"), self.inner.fire_cue(list, cue).await)
+    }
+    async fn status(&self) -> Result<LightingStatus> {
+        self.inner.status().await
     }
 }
 

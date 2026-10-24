@@ -12,10 +12,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
-use streamit_core::config::{AudioSourceId, Config};
+use streamit_core::config::{AudioSourceId, Config, OscFraming};
 use streamit_core::devices::{
     self, BroadcastCheck, BroadcastSummary, Broadcasts, Counter, DeviceError, Devices, Encoder, EncoderStatus, Fix,
-    Health, Phase, Player, PlayerEvent, Router, StreamSwitcher, Switcher,
+    Health, Lighting, LightingStatus, Phase, Player, PlayerEvent, Router, StreamSwitcher, Switcher,
 };
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
 use streamit_core::golive::Stage;
@@ -208,6 +208,16 @@ impl Player for Absent {
 }
 
 #[async_trait]
+impl Lighting for Absent {
+    async fn fire_cue(&self, _: u32, _: &str) -> devices::Result<()> {
+        self.err()
+    }
+    async fn status(&self) -> devices::Result<LightingStatus> {
+        self.err()
+    }
+}
+
+#[async_trait]
 impl Counter for Absent {
     async fn show(&self, _: Duration) -> devices::Result<()> {
         self.err()
@@ -375,6 +385,8 @@ pub struct Probes {
     devices: Devices,
     player: Arc<Late<dyn Player>>,
     counter: Arc<Late<dyn Counter>>,
+    /// A lighting console is set up, so its health is polled.
+    lighting: bool,
 }
 
 pub struct Wired {
@@ -397,6 +409,7 @@ pub fn logged(d: Devices) -> Devices {
         yt: Logged::wrap("YouTube", d.yt),
         player: Logged::wrap("DeckLink", d.player),
         counter: Logged::wrap("NDI", d.counter),
+        lights: Logged::wrap("Lighting", d.lights),
     }
 }
 
@@ -440,6 +453,18 @@ pub async fn build(c: &Config) -> Wired {
         Ok(y) => y,
         Err(why) => stand_in(DeviceKind::YouTube, "YouTube", why),
     };
+    // The lighting console is optional: without an address there is nothing to poll.
+    let lights: Arc<dyn Lighting> = match (c.lighting.is_set(), socket_addr(&c.lighting.address, streamit_eos::PORT)) {
+        (true, Ok(a)) => {
+            let framing = match c.lighting.framing {
+                OscFraming::Slip => streamit_eos::Framing::Slip,
+                OscFraming::Length => streamit_eos::Framing::Length,
+            };
+            streamit_eos::EosClient::connect(a, framing)
+        }
+        (true, Err(e)) => absent("Lighting console", e),
+        (false, _) => Absent::new("no lighting console set up (Settings › Equipment)"),
+    };
     let (player, counter, tasks) = playout(c).await;
     let devices = logged(Devices {
         stream,
@@ -449,8 +474,9 @@ pub async fn build(c: &Config) -> Wired {
         yt,
         player: player.clone() as Arc<dyn Player>,
         counter: counter.clone() as Arc<dyn Counter>,
+        lights,
     });
-    let probes = Probes { devices: devices.clone(), player, counter };
+    let probes = Probes { devices: devices.clone(), player, counter, lighting: c.lighting.is_set() };
     // Stand-ins never come up, so only wait for the devices that were really built.
     let real: Vec<DeviceKind> = NETWORK.iter().copied().filter(|k| !stand_ins.contains(k)).collect();
     probes.wait_ready(&real, c.videohub.input8_output, STARTUP_WAIT).await;
@@ -520,12 +546,13 @@ impl Probes {
         let (player, counter) = (Late::new(""), Late::new(""));
         player.install(devices.player.clone());
         counter.install(devices.counter.clone());
-        Probes { devices, player, counter }
+        // The pretend console is always there.
+        Probes { devices, player, counter, lighting: true }
     }
 
     #[cfg(test)]
     fn new(devices: Devices, player: Arc<Late<dyn Player>>, counter: Arc<Late<dyn Counter>>) -> Probes {
-        Probes { devices, player, counter }
+        Probes { devices, player, counter, lighting: false }
     }
 
     /// One read for one device: program() for the ATEMs, route_of(input-8 output, or 1)
@@ -546,6 +573,7 @@ impl Probes {
             DeviceKind::DeckLink => self.player.health(),
             DeviceKind::Ndi => self.counter.health(),
             DeviceKind::StreamDeck => DeviceHealth::Ok, // reported by the deck itself
+            DeviceKind::Lighting => probe(d.lights.status()).await,
         }
     }
 
@@ -606,7 +634,7 @@ impl Probes {
             self.check(DeviceKind::WebPresenter, hub_output),
             self.check(DeviceKind::YouTube, hub_output),
         );
-        vec![
+        let mut out = vec![
             (DeviceKind::StreamAtem, stream),
             (DeviceKind::ScreensAtem, screens),
             (DeviceKind::VideoHub, hub),
@@ -614,7 +642,20 @@ impl Probes {
             (DeviceKind::YouTube, yt),
             (DeviceKind::DeckLink, self.player.health()),
             (DeviceKind::Ndi, self.counter.health()),
-        ]
+        ];
+        if self.lighting {
+            out.push((DeviceKind::Lighting, self.check(DeviceKind::Lighting, hub_output).await));
+        }
+        out
+    }
+
+    /// What the lighting console says now (show, active cue), or `None` when it is not set
+    /// up or not answering.
+    pub async fn read_lighting(&self) -> Option<LightingStatus> {
+        if !self.lighting {
+            return None;
+        }
+        self.devices.lights.status().await.ok()
     }
 }
 
@@ -646,7 +687,15 @@ pub fn spawn_health_poll(
     tokio::spawn(
         async move {
             let mut last_routing = None;
+            let mut last_lighting = None;
             loop {
+                let lighting = probes.read_lighting().await;
+                if last_lighting.as_ref() != Some(&lighting) {
+                    if tx.send(Command::LightingRead(lighting.clone())).await.is_err() {
+                        return;
+                    }
+                    last_lighting = Some(lighting);
+                }
                 // What the VideoHub feeds and the ATEMs show, sent when it changes.
                 let c = config.read().unwrap_or_else(|e| e.into_inner()).clone();
                 let routing = probes.read_routing(&c).await;

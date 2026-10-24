@@ -17,8 +17,8 @@ use eframe::egui::{self, Align, Color32, Layout, Margin, RichText, Shape, Stroke
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
-use streamit_core::config::{AudioSourceId, Config};
-use streamit_core::engine::{DeviceKind, Snapshot};
+use streamit_core::config::{AudioSourceId, Config, OscFraming};
+use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
 use streamit_core::routing::Target;
 use streamit_youtube::{API_BASE, Auth, StreamSummary, YouTubeClient};
 use tracing::{info, warn};
@@ -117,6 +117,7 @@ pub(super) fn device_settings(c: &Config) -> impl PartialEq + use<> {
         // The countdown file is read when the countdown starts, so it is not listed.
         (c.playout.decklink_device, c.playout.video_mode.clone()),
         c.ndi.clone(),
+        c.lighting.clone(),
     )
 }
 
@@ -417,6 +418,8 @@ impl StreamItApp {
             field(&mut c[2], "Router", |ui| opt_text(ui, &mut d.videohub.address, "not set"));
             field(&mut c[3], "Stream encoder", |ui| opt_text(ui, &mut d.web_presenter.address, "not set"));
         });
+        ui.add_space(14.0);
+        self.lighting_card(ui, snap, simulating);
         // While simulating, the note at the top of Settings says this (and more).
         if !simulating {
             ui.add_space(14.0);
@@ -431,6 +434,72 @@ impl StreamItApp {
         }
         ui.add_space(16.0);
         self.simulation_card(ui, snap);
+    }
+
+    /// The lighting console (ETC Eos, OSC over TCP 3032): its address and framing, whether it
+    /// answers, its active cue, and a row to fire a cue by hand.
+    fn lighting_card(&mut self, ui: &mut Ui, snap: &Snapshot, simulating: bool) {
+        theme::lbl(ui, "Lighting console (ETC Eos)");
+        sub(
+            ui,
+            "Optional. StreamIt talks OSC over TCP (port 3032). On the console, turn on OSC TCP and set \
+             its \"TCP Format for OSC\" to match the one here. Applies when StreamIt restarts.",
+        );
+        ui.columns(4, |c| {
+            let d = &mut self.draft.lighting;
+            field(&mut c[0], "Console address", |ui| opt_text(ui, &mut d.address, "not set"));
+            field(&mut c[1], "TCP format for OSC", |ui| {
+                let shown = match d.framing {
+                    OscFraming::Slip => "OSC 1.1 (SLIP)",
+                    OscFraming::Length => "OSC 1.0 (packet length)",
+                };
+                egui::ComboBox::from_id_salt("osc-framing").selected_text(shown).width(ui.available_width()).show_ui(
+                    ui,
+                    |ui| {
+                        ui.selectable_value(&mut d.framing, OscFraming::Slip, "OSC 1.1 (SLIP)");
+                        ui.selectable_value(&mut d.framing, OscFraming::Length, "OSC 1.0 (packet length)");
+                    },
+                );
+            });
+        });
+        // What the console in use says, and a cue to try. In simulation this is the pretend console.
+        let health = snap.device_status.get(&DeviceKind::Lighting);
+        let (tone, line) = match (health, &snap.lighting) {
+            (None, _) => (Tone::Grey, "No console set up.".to_string()),
+            (Some(DeviceHealth::Ok), Some(st)) => (
+                Tone::Green,
+                format!(
+                    "Connected{}. Active cue: {}",
+                    st.show.as_deref().map(|s| format!(" · show {s}")).unwrap_or_default(),
+                    st.active_cue.as_deref().unwrap_or("none")
+                ),
+            ),
+            (Some(DeviceHealth::Ok), None) => (Tone::Green, "Connected.".to_string()),
+            (Some(DeviceHealth::Warning(w)), _) => (Tone::Amber, w.clone()),
+            (Some(DeviceHealth::Down(e)), _) => (Tone::Red, e.clone()),
+        };
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            theme::dot(ui, theme::tone_color(tone));
+            ui.label(RichText::new(line).color(theme::SOFT));
+        });
+        let ready = health == Some(&DeviceHealth::Ok);
+        ui.horizontal(|ui| {
+            ui.label("Fire cue");
+            ui.add(egui::DragValue::new(&mut self.light_list).range(1..=999).prefix("List "));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.light_cue).hint_text("Cue, e.g. 5 or 5.5").desired_width(190.0),
+            );
+            let can = ready && !self.light_cue.trim().is_empty();
+            let b = theme::button_enabled(ui, can, "Fire", Kind::Plain);
+            let b = if !ready { b.on_disabled_hover_text("The console is not connected") } else { b };
+            if b.clicked() {
+                self.send(Command::FireLightingCue { list: self.light_list, cue: self.light_cue.trim().to_string() });
+            }
+            if simulating {
+                amber_note(ui, "(the pretend console)");
+            }
+        });
     }
 
     fn add_by_ip(&mut self, ui: &mut Ui) {

@@ -146,6 +146,8 @@ pub struct SimWorld {
     pub player_events: broadcast::Sender<PlayerEvent>,
     /// The last remaining time the core showed on the NDI counter; `None` when cleared.
     pub counter: Option<Duration>,
+    /// The pretend lighting console's active cue ("list/cue").
+    pub lighting_cue: Option<String>,
     pub faults: HashSet<Fault>,
 }
 
@@ -190,6 +192,7 @@ impl SimWorld {
             player_gen: 0,
             player_events: broadcast::channel(16).0,
             counter: None,
+            lighting_cue: None,
             faults: HashSet::new(),
         }
     }
@@ -336,6 +339,10 @@ impl SimHandle {
     pub fn counter(&self) -> SimCounter {
         SimCounter::new(self.clone())
     }
+
+    pub fn lighting(&self) -> others::SimLighting {
+        others::SimLighting::new(self.clone())
+    }
 }
 
 /// All seven pretend devices, sharing one world and one clock.
@@ -348,6 +355,7 @@ pub fn build_devices(sim: &SimHandle) -> Devices {
         yt: Arc::new(sim.broadcasts()),
         player: Arc::new(sim.player()),
         counter: Arc::new(sim.counter()),
+        lights: Arc::new(sim.lighting()),
     }
 }
 

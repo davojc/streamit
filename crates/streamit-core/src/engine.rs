@@ -18,7 +18,9 @@
 //! Broadcast, Fix, Refresh and device health. Every ignored command is logged at `info`.
 use crate::audio::LiveLevels;
 use crate::config::Config;
-use crate::devices::{self, BroadcastCheck, BroadcastSummary, DeviceError, Devices, Fix, LabelKind, Phase};
+use crate::devices::{
+    self, BroadcastCheck, BroadcastSummary, DeviceError, Devices, Fix, LabelKind, LightingStatus, Phase,
+};
 use crate::end::{EndOutcome, end_service};
 use crate::golive::{self, CountdownOutcome, CountdownReport, Readiness, Stage, Stage0Report, T0Error};
 use crate::recovery::{self, Assessment, Offer};
@@ -85,6 +87,13 @@ pub enum Command {
     },
     /// What the VideoHub and the ATEMs report for routing, from the health poll.
     RoutingRead(Box<RoutingRead>),
+    /// Fire cue `cue` in cue list `list` on the lighting console.
+    FireLightingCue {
+        list: u32,
+        cue: String,
+    },
+    /// What the lighting console says now, from the health poll (`None`: not answering).
+    LightingRead(Option<LightingStatus>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -97,6 +106,8 @@ pub enum DeviceKind {
     DeckLink,
     Ndi,
     StreamDeck,
+    /// The lighting console (ETC Eos), when one is set up.
+    Lighting,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +145,8 @@ pub struct Snapshot {
     /// The engine drives pretend devices: nothing is live.
     pub simulation: bool,
     pub routing: RoutingState,
+    /// The lighting console's show and active cue, while it answers.
+    pub lighting: Option<LightingStatus>,
 }
 
 /// How far the playing roll-in is.
@@ -173,6 +186,7 @@ impl Default for Snapshot {
             activity: Vec::new(),
             simulation: false,
             routing: RoutingState::default(),
+            lighting: None,
         }
     }
 }
@@ -696,6 +710,27 @@ impl Engine {
                     }
                     .in_current_span(),
                 );
+            }
+            Command::FireLightingCue { list, cue } => {
+                let (list, cue) = (*list, cue.trim().to_string());
+                if list == 0 || cue.is_empty() {
+                    return self.ignore(&cmd, "a cue needs a list (from 1) and a number");
+                }
+                info!(list, cue = %cue, "firing a lighting cue");
+                let (lights, snap) = (self.d.lights.clone(), self.snap.clone());
+                tokio::spawn(
+                    async move {
+                        match lights.fire_cue(list, &cue).await {
+                            Ok(()) => snap.send_modify(|s| log(s, format!("Lighting · cue {list}/{cue} fired"))),
+                            Err(e) => set_warning(&snap, format!("Lighting: could not fire cue {list}/{cue}: {e}")),
+                        }
+                    }
+                    .in_current_span(),
+                );
+            }
+            Command::LightingRead(status) => {
+                let status = status.clone();
+                self.set(|s| s.lighting = status);
             }
             Command::RoutingRead(read) => {
                 let RoutingRead { labels, output_labels, targets } = (**read).clone();
@@ -3163,5 +3198,35 @@ mod tests {
         let s = until(&mut e, "a warning", |s| s.last_warning.as_deref().is_some_and(|w| w.contains("rename"))).await;
         assert!(s.last_warning.unwrap().contains("output 37"));
         assert_eq!(s.routing.own_output_label(37), None);
+    }
+
+    // ---- lighting
+
+    #[tokio::test(start_paused = true)]
+    async fn firing_a_lighting_cue_logs_it_and_a_refusal_warns() {
+        let (d, log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::FireLightingCue { list: 1, cue: " 5.5 ".into() }).await;
+        until_call(&log, Call::LightsFireCue(1, "5.5".into())).await;
+        until(&mut e, "the activity line", |s| s.activity.iter().any(|a| a.text == "Lighting · cue 1/5.5 fired")).await;
+        h.lights.fail_next("fire_cue");
+        send(&e, Command::FireLightingCue { list: 2, cue: "9".into() }).await;
+        until(&mut e, "a warning", |s| s.last_warning.as_deref().is_some_and(|w| w.contains("cue 2/9"))).await;
+        // Nothing to fire: ignored, the console is not called.
+        send(&e, Command::FireLightingCue { list: 0, cue: "1".into() }).await;
+        send(&e, Command::Refresh).await;
+        sleep(MS(200)).await;
+        assert!(!log.calls().contains(&Call::LightsFireCue(0, "1".into())));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_lighting_status_follows_the_poll() {
+        let (d, _log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        let st = LightingStatus { show: Some("Sunday".into()), active_cue: Some("1/5".into()) };
+        send(&e, Command::LightingRead(Some(st.clone()))).await;
+        until(&mut e, "the status", |s| s.lighting == Some(st.clone())).await;
+        send(&e, Command::LightingRead(None)).await;
+        until(&mut e, "no status", |s| s.lighting.is_none()).await;
     }
 }

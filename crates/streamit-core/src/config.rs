@@ -167,6 +167,32 @@ impl Default for NdiConfig {
     }
 }
 
+/// How OSC packets are framed on TCP: the lighting console's "TCP Format for OSC".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OscFraming {
+    /// OSC 1.1 (SLIP).
+    #[default]
+    Slip,
+    /// OSC 1.0 (packet length headers).
+    Length,
+}
+
+/// The lighting console (ETC Eos family, OSC over TCP port 3032). Optional.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LightingConfig {
+    pub address: Option<String>,
+    pub framing: OscFraming,
+}
+
+impl LightingConfig {
+    /// A console is set up.
+    pub fn is_set(&self) -> bool {
+        self.address.as_deref().is_some_and(|a| !a.trim().is_empty())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -178,6 +204,7 @@ pub struct Config {
     pub timings: Timings,
     pub playout: PlayoutConfig,
     pub ndi: NdiConfig,
+    pub lighting: LightingConfig,
     /// Routing: what feeds the MultiView 4's views and the ATEMs' inputs, and the presets.
     pub multiview: RoutingConfig,
     pub stream_routing: RoutingConfig,

@@ -4282,6 +4282,7 @@ dependencies = [
  "streamit-atem",
  "streamit-core",
  "streamit-deck",
+ "streamit-eos",
  "streamit-playout",
  "streamit-sim",
  "streamit-videohub",
@@ -4340,6 +4341,16 @@ dependencies = [
  "anyhow",
  "elgato-streamdeck",
  "image",
+ "streamit-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "streamit-eos"
+version = "0.1.6"
+dependencies = [
+ "async-trait",
  "streamit-core",
  "tokio",
  "tracing",
