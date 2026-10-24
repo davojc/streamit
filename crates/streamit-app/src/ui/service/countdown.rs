@@ -56,7 +56,7 @@ impl StreamItApp {
                             status_line(
                                 ui,
                                 Tone::Grey,
-                                &format!("Mics fade up, hall goes to input {}", c.screens_atem.t0_input),
+                                &format!("Stream audio fades up, hall goes to input {}", c.screens_atem.t0_input),
                             );
                             status_line(ui, if v.ndi_ok { Tone::Green } else { Tone::Grey }, &v.ndi_text);
                         });
@@ -69,7 +69,7 @@ impl StreamItApp {
                             "Online sees",
                             "Stream starting soon…",
                             true,
-                            &format!("{privacy} · mics silent · ready on preview"),
+                            &format!("{privacy} · stream audio silent · ready on preview"),
                         );
                         preview(
                             &mut cols[1],

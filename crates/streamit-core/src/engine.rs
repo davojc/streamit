@@ -1376,7 +1376,7 @@ impl Engine {
     }
 }
 
-/// I1: T-0 went live but could not bring the mics up. Show them as down and offer
+/// I1: T-0 went live but could not bring the stream audio up. Show them as down and offer
 /// Recover, the one-press way back.
 fn mics_left_down(s: &mut Snapshot) {
     s.mics_ducked = true;
@@ -1489,8 +1489,8 @@ fn store_levels(levels: &Mutex<LiveLevels>, l: LiveLevels, file: Option<&PathBuf
     };
     if changed && let Some(path) = file {
         match l.save(path) {
-            Ok(()) => info!(path = %path.display(), "mic levels saved"),
-            Err(e) => warn!(error = %format!("{e:#}"), "could not save the mic levels"),
+            Ok(()) => info!(path = %path.display(), "stream audio levels saved"),
+            Err(e) => warn!(error = %format!("{e:#}"), "could not save the stream audio levels"),
         }
     }
 }
@@ -1945,7 +1945,7 @@ mod tests {
         // Presses while Go Live is in flight.
         send(&e, Command::GoLive).await;
         send(&e, Command::StopCountdown).await;
-        sleep(MS(50)).await; // the countdown has returned; t0 is still fading the mics up
+        sleep(MS(50)).await; // the countdown has returned; t0 is still fading the stream audio up
         send(&e, Command::Prepare).await;
         until(&mut e, "Live", |s| s.stage == Stage::Live).await;
         // Presses once live.
@@ -2074,7 +2074,7 @@ mod tests {
         h.stream.fail_next("set_audio_level");
         send(&e, Command::UnmuteMics).await;
         sleep(MS(1500)).await;
-        assert!(snap(&e).mics_ducked, "the fade up failed, so the mics are still down");
+        assert!(snap(&e).mics_ducked, "the fade up failed, so the stream audio is still down");
         // A second press works.
         send(&e, Command::UnmuteMics).await;
         until(&mut e, "unducked", |s| !s.mics_ducked).await;
@@ -2415,11 +2415,11 @@ mod tests {
         h.stream.set_audio_level_state(MIC, crate::audio::FLOOR_DB);
         let mut e = Engine::spawn(d, cfg(vec![]));
         let s = until(&mut e, "Live, Recover", |s| s.stage == Stage::Live && s.offers.contains(&Offer::Recover)).await;
-        assert!(s.mics_ducked, "the mics are down: {s:?}");
+        assert!(s.mics_ducked, "the stream audio is down: {s:?}");
         // Mics up again (put right by hand) and a Refresh: no longer shown down.
         h.stream.set_audio_level_state(MIC, -3.0);
         send(&e, Command::Refresh).await;
-        let s = until(&mut e, "mics up", |s| !s.mics_ducked).await;
+        let s = until(&mut e, "stream audio up", |s| !s.mics_ducked).await;
         assert!(!s.offers.contains(&Offer::Recover), "{:?}", s.offers);
     }
 
@@ -2434,7 +2434,7 @@ mod tests {
         h.stream.fail_next("set_audio_level");
         send(&e, Command::GoLive).await;
         let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
-        assert!(s.mics_ducked, "the mics did not come up");
+        assert!(s.mics_ducked, "the stream audio did not come up");
         assert!(s.offers.contains(&Offer::Recover), "{:?}", s.offers);
 
         // The countdown's own T-0.
@@ -2445,7 +2445,7 @@ mod tests {
         h.stream.fail_next("set_audio_level");
         h.player.emit(PlayerEvent::Ended);
         let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
-        assert!(s.mics_ducked, "the mics did not come up");
+        assert!(s.mics_ducked, "the stream audio did not come up");
         assert!(s.offers.contains(&Offer::Recover), "{:?}", s.offers);
     }
 
@@ -2807,7 +2807,7 @@ mod tests {
         let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
         assert!(s.on_air_since.is_some_and(|t| t >= before), "{:?}", s.on_air_since);
         let t0 = cfg(vec![]).read().unwrap().screens_atem.t0_input;
-        let live = format!("Live · Cam 1 on air · mics up · hall → input {t0}");
+        let live = format!("Live · Cam 1 on air · stream audio up · hall → input {t0}");
         assert!(has(&s, &live), "{:?}", texts(&s));
         send(&e, Command::EndService).await;
         let s = until(&mut e, "Ended", |s| s.stage == Stage::Ended).await;
@@ -2826,8 +2826,8 @@ mod tests {
         // Newest first: the warning came first, then the steps in order.
         assert!(at("Ready for the countdown") < at("YouTube receiving · private"), "{t:?}");
         assert!(at("YouTube receiving · private") < at("Web Presenter streaming"), "{t:?}");
-        assert!(at("Web Presenter streaming") < at("Opening still on air · mics silent"), "{t:?}");
-        assert!(at("Opening still on air · mics silent") < at(NO_BROADCAST), "{t:?}");
+        assert!(at("Web Presenter streaming") < at("Opening still on air · stream audio silent"), "{t:?}");
+        assert!(at("Opening still on air · stream audio silent") < at(NO_BROADCAST), "{t:?}");
         assert!(s.activity.windows(2).all(|w| w[0].at >= w[1].at));
 
         // Every warning is recorded; the list keeps the newest 50.

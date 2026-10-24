@@ -724,8 +724,8 @@ impl StreamItApp {
             field(&mut col[2], "Router settle time", |ui| seconds(ui, &mut c.videohub.settle));
         });
         ui.columns(3, |col| {
-            field(&mut col[0], "Mic fade", |ui| seconds(ui, &mut c.stream_atem.fade));
-            field(&mut col[1], "Mics during a video (−100 = off)", |ui| {
+            field(&mut col[0], "Stream audio fade", |ui| seconds(ui, &mut c.stream_atem.fade));
+            field(&mut col[1], "Stream audio during a video (−100 = off)", |ui| {
                 let w = ui.available_width();
                 ui.add_sized(
                     [w, FIELD_H],
@@ -734,7 +734,7 @@ impl StreamItApp {
             });
         });
         ui.add_space(6.0);
-        theme::lbl(ui, "Mic sources (Fairlight input / source)");
+        theme::lbl(ui, "Stream audio sources (Fairlight input / source)");
         let mut remove = None;
         for (i, m) in c.stream_atem.mic_sources.iter_mut().enumerate() {
             ui.horizontal(|ui| {
@@ -748,7 +748,7 @@ impl StreamItApp {
         if let Some(i) = remove {
             c.stream_atem.mic_sources.remove(i);
         }
-        if ui.button("Add mic source").clicked() {
+        if ui.button("Add stream audio source").clicked() {
             c.stream_atem.mic_sources.push(AudioSourceId { input: 1001, source: -65280 });
         }
     }

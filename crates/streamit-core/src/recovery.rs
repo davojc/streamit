@@ -47,7 +47,7 @@ pub async fn assess(d: &Devices, c: &Config, bid: Option<&str>, player_active: b
     let on_live_input = stream_prog.is_some_and(|p| sa.live_inputs.contains(&p));
     let on_decklink = stream_prog == Some(sa.decklink_input);
 
-    // On the DeckLink the mics were faded down for the video, and stay down after a crash.
+    // On the DeckLink the stream audio was faded down for the video, and stay down after a crash.
     let mut mic_muted = false;
     if streaming && (on_live_input || on_decklink) {
         let down = down_threshold(sa.duck_db);
@@ -146,7 +146,7 @@ pub async fn recover(d: &Devices, c: &Config, levels: &LiveLevels) -> Result<()>
         Ok(p) if p == d.stream.media_player_input(sa.media_player) => {}
         _ => {
             if let Err(e) = fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
-                fail("Could not fade the mics up", e);
+                fail("Could not fade the stream audio up", e);
             }
         }
     }
@@ -319,7 +319,7 @@ mod tests {
         let a = assess(&d, &cfg(), Some("b"), false).await;
         assert_eq!(a.stage, Stage::Live);
         assert_eq!(a.offer, vec![Offer::Recover]);
-        assert!(a.mics_down, "the mics were faded down for the video");
+        assert!(a.mics_down, "the stream audio was faded down for the video");
         // YouTube's state unknown: the stage stays Idle, Recover still offered.
         h.yt.fail_next("life_cycle");
         let a = assess(&d, &cfg(), Some("b"), false).await;
@@ -384,8 +384,9 @@ mod tests {
         let route = pos(&Call::HubRoute { output: OUT, input: CAM8 });
         assert!(pos(&Call::StreamAuto) < route && pos(&Call::ScreensAuto) < route);
         assert!(pos(&Call::StreamSetAudioOn(AudioSourceId { input: 8, source: STEREO_SOURCE }, false)) < route);
-        let last_fade = calls.iter().rposition(|c| matches!(c, Call::StreamSetAudioLevel(..))).expect("mics faded");
-        assert!(last_fade < route, "mic fade must precede the route restore");
+        let last_fade =
+            calls.iter().rposition(|c| matches!(c, Call::StreamSetAudioLevel(..))).expect("stream audio faded");
+        assert!(last_fade < route, "the stream audio fade must precede the route restore");
         assert_eq!(route, calls.len() - 1);
     }
 

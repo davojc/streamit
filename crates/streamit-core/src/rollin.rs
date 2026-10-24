@@ -302,7 +302,7 @@ pub async fn play_reporting(
         sleep(hub.settle).await;
         let down = down_threshold(sa.duck_db);
         if let Err(e) = levels.recapture(&*d.stream, &sa.mic_sources, down).await {
-            note(&mut problems, format!("Could not read mic levels: {e}"));
+            note(&mut problems, format!("Could not read the stream audio levels: {e}"));
         }
         held_down = all_down(&*d.stream, &sa.mic_sources, down).await;
     }
@@ -358,7 +358,7 @@ pub async fn play_reporting(
     };
     let (faded, (screens, played)) = tokio::join!(fade_down, screens_and_play);
     if let Err(e) = faded {
-        note(&mut problems, format!("Could not fade the mics down: {e}"));
+        note(&mut problems, format!("Could not fade the stream audio down: {e}"));
     }
     let screens_cut = matches!(screens, Some(Ok(())));
     if let Some(Err(e)) = screens {
@@ -386,13 +386,13 @@ pub async fn play_reporting(
                 },
                 _ = unmute.notified(), if mics_down && !unmuted => {
                     // Only a fade that worked counts: otherwise Unmute stays armed
-                    // and the return path still fades the mics up.
+                    // and the return path still fades the stream audio up.
                     match fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
                         Ok(()) => {
                             unmuted = true;
                             mics_ducked(false);
                         }
-                        Err(e) => note(&mut problems, format!("Could not fade the mics up: {e}")),
+                        Err(e) => note(&mut problems, format!("Could not fade the stream audio up: {e}")),
                     }
                 }
                 _ = tick.tick() => {
@@ -469,7 +469,7 @@ pub async fn play_reporting(
     if mics_down && !unmuted {
         match fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
             Ok(()) => mics_ducked(false),
-            Err(e) => note(&mut problems, format!("Could not fade the mics up: {e}")),
+            Err(e) => note(&mut problems, format!("Could not fade the stream audio up: {e}")),
         }
     }
     if video_audio
@@ -943,7 +943,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn failed_unmute_can_be_retried_and_return_still_fades_up() {
         let up = Call::StreamSetAudioLevel(MIC, -3.0);
-        // A failed Unmute leaves Unmute armed: a second press fades the mics up.
+        // A failed Unmute leaves Unmute armed: a second press fades the stream audio up.
         let (d, log, h) = rig();
         let run = spawn_play(&d, &cfg(), cue(Destination::HallAndOnline));
         until(&log, Call::StreamSetAudioLevel(MIC, FLOOR_DB)).await;
@@ -959,7 +959,7 @@ mod tests {
         assert!(matches!(r, RollinOutcome::Failed { recover_needed: true, .. }), "{r:?}");
         assert_eq!(log.calls().iter().filter(|c| **c == up).count(), 1);
 
-        // A failed Unmute with no retry: the return path still fades the mics up.
+        // A failed Unmute with no retry: the return path still fades the stream audio up.
         let (d, log, h) = rig();
         let run = spawn_play(&d, &cfg(), cue(Destination::HallAndOnline));
         until(&log, Call::StreamSetAudioLevel(MIC, FLOOR_DB)).await;
@@ -1018,7 +1018,7 @@ mod tests {
             let r = play_to_end(&d, &c, cue(Destination::HallAndOnline), &log, &h).await;
             assert_eq!(r, RollinOutcome::Finished);
             let calls = log.calls();
-            assert!(!calls.iter().any(is_mic), "duck {duck}: the mics were touched: {calls:?}");
+            assert!(!calls.iter().any(is_mic), "duck {duck}: the stream audio was touched: {calls:?}");
             assert_eq!(h.stream.audio_level(MIC).await.unwrap(), FLOOR_DB, "duck {duck}");
             // The video's own sound still comes and goes.
             assert_in_order(&calls, &[Call::StreamSetAudioOn(IN8, true), Call::StreamSetAudioOn(IN8, false)]);

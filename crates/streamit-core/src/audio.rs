@@ -54,7 +54,7 @@ impl LiveLevels {
         let mut mic: Vec<MicLevel> =
             self.0.iter().map(|(s, db)| MicLevel { input: s.input, source: s.source, db: *db }).collect();
         mic.sort_by_key(|m| (m.input, m.source));
-        let text = toml::to_string_pretty(&LevelsFile { mic }).context("serializing mic levels")?;
+        let text = toml::to_string_pretty(&LevelsFile { mic }).context("serializing stream audio levels")?;
         write_atomic(path, &text)
     }
 
@@ -212,7 +212,7 @@ mod tests {
         let mut live = LiveLevels::capture(&*d.stream, &[MIC], down_threshold(-20.0)).await.unwrap();
         h.stream.set_audio_level_state(MIC, -20.0);
         live.recapture(&*d.stream, &[MIC], down_threshold(-20.0)).await.unwrap();
-        assert_eq!(live.0[&MIC], -6.0, "a ducked mic is not its live level");
+        assert_eq!(live.0[&MIC], -6.0, "ducked stream audio is not its live level");
     }
 
     #[test]

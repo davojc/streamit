@@ -219,8 +219,8 @@ pub fn next_step_text(s: &Snapshot, c: &Config) -> (&'static str, String) {
         ),
         NextStep::Recover => (
             "Recover first",
-            "StreamIt restarted with the equipment left mid-video (or the mics down). Recover puts it \
-             back: the stream and hall off the video, mics up, input 8 back on its camera. Then carry on."
+            "StreamIt restarted with the equipment left mid-video (or the stream audio down). Recover puts it \
+             back: the stream and hall off the video, stream audio up, input 8 back on its camera. Then carry on."
                 .to_string(),
         ),
         NextStep::Prepare => (
@@ -516,11 +516,15 @@ pub fn selection_after_remove(selected: usize, removed: usize, len: usize) -> us
 pub fn destination_help(d: Destination) -> &'static str {
     match d {
         Destination::HallAndOnline => {
-            "Hall screens and the stream both switch to the video. Stream mics fade down and come back after."
+            "Hall screens and the stream both switch to the video. The stream audio fades down and comes back after."
         }
-        Destination::HallOnly => "Only the hall screens switch. The stream stays on the cameras with the mics up.",
-        Destination::OnlineOnly => "Only the stream switches to the video. Stream mics fade down and come back after.",
-        Destination::AudioOnly => "No picture changes. The video's sound plays and the stream mics fade down.",
+        Destination::HallOnly => {
+            "Only the hall screens switch. The stream stays on the cameras with the stream audio up."
+        }
+        Destination::OnlineOnly => {
+            "Only the stream switches to the video. The stream audio fades down and comes back after."
+        }
+        Destination::AudioOnly => "No picture changes. The video's sound plays and the stream audio fades down.",
     }
 }
 
@@ -589,7 +593,7 @@ pub fn fault_label(f: Fault) -> &'static str {
         Fault::YouTubeRefusesPublic => "YouTube refuses public",
         Fault::YouTubeSlow => "YouTube very slow",
         Fault::NextVideoFails => "Next video won’t load",
-        Fault::MicFadeFails => "Mic fade fails",
+        Fault::MicFadeFails => "Stream audio fade fails",
     }
 }
 
@@ -751,19 +755,19 @@ mod tests {
     fn destination_help_texts_match_spec() {
         assert_eq!(
             destination_help(Destination::HallAndOnline),
-            "Hall screens and the stream both switch to the video. Stream mics fade down and come back after."
+            "Hall screens and the stream both switch to the video. The stream audio fades down and comes back after."
         );
         assert_eq!(
             destination_help(Destination::HallOnly),
-            "Only the hall screens switch. The stream stays on the cameras with the mics up."
+            "Only the hall screens switch. The stream stays on the cameras with the stream audio up."
         );
         assert_eq!(
             destination_help(Destination::OnlineOnly),
-            "Only the stream switches to the video. Stream mics fade down and come back after."
+            "Only the stream switches to the video. The stream audio fades down and comes back after."
         );
         assert_eq!(
             destination_help(Destination::AudioOnly),
-            "No picture changes. The video's sound plays and the stream mics fade down."
+            "No picture changes. The video's sound plays and the stream audio fades down."
         );
     }
 
@@ -985,7 +989,7 @@ mod tests {
         assert!(!countdown(&public, &c).unwrap().show_retry_public);
     }
 
-    /// I6: the mic bar says why the mics are down.
+    /// I6: the mic bar says why the stream audio is down.
     #[test]
     fn mic_bar_wording() {
         let live = Snapshot { stage: Stage::Live, ..Snapshot::default() };
@@ -1110,7 +1114,7 @@ mod tests {
                 "YouTube refuses public",
                 "YouTube very slow",
                 "Next video won’t load",
-                "Mic fade fails",
+                "Stream audio fade fails",
             ]
         );
         assert_eq!(sim_sources(3010), [1, 2, 3, 4, 5, 8, 3010]);

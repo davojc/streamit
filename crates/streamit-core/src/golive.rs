@@ -68,7 +68,7 @@ pub enum CountdownReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CountdownOutcome {
     /// T-0 is done. `public` is whether the broadcast went public (go-public settled Ok);
-    /// `mics_failed` is whether T-0 could not bring the mics up (I1: Recover is offered).
+    /// `mics_failed` is whether T-0 could not bring the stream audio up (I1: Recover is offered).
     Live {
         public: bool,
         mics_failed: bool,
@@ -167,9 +167,9 @@ pub async fn prepare(
     let mut problems = Vec::new();
     let waiting = |s: &str| progress(Readiness::Waiting(s.to_string()));
 
-    waiting("Capturing mic levels");
+    waiting("Capturing the stream audio levels");
     if let Err(e) = levels.recapture(&*d.stream, &sa.mic_sources, down_threshold(sa.duck_db)).await {
-        problem(&mut problems, &warn, format!("Could not read mic levels: {e}"));
+        problem(&mut problems, &warn, format!("Could not read the stream audio levels: {e}"));
     }
 
     waiting("Putting the opening still on air");
@@ -182,12 +182,12 @@ pub async fn prepare(
         problem(&mut problems, &warn, format!("Could not cut the stream to the opening still: {e}"));
     }
 
-    waiting("Fading the mics down");
+    waiting("Fading the stream audio down");
     if let Err(e) = fade(&*d.stream, &sa.mic_sources, Target::Floor, sa.fade).await {
-        problem(&mut problems, &warn, format!("Could not fade the mics down: {e}"));
+        problem(&mut problems, &warn, format!("Could not fade the stream audio down: {e}"));
     }
     if problems.len() == before {
-        note("Opening still on air · mics silent".into());
+        note("Opening still on air · stream audio silent".into());
     }
 
     waiting("Starting the encoder");
@@ -600,7 +600,7 @@ impl std::fmt::Display for T0Error {
 
 impl std::error::Error for T0Error {}
 
-/// T-0: stream to live action, then mics up and hall to `t0_input` together (the hall
+/// T-0: stream to live action, then stream audio up and hall to `t0_input` together (the hall
 /// does not wait out the 1 s mic fade, as for roll-ins), then counter off.
 /// Mics come up only if the stream cut succeeded. Every step is attempted.
 pub async fn t0(d: &Devices, c: &Config, levels: &LiveLevels) -> std::result::Result<(), T0Error> {
@@ -608,7 +608,7 @@ pub async fn t0(d: &Devices, c: &Config, levels: &LiveLevels) -> std::result::Re
 }
 
 /// `t0`, also giving `note` one plain line saying what went on air once the stream
-/// cut has succeeded, e.g. "Live · Cam 1 on air · mics up · hall → input 6".
+/// cut has succeeded, e.g. "Live · Cam 1 on air · stream audio up · hall → input 6".
 pub async fn t0_reporting(
     d: &Devices,
     c: &Config,
@@ -641,7 +641,7 @@ pub async fn t0_reporting(
     }
     let mics_failed = matches!(faded, Some(Err(_)));
     if let Ok(input) = &stream_cut {
-        let mics = if mics_failed { "mics still down" } else { "mics up" };
+        let mics = if mics_failed { "stream audio still down" } else { "stream audio up" };
         let hall = match &hall {
             Ok(()) => format!("hall → input {}", c.screens_atem.t0_input),
             Err(_) => "hall not switched".into(),
@@ -649,7 +649,7 @@ pub async fn t0_reporting(
         note(format!("Live · Cam {input} on air · {mics} · {hall}"));
     }
     if let Some(Err(e)) = faded {
-        failures.push(format!("Could not fade the mics up: {e}"));
+        failures.push(format!("Could not fade the stream audio up: {e}"));
     }
     if let Err(e) = hall {
         failures.push(format!("Could not switch the hall screens: {e}"));
@@ -1023,7 +1023,7 @@ mod tests {
         // The hall switches alongside the 1 s mic fade, not after it.
         let hall = pos(&calls, &Call::ScreensAuto);
         assert!(pos(&calls, &Call::ScreensSetPreview(6)) < hall);
-        assert!(hall < fades[1], "the hall waited for the mic fade: {calls:?}");
+        assert!(hall < fades[1], "the hall waited for the stream audio fade: {calls:?}");
         assert_eq!(calls.last(), Some(&Call::CounterClear));
         assert_eq!(d.screens.program().await.unwrap(), 6);
     }

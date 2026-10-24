@@ -20,8 +20,8 @@ Drills. Each fault button breaks one thing. Press it again to put it right.
 
 - **VideoHub unplugged mid-video.** Play a video. Press **Unplug VideoHub**. Let the video end, or press **Stop video**. A warning appears. Press **Unplug VideoHub** again to plug it back in, then press **Recover**. Pass if the warning clears and Camera 8 is back on input 8.
 - **YouTube refuses public.** Press **YouTube refuses public**. Start the countdown, or press **Start service now**. The picture still cuts on time. A warning appears with **Retry going public**. Press **YouTube refuses public** again to let it through, then press **Retry going public**. Pass if the broadcast shows as public.
-- **Mic fade fails at T-0.** Press **Mic fade fails**. Press **Start countdown** on the Service tab (or the COUNTDOWN key) and let it reach T-0. A warning appears. Press **Mic fade fails** again to fix it, then press **Recover**. Pass if the mics come up.
-- **Crash & restart mid-video.** Play a video. Press **Crash & restart app**. StreamIt restarts against the same pretend equipment and changes nothing by itself. Press **Recover**. Pass if the right input is on air and the mics are right.
+- **Stream audio fade fails at T-0.** Press **Stream audio fade fails**. Press **Start countdown** on the Service tab (or the COUNTDOWN key) and let it reach T-0. A warning appears. Press **Stream audio fade fails** again to fix it, then press **Recover**. Pass if the stream audio comes up.
+- **Crash & restart mid-video.** Play a video. Press **Crash & restart app**. StreamIt restarts against the same pretend equipment and changes nothing by itself. Press **Recover**. Pass if the right input is on air and the stream audio is right.
 
 ## Part A. Before the rehearsal
 
@@ -123,7 +123,7 @@ cargo run -p streamit-atem --example atem-probe -- 192.168.4.123 state
   cargo run -p streamit-atem --example atem-probe -- 192.168.4.123 level 1001 -65280 -10
   cargo run -p streamit-atem --example atem-probe -- 192.168.4.123 level 1001 -65280 <original>
   ```
-- Look for: input 3 shows on preview. Media player 1 (input 3010) shows the opening still. The mic fader in ATEM Software Control moves to -10 dB, nothing else on that channel changes, and the last command puts it back.
+- Look for: input 3 shows on preview. Media player 1 (input 3010) shows the opening still. The stream audio fader in ATEM Software Control moves to -10 dB, nothing else on that channel changes, and the last command puts it back.
 - `<opening>` is the still's slot in the media pool counting from 0. ATEM Software Control counts from 1, so slot 1 there is 0 here.
 - Every command must report success. `timeout` means the switcher did not confirm. `disconnected` means no state arrived: check the address.
 - Also confirm the ATEM accepts the empty-packet keep-alive ping (the probe stays connected for the whole run without dropping).
@@ -182,7 +182,7 @@ Look for:
 - Row 0: STREAM ATEM, SCREENS ATEM (green), VIDEO HUB (amber), WEB PRESENTER (red), YOUTUBE (green), DECKLINK and NDI (dim), then `T-0:42` in amber.
 - Row 1: GO PUBLIC and GO LIVE lit, RECOVER dim. Pressing a dim key prints nothing.
 - Row 2: cue names are word-wrapped and readable. The first cue blinks at 2 Hz. STOP VIDEO is lit.
-- UNMUTE MICS is lit, bottom right.
+- STREAM AUDIO UP is lit, bottom right.
 - Unplug the deck and plug it back in. The keys redraw within a few seconds.
 
 ### A5. Settings
@@ -201,7 +201,7 @@ Open StreamIt (`target\release\streamit.exe`) and go to the Settings tab.
 
 ## Part B. The rehearsal
 
-On the **Service** tab, select the private test broadcast in the **Pre-flight checks** panel (the broadcast list at its top). Keep it private until check 3. Press keys on the Stream Deck or the matching buttons in the window. Both do the same thing. The window's buttons: **Prepare** and **Start countdown** on the Service tab; **Play**, **Stop video** and **Unmute mics** in the Service tab's video list once live; **End service** on the live screen; and the **MORE** menu (right of the step bar) for Start service now, Go public now, End broadcast and End service. Do the checks in order.
+On the **Service** tab, select the private test broadcast in the **Pre-flight checks** panel (the broadcast list at its top). Keep it private until check 3. Press keys on the Stream Deck or the matching buttons in the window. Both do the same thing. The window's buttons: **Prepare** and **Start countdown** on the Service tab; **Play**, **Stop video** and **Stream audio up** in the Service tab's video list once live; **End service** on the live screen; and the **MORE** menu (right of the step bar) for Start service now, Go public now, End broadcast and End service. Do the checks in order.
 
 1. **Stage 0: the checks.**
    Look at the Pre-flight checks on the Service tab. Turn Auto Start on in YouTube Studio for the test broadcast. Press **Fix** next to Auto Start. Auto Start must go off.
@@ -217,7 +217,7 @@ On the **Service** tab, select the private test broadcast in the **Pre-flight ch
 
 4. **T-0.**
    Before T-0, put Camera 5 on the Stream ATEM preview. Let the countdown reach T-0.
-   *Pass if:* Camera 1 goes on air (not Camera 5). The mics fade up. The Screens ATEM goes to its T-0 input.
+   *Pass if:* Camera 1 goes on air (not Camera 5). The stream audio fades up. The Screens ATEM goes to its T-0 input.
 
 5. **One roll-in per destination.**
    Play one video to the hall and online, and one to each other destination in your cue list. Use the video with a return input at least once.
@@ -228,9 +228,9 @@ On the **Service** tab, select the private test broadcast in the **Pre-flight ch
    - After a video the ATEM returns to preview, unless the video has a return input.
    - A second press of a cue while one video is playing is ignored and its key flashes.
 
-6. **Unmute Mics during a video.**
-   While a video plays, press UNMUTE MICS.
-   *Pass if:* the mics come back up during the video. The key goes dim.
+6. **Stream audio up during a video.**
+   While a video plays, press STREAM AUDIO UP.
+   *Pass if:* the stream audio comes back up during the video. The key goes dim.
 
 7. **Stop Video.**
    While a video plays, press STOP VIDEO.
@@ -242,7 +242,7 @@ On the **Service** tab, select the private test broadcast in the **Pre-flight ch
 
 9. **Crash test.**
    Start another run through to a video playing. Kill the app (End task in Task Manager) while the video plays. Restart StreamIt.
-   *Pass if:* nothing changes on its own after the restart. Press RECOVER. It fixes the state (the right input on air, mics correct).
+   *Pass if:* nothing changes on its own after the restart. Press RECOVER. It fixes the state (the right input on air, stream audio correct).
 
 10. **VideoHub cable.**
     Play a video to the hall and online. While it plays, pull the VideoHub's network cable. Let the video end (or press STOP VIDEO).
@@ -252,7 +252,7 @@ On the **Service** tab, select the private test broadcast in the **Pre-flight ch
     Start the countdown. Kill the app mid-countdown. Restart StreamIt.
     *Pass if:* the stage shows READY (or LIVE, if the countdown had passed T-10s), GO LIVE is lit, and GO PUBLIC is lit (it always is). Nothing changes on its own.
 
-After the rehearsal: return the mic fader, Auto Start/Auto Stop and any VideoHub routes to their normal settings, and delete or end the private test broadcast.
+After the rehearsal: return the stream audio fader, Auto Start/Auto Stop and any VideoHub routes to their normal settings, and delete or end the private test broadcast.
 
 ## Part C. Results
 

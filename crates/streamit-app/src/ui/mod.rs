@@ -589,8 +589,8 @@ impl StreamItApp {
             ui.label(what);
             ui.label(
                 "Closing stops the Stream Deck and leaves the devices as they are now: a video, \
-                 the countdown or End Service stops part-way, and nothing returns the switchers, \
-                 the mics or the stream to normal. The YouTube broadcast and the Web Presenter keep \
+                 the countdown or End Service stops part-way, and nothing returns the switchers \
+                 or the stream audio to normal. The YouTube broadcast and the Web Presenter keep \
                  going until someone ends them.",
             );
             ui.horizontal(|ui| {

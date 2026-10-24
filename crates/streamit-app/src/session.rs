@@ -518,10 +518,10 @@ impl Inner {
             // The mics' live levels from the last run of this mode, so Go Live and Recover
             // after a restart fade up to them rather than to 0 dB.
             let levels = LiveLevels::load(&levels_file).unwrap_or_else(|e| {
-                warn!("{e:#}; starting without saved mic levels");
+                warn!("{e:#}; starting without saved stream audio levels");
                 LiveLevels::default()
             });
-            info!(path = %levels_file.display(), mics = levels.0.len(), "mic levels loaded");
+            info!(path = %levels_file.display(), mics = levels.0.len(), "stream audio levels loaded");
             let engine = Engine::spawn_with(
                 kit.devices.clone(),
                 config.clone(),

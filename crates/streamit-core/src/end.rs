@@ -1,4 +1,4 @@
-//! End Service: closing still on air, mics faded, hold, YouTube complete, encoder stop.
+//! End Service: closing still on air, stream audio faded, hold, YouTube complete, encoder stop.
 //!
 //! Device errors never abort the sequence; they become warnings. The encoder is
 //! stopped even when YouTube fails or hangs.
@@ -37,7 +37,7 @@ pub async fn end_service(
         warnings.push(format!("Could not cut the stream to the closing still: {e}"));
     }
     if let Err(e) = fade(&*d.stream, &sa.mic_sources, Target::Floor, sa.fade).await {
-        warnings.push(format!("Could not fade the mics down: {e}"));
+        warnings.push(format!("Could not fade the stream audio down: {e}"));
     }
 
     // Hold: one report per second, counting down; a (stored) skip permit ends it early.

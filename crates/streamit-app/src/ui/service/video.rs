@@ -81,8 +81,8 @@ impl StreamItApp {
                             if theme::sized_button(ui, "Stop video", Kind::DangerOutline, 60.0, 19.0, true).clicked() {
                                 app.send(Command::StopVideo);
                             }
-                            if theme::sized_button(ui, "Unmute mics", Kind::Warn, 60.0, 19.0, snap.mics_ducked)
-                                .on_disabled_hover_text("The mics are not turned down")
+                            if theme::sized_button(ui, "Stream audio up", Kind::Warn, 60.0, 19.0, snap.mics_ducked)
+                                .on_disabled_hover_text("The stream audio is not turned down")
                                 .clicked()
                             {
                                 app.send(Command::UnmuteMics);

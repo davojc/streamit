@@ -116,7 +116,7 @@ impl StreamSwitcher for SimSwitcher {
     async fn set_audio_level(&self, src: AudioSourceId, db: f32) -> Result<()> {
         self.with(|w| {
             if w.has_fault(Fault::MicFadeFails) {
-                return Err(DeviceError::Refused("mic fade failed (simulation)".into()));
+                return Err(DeviceError::Refused("stream audio fade failed (simulation)".into()));
             }
             w.fairlight.insert(src, db);
             Ok(())

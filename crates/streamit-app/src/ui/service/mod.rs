@@ -271,7 +271,7 @@ fn big_value(ui: &mut Ui, text: &str, size: f32) {
 }
 
 fn mics(ui: &mut Ui, snap: &Snapshot) {
-    theme::lbl(ui, "Mics");
+    theme::lbl(ui, "Stream audio");
     ui.horizontal(|ui| {
         let bar = view::mic_bar(snap);
         let (frac, text) = (bar.fraction, bar.text);

@@ -54,7 +54,7 @@ impl StreamItApp {
                     "Online will see",
                     "Stream starting soon…",
                     true,
-                    &format!("Opening still · media slot {} · mics silent", c.stream_atem.opening_still + 1),
+                    &format!("Opening still · media slot {} · stream audio silent", c.stream_atem.opening_still + 1),
                 );
                 preview(&mut cols[1], "Hall screens", "Unchanged", false, "The hall isn’t touched until the countdown");
             });

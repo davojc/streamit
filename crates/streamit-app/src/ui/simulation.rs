@@ -164,7 +164,7 @@ impl StreamItApp {
             ui.columns(3, |col| {
                 let mic = v.mic_levels.iter().find(|(s, _)| c.stream_atem.mic_sources.contains(s)).map(|(_, db)| *db);
                 col[0].vertical(|ui| {
-                    theme::lbl(ui, "Mics (XLR)");
+                    theme::lbl(ui, "Stream audio (XLR)");
                     theme::progress(ui, mic.map(view::mic_fraction).unwrap_or(0.0), theme::GREEN);
                     let text = mic.map(|db| format!("{db:.1} dB").replace('-', "−")).unwrap_or_else(|| "—".into());
                     ui.label(RichText::new(text).font(theme::mono(13.0)).color(theme::SOFT));

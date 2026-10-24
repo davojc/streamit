@@ -445,8 +445,8 @@ fn videos_look(key: u8, snap: &Snapshot, blink_phase: bool) -> KeyLook {
     match key {
         STOP_VIDEO if snap.playing.is_some() => look("STOP\nVIDEO", RED, WHITE),
         STOP_VIDEO => dim("STOP\nVIDEO"),
-        UNMUTE if unmute_pressable(snap) => look("UNMUTE\nMICS", AMBER, BLACK),
-        UNMUTE => dim("UNMUTE\nMICS"),
+        UNMUTE if unmute_pressable(snap) => look("STREAM\nAUDIO UP", AMBER, BLACK),
+        UNMUTE => dim("STREAM\nAUDIO UP"),
         _ => blank(),
     }
 }

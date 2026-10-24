@@ -982,7 +982,7 @@ mod tests {
     }
 
     /// A crash (the app dying) in the middle of a video: the next start offers Recover,
-    /// and Recover puts input 8 back on Camera 8 with the mics up.
+    /// and Recover puts input 8 back on Camera 8 with the stream audio up.
     #[tokio::test(start_paused = true)]
     async fn restart_mid_video_offers_recover() {
         let c = cfg();
