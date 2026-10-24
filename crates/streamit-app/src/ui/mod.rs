@@ -576,7 +576,7 @@ impl eframe::App for StreamItApp {
                     Tab::Service => self.service_tab(ui, &snap, &config, viewport),
                     Tab::Videos => self.videos_tab(ui, &snap, &config),
                     Tab::Settings => self.settings_tab(ui, &snap),
-                    Tab::Simulation => self.simulation_tab(ui, &snap, &config),
+                    Tab::Simulation => self.simulation_tab(ui, &snap),
                 });
             });
     }

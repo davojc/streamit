@@ -127,9 +127,19 @@ pub(super) fn parse_inputs(s: &str) -> Result<Vec<u16>, String> {
 }
 
 /// The digits in a typed field ("Input 13" → 13); `None` if there are none.
+/// A leading word ("Input", "Slot", "MP") is allowed; anything else that is not a digit
+/// ("1.5", "12a") is rejected, so the field keeps its value rather than guessing.
 fn digits(s: &str) -> Option<f64> {
-    let d: String = s.chars().filter(char::is_ascii_digit).collect();
-    d.parse().ok()
+    let rest = s.trim().trim_start_matches(|c: char| c.is_ascii_alphabetic()).trim_start();
+    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+/// A router field cleared or typed as "not set" means 0.
+fn router_digits(s: &str) -> Option<f64> {
+    if s.chars().all(|c| c.is_ascii_alphabetic() || c.is_whitespace()) { Some(0.0) } else { digits(s) }
 }
 
 // ---------------------------------------------------------------- fields
@@ -167,15 +177,16 @@ fn router_number(ui: &mut Ui, v: &mut u16, prefix: &'static str) {
     let d = egui::DragValue::new(v)
         .range(0..=999)
         .custom_formatter(move |n, _| if n == 0.0 { "not set".into() } else { format!("{prefix}{n}") })
-        .custom_parser(|s| Some(digits(s).unwrap_or(0.0)));
+        .custom_parser(router_digits);
     ui.add_sized([w, FIELD_H], d);
 }
 
-/// A media-pool still, stored from 0 and shown from 1 as on the ATEM ("Slot 1").
+/// A media-pool still, stored from 0 and shown from 1 as on the ATEM ("Slot 1"). The
+/// range is wide so an existing value is never clamped.
 fn slot(ui: &mut Ui, v: &mut u16) {
     let w = ui.available_width();
     let d = egui::DragValue::new(v)
-        .range(0..=63)
+        .range(0..=255)
         .custom_formatter(|n, _| format!("Slot {}", n as u64 + 1))
         .custom_parser(|s| digits(s).map(|n| (n - 1.0).max(0.0)));
     ui.add_sized([w, FIELD_H], d);
@@ -344,14 +355,9 @@ impl StreamItApp {
             field(&mut c[2], "Router", |ui| opt_text(ui, &mut d.videohub.address, "not set"));
             field(&mut c[3], "Stream encoder", |ui| opt_text(ui, &mut d.web_presenter.address, "not set"));
         });
-        ui.add_space(14.0);
-        if simulating {
-            note_box(
-                ui,
-                "Equipment changes you save now take effect when StreamIt restarts, and in the simulation next time you open simulation.",
-                theme::AMBER,
-            );
-        } else {
+        // While simulating, the note at the top of Settings says this (and more).
+        if !simulating {
+            ui.add_space(14.0);
             note_box(ui, RESTART_CARD, theme::AMBER);
             let waiting = device_settings(&self.config.read().unwrap_or_else(|e| e.into_inner()))
                 != device_settings(&self.startup);
@@ -556,7 +562,9 @@ impl StreamItApp {
         heading(ui, "Inputs & routing");
         ui.add_space(8.0);
         let defaulted = if simulating { self.sim_defaults.borrow().clone() } else { Vec::new() };
-        let (sim, _) = crate::session::sim_config(&self.draft);
+        // The values the running simulation uses: its effective config.
+        let running = self.sim.borrow().as_ref().map(|s| s.config().videohub.clone());
+        let sim = running.unwrap_or_default();
         let note = |ui: &mut Ui, field: &str, value: u16| {
             if let Some(n) = view::sim_default_note(&defaulted, field, value) {
                 amber_note(ui, &n);
@@ -577,11 +585,11 @@ impl StreamItApp {
             field(&mut col[0], "Video comes in on", |ui| number(ui, &mut c.stream_atem.decklink_input, "Input "));
             field(&mut col[1], "Router output to input 8", |ui| {
                 router_number(ui, &mut c.videohub.input8_output, "Output ");
-                note(ui, "videohub.input8_output", sim.videohub.input8_output);
+                note(ui, "videohub.input8_output", sim.input8_output);
             });
             field(&mut col[2], "Cam 8 normally on router input", |ui| {
                 router_number(ui, &mut c.videohub.fallback_normal_input, "Input ");
-                note(ui, "videohub.fallback_normal_input", sim.videohub.fallback_normal_input);
+                note(ui, "videohub.fallback_normal_input", sim.fallback_normal_input);
             });
         });
         ui.columns(3, |col| {
@@ -589,14 +597,19 @@ impl StreamItApp {
             field(&mut col[1], "Closing still", |ui| slot(ui, &mut c.stream_atem.closing_still));
             field(&mut col[2], "DeckLink on router input", |ui| {
                 router_number(ui, &mut c.videohub.decklink_input, "Input ");
-                note(ui, "videohub.decklink_input", sim.videohub.decklink_input);
+                note(ui, "videohub.decklink_input", sim.decklink_input);
             });
         });
         ui.columns(3, |col| {
             field(&mut col[0], "Hall screens: video comes in on", |ui| {
                 number(ui, &mut c.screens_atem.decklink_input, "Input ")
             });
-            field(&mut col[1], "Media player", |ui| number(ui, &mut c.stream_atem.media_player, "MP"));
+            field(&mut col[1], "Media player", |ui| {
+                // Media players count from 1 on the ATEM.
+                let w = ui.available_width();
+                let d = egui::DragValue::new(&mut c.stream_atem.media_player).range(1..=u8::MAX).prefix("MP");
+                ui.add_sized([w, FIELD_H], d);
+            });
         });
         if !defaulted.is_empty() {
             amber_note(
@@ -859,8 +872,16 @@ mod tests {
     #[test]
     fn typed_numbers_keep_their_digits() {
         assert_eq!(digits("Input 13"), Some(13.0));
+        assert_eq!(digits(" 7 "), Some(7.0));
+        assert_eq!(digits("MP1"), Some(1.0));
         assert_eq!(digits("not set"), None);
         assert_eq!(digits("Slot 2"), Some(2.0));
+        assert_eq!(digits("1.5"), None, "not joined into 15");
+        assert_eq!(digits("12a"), None);
+        assert_eq!(router_digits("not set"), Some(0.0));
+        assert_eq!(router_digits(""), Some(0.0));
+        assert_eq!(router_digits("Output 11"), Some(11.0));
+        assert_eq!(router_digits("1.5"), None);
     }
 
     #[test]

@@ -1142,6 +1142,9 @@ mod tests {
         // The pretend world was seeded from the effective config: output 11 carries input 13.
         let sim = front.sim.borrow().clone().unwrap();
         assert_eq!(sim.snapshot().input8, Input8Source::Other(13));
+        // Settings and the Simulation tab read the running simulation's effective config.
+        let e = &sim.config().videohub;
+        assert_eq!((e.input8_output, e.decklink_input, e.fallback_normal_input), (11, 39, 13));
         // Nothing was saved, and the real config is unchanged.
         assert_eq!(std::fs::read(&config).unwrap(), saved);
         let real = shared.read().unwrap().videohub.clone();
@@ -1247,20 +1250,33 @@ mod tests {
             ..Config::default()
         };
         let (s, front, ..) = start_cfg("rehearsal", real.clone(), Arc::new(SimFactory), c).await;
+        // `real` keeps only its latest build's log: hold on to the first real session's.
+        let first_real = real.last_log.lock().unwrap().clone().unwrap();
         tokio::time::sleep(Duration::from_secs(30)).await;
         let idle = front.rx.borrow().clone();
         assert_eq!(view::switch_state(&idle, *front.mode.borrow()).label, "Switch to simulation");
+
+        // No step raises a warning.
+        let no_warning = |front: &Front, step: &str| {
+            let s = front.rx.borrow().clone();
+            assert_eq!(s.last_warning, None, "a warning after {step}: {:#?}", s.activity);
+        };
 
         // 1. Switch to simulation.
         s.switch(Mode::Simulation).await.unwrap();
         assert_eq!(*front.mode.borrow(), Mode::Simulation);
         let sim = front.sim.borrow().clone().unwrap();
         wait_for(&front, "the pretend broadcast", |s| s.simulation && s.broadcast.is_some()).await;
+        no_warning(&front, "the switch");
+        let decklink = sim.config().stream_atem.decklink_input;
+        let cam8 = sim.config().videohub.fallback_normal_input;
+        assert_eq!(cam8, SIM_FALLBACK_NORMAL_INPUT, "the effective config's simulated default");
 
         // 2. Prepare.
         front.tx.send(Command::Prepare).await.unwrap();
         wait_for(&front, "Prepare to run", |s| s.job == Some("Prepare")).await;
         let prepared = wait_for(&front, "Prepared", |s| matches!(s.stage, Stage::Prepared(_)) && s.job.is_none()).await;
+        no_warning(&front, "Prepare");
         assert!(!view::switch_state(&prepared, Mode::Simulation).enabled, "no leaving mid-service");
         assert_eq!(s.switch(Mode::Real).await, refused());
 
@@ -1274,6 +1290,7 @@ mod tests {
         wait_for(&front, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
         assert!(counting.elapsed() < Duration::from_secs(10), "the countdown ran at 10×: {:?}", counting.elapsed());
         wait_for(&front, "public", |s| s.activity.iter().any(|a| a.text.starts_with("YouTube public"))).await;
+        no_warning(&front, "the countdown");
         let v = sim.snapshot();
         assert_eq!(v.yt_life_cycle.as_deref(), Some("live"));
         assert!(view::went_public_text(v.last_go_public, v.speed).ends_with("at 10×"));
@@ -1282,10 +1299,21 @@ mod tests {
         front.tx.send(Command::PlayCue(0)).await.unwrap();
         wait_for(&front, "the video to play", |s| s.playing == Some(0)).await;
         wait_for(&front, "the video to end", |s| s.playing.is_none() && s.job.is_none()).await;
+        no_warning(&front, "the video");
+        tokio::time::sleep(Duration::from_secs(1)).await; // any pretend mix still settling
+        let v = sim.snapshot();
+        assert_ne!(v.stream_program, decklink, "the stream is back off input 8");
+        assert_eq!(v.input8, Input8Source::Other(cam8), "input 8 is routed back to Cam 8");
+        assert!(!v.in8_audio_on, "input-8 audio is off again");
 
         // 6. End service.
         front.tx.send(Command::EndService).await.unwrap();
         let ended = wait_for(&front, "Ended", |s| s.stage == Stage::Ended && s.job.is_none()).await;
+        no_warning(&front, "End service");
+        tokio::time::sleep(Duration::from_secs(5)).await; // pretend YouTube's last transition
+        let v = sim.snapshot();
+        assert_eq!(v.encoder, streamit_core::devices::EncoderStatus::Idle, "the Web Presenter stopped");
+        assert_eq!(v.yt_life_cycle.as_deref(), Some("complete"), "the broadcast is complete");
         let texts: Vec<&str> = ended.activity.iter().rev().map(|a| a.text.as_str()).collect();
         for want in [
             "Ready for the countdown",
@@ -1313,6 +1341,8 @@ mod tests {
         let snap = wait_for(&front, "a real snapshot", |s| !s.simulation).await;
         assert_eq!(snap.stage, Stage::Idle);
         tokio::time::sleep(Duration::from_secs(30)).await;
-        assert_eq!(real.calls(), vec![], "nothing in the rehearsal touched the real equipment");
+        assert_eq!(real.builds(), 2, "the real equipment was built at startup and again on leaving");
+        assert_eq!(first_real.calls(), vec![], "nothing in the rehearsal touched the first real session");
+        assert_eq!(real.calls(), vec![], "the second real session's startup only read");
     }
 }

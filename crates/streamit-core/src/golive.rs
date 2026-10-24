@@ -242,8 +242,22 @@ pub(crate) async fn cut(sw: &dyn Switcher, input: u16) -> Result<()> {
     sw.auto().await
 }
 
-/// An in-flight go-public; `Ok` holds how long it took.
-type GoPublicTask = JoinHandle<Result<Duration>>;
+/// An in-flight go-public; `Ok` holds how long it took. Dropping it aborts the task, so
+/// a countdown that is itself aborted part-way (a simulated crash) leaves no go-public
+/// retrying on its own. Every normal path settles or aborts it first.
+struct GoPublicTask(JoinHandle<Result<Duration>>);
+
+impl GoPublicTask {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for GoPublicTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 fn joined(r: std::result::Result<Result<Duration>, JoinError>) -> Result<Duration> {
     r.unwrap_or_else(|e| Err(DeviceError::Other(format!("go public task failed: {e}"))))
@@ -251,10 +265,10 @@ fn joined(r: std::result::Result<Result<Duration>, JoinError>) -> Result<Duratio
 
 fn spawn_go_public(d: &Devices, bid: &str) -> GoPublicTask {
     let (d, bid) = (d.clone(), bid.to_string());
-    tokio::spawn(async move {
+    GoPublicTask(tokio::spawn(async move {
         let start = Instant::now();
         go_public(&d, &bid).await.map(|()| start.elapsed())
-    }.in_current_span())
+    }.in_current_span()))
 }
 
 /// The activity line for a go-public that worked after `took`.
@@ -339,7 +353,7 @@ pub async fn countdown(
             },
             res = async {
                 match pub_task.as_mut() {
-                    Some(t) => t.await,
+                    Some(t) => (&mut t.0).await,
                     None => std::future::pending().await,
                 }
             } => {
@@ -420,7 +434,7 @@ async fn settle_go_public(
     report: &impl Fn(CountdownReport),
 ) -> Option<bool> {
     let mut t = task?;
-    match tokio::time::timeout(GO_PUBLIC_WAIT, &mut t).await {
+    match tokio::time::timeout(GO_PUBLIC_WAIT, &mut t.0).await {
         Ok(res) => match joined(res) {
             Ok(took) => {
                 report(CountdownReport::Note(public_note(took)));
@@ -1024,6 +1038,21 @@ mod tests {
         assert_eq!(tail, [Call::PlayerStop, Call::CounterClear, Call::ScreensSetPreview(6), Call::ScreensAuto]);
         assert!(yt_calls(&calls).is_empty());
         assert!(!calls.contains(&Call::StreamAuto));
+    }
+
+    /// A countdown aborted part-way (a simulated crash) takes its go-public with it.
+    #[tokio::test(start_paused = true)]
+    async fn aborted_countdown_aborts_its_go_public() {
+        let (d, log, h) = fake_devices();
+        h.yt.fail_times("transition", 4);
+        h.player.set_duration(Duration::from_secs(5));
+        h.player.set_position(Some(Duration::ZERO));
+        let run = spawn_countdown(&d, &Config::default(), Readiness::Ready, LiveLevels::default());
+        sleep(MS(500)).await;
+        assert_eq!(live_transitions(&log), 1);
+        run.task.abort();
+        sleep(Duration::from_secs(10)).await;
+        assert_eq!(live_transitions(&log), 1, "no go-public retry ran after the abort");
     }
 
     #[tokio::test(start_paused = true)]

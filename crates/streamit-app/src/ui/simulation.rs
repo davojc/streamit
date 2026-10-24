@@ -4,7 +4,7 @@
 //! reads and drives the pretend world through `Front.sim` (`SimControl`); nothing here
 //! goes through the engine except "Crash & restart app" (`Sessions::restart_engine`).
 use super::StreamItApp;
-use crate::session::sim_config;
+use crate::session::Mode;
 use crate::theme::{self, Kind};
 use crate::view;
 use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, Stroke, Ui, vec2};
@@ -68,7 +68,7 @@ fn hint(ui: &mut Ui, text: &str) {
 }
 
 impl StreamItApp {
-    pub(super) fn simulation_tab(&mut self, ui: &mut Ui, snap: &Snapshot, config: &Config) {
+    pub(super) fn simulation_tab(&mut self, ui: &mut Ui, snap: &Snapshot) {
         let Some(sim) = self.sim.borrow().clone() else {
             theme::panel().show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -76,9 +76,12 @@ impl StreamItApp {
             });
             return;
         };
-        // What the simulation runs on: the settings with its simulated defaults.
-        let (effective, _) = sim_config(config);
+        // What the running simulation was built from (its effective config, with any
+        // simulated defaults), not the settings file as edited since.
+        let effective = sim.config().clone();
         let v = sim.snapshot();
+        // A reset under a running sequence would pull its devices out from under it.
+        let reset = view::switch_state(snap, Mode::Simulation);
         self.columns(
             ui,
             ASIDE_W,
@@ -99,9 +102,17 @@ impl StreamItApp {
                     theme::lbl(ui, "Start again");
                     hint(ui, "Puts every pretend device back to before the service.");
                     ui.add_space(4.0);
-                    if theme::button(ui, "Reset simulation", Kind::Plain).clicked() {
+                    let r = theme::button_enabled(ui, reset.enabled, "Reset simulation", Kind::Plain);
+                    let r = match reset.reason {
+                        Some(why) => r.on_disabled_hover_text(why),
+                        None => r,
+                    };
+                    if r.clicked() {
                         info!("simulation: reset");
                         sim.reset();
+                    }
+                    if let Some(why) = reset.reason {
+                        ui.label(RichText::new(why).size(13.0).color(theme::AMBER_SOFT));
                     }
                 });
             },
@@ -115,7 +126,7 @@ impl StreamItApp {
             ui.horizontal(|ui| {
                 theme::lbl(ui, "Stream ATEM · you are the vision mixer");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new("Mix takes 1 s").size(14.0).color(theme::MUTED));
+                    ui.label(RichText::new(view::mix_text(v.speed)).size(14.0).color(theme::MUTED));
                 });
             });
             ui.add_space(6.0);

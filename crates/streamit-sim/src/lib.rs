@@ -159,7 +159,7 @@ impl SimWorld {
             screens: SwitcherState::new(cfg.screens_atem.t0_input, 1),
             fairlight,
             decklink_input: sa.decklink_input,
-            input8_audio_on: true,
+            input8_audio_on: false,
             routes,
             pending_routes: BTreeMap::new(),
             encoder: EncoderStatus::Idle,
@@ -404,6 +404,12 @@ impl SimControl {
 
     pub fn handle(&self) -> &SimHandle {
         &self.sim
+    }
+
+    /// The config the pretend world was built from: the running simulation's effective
+    /// config (with any simulated defaults), not the settings file.
+    pub fn config(&self) -> &Config {
+        &self.cfg
     }
 
     pub fn devices(&self) -> Devices {
@@ -723,7 +729,7 @@ mod tests {
         let v = c.snapshot();
         assert_eq!((v.stream_program, v.stream_preview, v.screens_program), (3010, 1, 6));
         assert_eq!(v.input8, Input8Source::Other(CAM8));
-        assert!(v.in8_audio_on);
+        assert!(!v.in8_audio_on, "input 8 audio starts off, as on the real Stream ATEM between videos");
         assert_eq!(v.mic_levels.len(), cfg().stream_atem.mic_sources.len());
         assert!(v.mic_levels.iter().all(|(_, db)| *db == -3.0));
         assert_eq!(v.encoder, EncoderStatus::Idle);

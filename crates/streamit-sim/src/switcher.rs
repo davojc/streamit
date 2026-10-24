@@ -269,6 +269,8 @@ mod tests {
         a.set_program(3).await.unwrap();
         tokio::time::advance(Duration::from_secs(2)).await;
         assert_eq!(a.program().await.unwrap(), 3);
+        a.set_audio_on(AudioSourceId { input: 8, source: 0 }, true).await.unwrap();
+        assert!(s.lock().input8_audio_on);
         a.set_audio_on(AudioSourceId { input: 8, source: 0 }, false).await.unwrap();
         assert!(!s.lock().input8_audio_on);
     }

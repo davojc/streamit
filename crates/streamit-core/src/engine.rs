@@ -277,6 +277,9 @@ pub struct Engine {
     flash_gen: u64,
     key_flash_gen: u64,
     aux: mpsc::UnboundedSender<Aux>,
+    /// The devices are pretend ones: a sequence still running when the engine stops is
+    /// aborted (simulated crash) rather than left to finish.
+    simulation: bool,
 }
 
 impl Engine {
@@ -318,6 +321,7 @@ impl Engine {
             flash_gen: 0,
             key_flash_gen: 0,
             aux,
+            simulation,
         };
         tokio::spawn(engine.run(rx, aux_rx).in_current_span());
         EngineHandle { tx, rx: srx }
@@ -346,11 +350,17 @@ impl Engine {
                 Wake::Aux(a) => self.apply_aux(a),
             }
         }
-        // A sequence still running stops with the engine, part-way, as it would if the app
-        // stopped (an engine is only stopped mid-sequence by "Crash & restart app").
         if let Some(r) = self.running.take() {
-            warn!(job = r.job.name(), "engine stopping with a sequence running: aborting it");
-            r.handle.abort();
+            if self.simulation {
+                // "Crash & restart app": the sequence stops part-way, as it would if the
+                // app crashed. Its own sub-tasks (the countdown's go-public) stop with it.
+                warn!(job = r.job.name(), "simulated engine stopping with a sequence running: aborting it");
+                r.handle.abort();
+            } else {
+                // v1: a sequence on the real equipment is never cut off part-way; it runs
+                // to the end on its own.
+                warn!(job = r.job.name(), "engine stopping with a sequence running: letting it finish");
+            }
         }
         info!("engine stopped: the command channel closed");
     }
@@ -2432,13 +2442,14 @@ mod tests {
         s.activity.iter().any(|a| a.text == text)
     }
 
-    /// Closing the command channel mid-video (a "crash") aborts the video: its return
-    /// path never runs, and the engine's snapshot closes.
+    /// In simulation, closing the command channel mid-video ("Crash & restart app")
+    /// aborts the video: its return path never runs, and the engine's snapshot closes.
     #[tokio::test(start_paused = true)]
-    async fn stopping_the_engine_aborts_its_running_sequence() {
+    async fn stopping_a_simulated_engine_aborts_its_running_sequence() {
         let (d, log, h) = rig();
         h.player.set_duration(Duration::from_secs(60));
-        let EngineHandle { tx, mut rx } = Engine::spawn(d, cfg(vec![cue("a", Destination::HallOnly)]));
+        let c = cfg(vec![cue("a", Destination::HallOnly)]);
+        let EngineHandle { tx, mut rx } = Engine::spawn_with(d, c, LiveLevels::default(), None, true);
         tx.send(Command::PlayCue(0)).await.unwrap();
         until_call(&log, Call::PlayerPlay).await;
         let before = log.calls().len();
@@ -2448,6 +2459,26 @@ mod tests {
         h.player.emit(PlayerEvent::Ended);
         sleep(Duration::from_secs(30)).await;
         assert_eq!(log.calls().len(), before, "no return path ran: {:?}", &log.calls()[before..]);
+    }
+
+    /// On the real equipment (v1) a sequence is never cut off part-way: when the engine's
+    /// command channel closes mid-video, the video still runs its return path.
+    #[tokio::test(start_paused = true)]
+    async fn stopping_a_real_engine_lets_its_sequence_finish() {
+        let (d, log, h) = rig();
+        h.player.set_duration(Duration::from_secs(60));
+        let EngineHandle { tx, rx } = Engine::spawn(d, cfg(vec![cue("a", Destination::HallOnly)]));
+        tx.send(Command::PlayCue(0)).await.unwrap();
+        until_call(&log, Call::PlayerPlay).await;
+        let before = log.calls().len();
+        drop(tx);
+        sleep(Duration::from_secs(1)).await;
+        h.player.emit(PlayerEvent::Ended);
+        sleep(Duration::from_secs(30)).await;
+        let after = log.calls()[before..].to_vec();
+        // The hall went back (counter cleared, screens cut away from the DeckLink).
+        assert!(after.ends_with(&[Call::CounterClear, Call::ScreensAuto]), "the return path ran: {after:?}");
+        drop(rx);
     }
 
     #[tokio::test(start_paused = true)]

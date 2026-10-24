@@ -519,6 +519,12 @@ pub fn went_public_text(d: Option<Duration>, speed: Speed) -> String {
     }
 }
 
+/// How long a pretend mix takes at `speed` (1 s at 1×).
+pub fn mix_text(speed: Speed) -> String {
+    let secs = 1.0 / speed.factor() as f32;
+    format!("Mix takes {} s at {}×", format!("{secs:.2}").trim_end_matches('0').trim_end_matches('.'), speed.factor())
+}
+
 /// How full the mic bar is: −40 dB (or off) empty, +6 dB full.
 pub fn mic_fraction(db: f32) -> f32 {
     ((db + 40.0) / 46.0).clamp(0.0, 1.0)
@@ -838,6 +844,9 @@ mod tests {
         assert_eq!(went_public_text(Some(Duration::from_secs(3)), Speed::X1), "3.0 s at 1×");
         assert_eq!(went_public_text(Some(Duration::from_millis(300)), Speed::X10), "0.3 s at 10×");
         assert_eq!(went_public_text(None, Speed::X4), "—");
+        assert_eq!(mix_text(Speed::X1), "Mix takes 1 s at 1×");
+        assert_eq!(mix_text(Speed::X4), "Mix takes 0.25 s at 4×");
+        assert_eq!(mix_text(Speed::X10), "Mix takes 0.1 s at 10×");
     }
 
     #[test]
