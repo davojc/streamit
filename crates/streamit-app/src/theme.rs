@@ -418,5 +418,10 @@ pub fn screen_box(ui: &mut Ui, height: f32, text: &str, font: FontId) {
     let w = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(vec2(w, height), Sense::hover());
     ui.painter().rect_filled(rect, 6.0, SCREEN);
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, font, SCREEN_TEXT);
+    // Long text (a long file name) wraps inside the box, centred, and is clipped to it.
+    let mut job = egui::text::LayoutJob::simple(text.to_owned(), font, SCREEN_TEXT, (rect.width() - 24.0).max(1.0));
+    job.halign = egui::Align::Center;
+    let galley = ui.painter().layout_job(job);
+    let top = rect.center().y - galley.size().y / 2.0;
+    ui.painter().with_clip_rect(rect.shrink(4.0)).galley(egui::pos2(rect.center().x, top), galley, SCREEN_TEXT);
 }
