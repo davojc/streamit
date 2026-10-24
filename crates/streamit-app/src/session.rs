@@ -843,6 +843,15 @@ mod tests {
             .with(file_layers(move || r.clone(), move || m.clone()));
         // The test runtime has one thread, so every task logs through this subscriber.
         let _default = tracing::subscriber::set_default(subscriber);
+        // Callsite interest is global, and while only one dispatcher is registered
+        // tracing-core works it out from the *calling thread's* default alone. A callsite
+        // first hit by a parallel test (whose thread has no subscriber) would then be
+        // cached as "never" and this test's events from it lost. A second, do-nothing
+        // dispatcher kept alive makes every registration ask all registered dispatchers
+        // (this one included); then every callsite's interest is recomputed.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        tokio::task::yield_now().await;
+        tracing::callsite::rebuild_interest_cache();
 
         let (s, front, ..) = start_with("simlog", Arc::new(Spy::default()), Arc::new(SimFactory)).await;
         front.tx.send(Command::Refresh).await.unwrap();
