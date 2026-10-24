@@ -146,6 +146,10 @@ pub struct StreamItApp {
     /// The Settings section last picked, and the one to scroll to on the next frame.
     section: Section,
     scroll_to: Option<Section>,
+    /// The Settings sections' scroll position last frame, to notice scrolling.
+    settings_offset: f32,
+    /// When a side-menu item was last clicked (the menu stops following the scroll briefly).
+    settings_jumped: Option<Instant>,
     show_add_ip: bool,
     /// The mode the window title was last set for.
     titled: Option<Mode>,
@@ -240,6 +244,8 @@ impl StreamItApp {
             restart_job: Pending::default(),
             section: Section::default(),
             scroll_to: None,
+            settings_offset: 0.0,
+            settings_jumped: None,
             show_add_ip: false,
             titled: None,
             config,
@@ -698,6 +704,10 @@ impl eframe::App for StreamItApp {
             .frame(egui::Frame::new().fill(theme::GROUND).inner_margin(Margin::symmetric(28, 24)))
             .show(ui, |ui| {
                 let viewport = ui.available_height();
+                // Settings scrolls its sections itself, so its side menu stays in view.
+                if self.tab == Tab::Settings {
+                    return self.settings_tab(ui, &snap);
+                }
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
                     Tab::Service => self.service_tab(ui, &snap, running.as_ref().unwrap_or(&config), &config, viewport),
                     Tab::Videos => self.videos_tab(ui, &snap, &config, running.as_ref()),
