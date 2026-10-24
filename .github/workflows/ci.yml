@@ -1,0 +1,32 @@
+# Checks every change: formatting, lints and the whole test suite, on Windows (the only
+# platform StreamIt runs on). Needs none of GStreamer, NDI or the DeckLink driver.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98
+        with:
+          components: rustfmt, clippy
+      # Caches the registry and the compiled dependencies; only StreamIt's own crates
+      # rebuild when nothing in Cargo.lock changed.
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace

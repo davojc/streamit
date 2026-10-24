@@ -5,6 +5,7 @@
 mod service;
 mod settings;
 mod simulation;
+mod updates;
 mod videos;
 
 use crate::discovery::{BmdKind, DiscoveredDevice};
@@ -179,6 +180,7 @@ pub struct StreamItApp {
     /// The video selected on the Videos tab.
     selected: usize,
     lengths: videos::Lengths,
+    updates: updates::Updates,
 }
 
 impl StreamItApp {
@@ -248,9 +250,11 @@ impl StreamItApp {
             countdown_pick_job: Pending::default(),
             selected: 0,
             lengths: videos::Lengths::default(),
+            updates: updates::Updates::default(),
         };
         app.load_broadcasts();
         app.scan();
+        app.check_for_update();
         app
     }
 
@@ -291,6 +295,7 @@ impl StreamItApp {
     fn poll_jobs(&mut self) {
         Self::take_switch_result(&mut self.switch_job, &mut self.notice);
         Self::take_switch_result(&mut self.restart_job, &mut self.notice);
+        self.poll_updates();
         if let Some(r) = self.broadcasts_job.take() {
             match r {
                 Ok(list) => {
@@ -469,7 +474,6 @@ impl StreamItApp {
             self.notice = Some(format!("Could not save the countdown video: {e:#}"));
         }
     }
-
 }
 
 impl StreamItApp {
@@ -622,6 +626,14 @@ impl StreamItApp {
                 for &(tab, name) in tabs {
                     if theme::tab(ui, name, self.tab == tab, tab == Tab::Simulation).clicked() {
                         self.tab = tab;
+                    }
+                }
+                if let Some(hint) = updates::header_hint(&self.updates.state) {
+                    ui.add_space(12.0);
+                    if theme::sized_button(ui, hint, theme::Kind::Primary, 36.0, 14.0, true).clicked() {
+                        self.tab = Tab::Settings;
+                        self.section = Section::Updates;
+                        self.scroll_to = Some(Section::Updates);
                     }
                 }
                 if summary {

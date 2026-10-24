@@ -3,8 +3,10 @@
 //!
 //! Startup never changes a device: the network clients only connect and listen (they
 //! reconnect by themselves), and the playout objects only initialise.
+use crate::logged::Logged;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -12,15 +14,13 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use streamit_core::config::{AudioSourceId, Config};
 use streamit_core::devices::{
-    self, BroadcastCheck, BroadcastSummary, Broadcasts, Counter, DeviceError, Devices, Encoder,
-    EncoderStatus, Fix, Health, Phase, Player, PlayerEvent, Router, StreamSwitcher, Switcher,
+    self, BroadcastCheck, BroadcastSummary, Broadcasts, Counter, DeviceError, Devices, Encoder, EncoderStatus, Fix,
+    Health, Phase, Player, PlayerEvent, Router, StreamSwitcher, Switcher,
 };
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
 use streamit_core::golive::Stage;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle};
-use crate::logged::Logged;
-use std::collections::BTreeSet;
 use tracing::{Instrument, info, warn};
 
 /// How often every device is polled.
@@ -481,8 +481,7 @@ async fn playout(c: &Config) -> (Arc<Late<dyn Player>>, Arc<Late<dyn Counter>>, 
     let counter: Arc<Late<dyn Counter>> = Late::new("NDI counter starting");
     let pc = c.playout.clone();
     let p = keep_building(player.clone(), "DeckLink player", move || {
-        streamit_playout::GstPlayer::new(&pc, streamit_playout::SinkKind::DeckLink)
-            .map(|p| p as Arc<dyn Player>)
+        streamit_playout::GstPlayer::new(&pc, streamit_playout::SinkKind::DeckLink).map(|p| p as Arc<dyn Player>)
     });
     let nc = c.ndi.clone();
     let n = keep_building(counter.clone(), "NDI counter", move || {
@@ -614,38 +613,41 @@ pub fn spawn_health_poll(
     let mut ever_ok: BTreeSet<DeviceKind> =
         seed.iter().filter(|(_, h)| *h == DeviceHealth::Ok).map(|(k, _)| *k).collect();
     // Runs in the caller's span, so a simulation's polls log to the simulation log.
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(POLL_EVERY).await;
-            let out = config.read().unwrap_or_else(|e| e.into_inner()).videohub.input8_output;
-            let mut came_up = Vec::new();
-            for (kind, h) in tracker.changes(&probes.poll(out).await) {
-                log_health(kind, &h);
-                if h == DeviceHealth::Ok && NETWORK.contains(&kind) && ever_ok.insert(kind) {
-                    came_up.push(kind);
-                }
-                if tx.send(Command::DeviceHealth(kind, h)).await.is_err() {
-                    return;
-                }
-            }
-            if !came_up.is_empty() {
-                // R20: only while nothing has started; mid-service the engine's stage
-                // stands, and the device stays marked so it never triggers later.
-                let idle = {
-                    let s = snap.borrow();
-                    s.stage == Stage::Idle && s.job.is_none()
-                };
-                if idle {
-                    info!(devices = ?came_up, "first contact after startup: reassessing");
-                    if tx.send(Command::Refresh).await.is_err() {
+    tokio::spawn(
+        async move {
+            loop {
+                tokio::time::sleep(POLL_EVERY).await;
+                let out = config.read().unwrap_or_else(|e| e.into_inner()).videohub.input8_output;
+                let mut came_up = Vec::new();
+                for (kind, h) in tracker.changes(&probes.poll(out).await) {
+                    log_health(kind, &h);
+                    if h == DeviceHealth::Ok && NETWORK.contains(&kind) && ever_ok.insert(kind) {
+                        came_up.push(kind);
+                    }
+                    if tx.send(Command::DeviceHealth(kind, h)).await.is_err() {
                         return;
                     }
-                } else {
-                    info!(devices = ?came_up, "first contact during a service: not reassessing");
+                }
+                if !came_up.is_empty() {
+                    // R20: only while nothing has started; mid-service the engine's stage
+                    // stands, and the device stays marked so it never triggers later.
+                    let idle = {
+                        let s = snap.borrow();
+                        s.stage == Stage::Idle && s.job.is_none()
+                    };
+                    if idle {
+                        info!(devices = ?came_up, "first contact after startup: reassessing");
+                        if tx.send(Command::Refresh).await.is_err() {
+                            return;
+                        }
+                    } else {
+                        info!(devices = ?came_up, "first contact during a service: not reassessing");
+                    }
                 }
             }
         }
-    }.in_current_span())
+        .in_current_span(),
+    )
 }
 
 #[cfg(test)]
@@ -660,11 +662,9 @@ mod tests {
             health_of::<()>(&Err(DeviceError::Disconnected("gone".into()))),
             DeviceHealth::Down("disconnected: gone".into())
         );
-        for e in [
-            DeviceError::Refused("no".into()),
-            DeviceError::Timeout("slow".into()),
-            DeviceError::Other("odd".into()),
-        ] {
+        for e in
+            [DeviceError::Refused("no".into()), DeviceError::Timeout("slow".into()), DeviceError::Other("odd".into())]
+        {
             let text = e.to_string();
             assert_eq!(health_of::<()>(&Err(e)), DeviceHealth::Warning(text));
         }
@@ -676,15 +676,9 @@ mod tests {
         let a = vec![(DeviceKind::VideoHub, DeviceHealth::Ok), (DeviceKind::YouTube, DeviceHealth::Ok)];
         assert_eq!(t.changes(&a), a);
         assert_eq!(t.changes(&a), vec![]);
-        let b = vec![
-            (DeviceKind::VideoHub, DeviceHealth::Down("x".into())),
-            (DeviceKind::YouTube, DeviceHealth::Ok),
-        ];
+        let b = vec![(DeviceKind::VideoHub, DeviceHealth::Down("x".into())), (DeviceKind::YouTube, DeviceHealth::Ok)];
         assert_eq!(t.changes(&b), vec![(DeviceKind::VideoHub, DeviceHealth::Down("x".into()))]);
-        let c = vec![
-            (DeviceKind::VideoHub, DeviceHealth::Down("y".into())),
-            (DeviceKind::YouTube, DeviceHealth::Ok),
-        ];
+        let c = vec![(DeviceKind::VideoHub, DeviceHealth::Down("y".into())), (DeviceKind::YouTube, DeviceHealth::Ok)];
         assert_eq!(t.changes(&c), vec![(DeviceKind::VideoHub, DeviceHealth::Down("y".into()))]);
     }
 

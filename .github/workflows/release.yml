@@ -1,0 +1,102 @@
+# Builds the two Windows exes and, for a version tag, publishes them as a GitHub release
+# (StreamIt's Settings › Updates installs from the latest release):
+#   streamit-windows-x64-playout.exe  with GStreamer (DeckLink playout, NDI counter): the playout PC
+#   streamit-windows-x64.exe          without GStreamer: any other PC
+# To release: set the version in Cargo.toml, commit, then push a tag `v<version>`.
+# A pull request that changes this file builds both exes without publishing anything.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: [".github/workflows/release.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Built against 1.26; the playout PC needs a GStreamer 1.24+ runtime.
+  GST_VERSION: "1.26.7"
+  GST_ROOT: 'C:\Program Files\gstreamer\1.0\msvc_x86_64'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the version
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $v = ($meta.packages | Where-Object name -eq 'streamit-app').version
+          if ("v$v" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match the version $v in Cargo.toml"
+          }
+
+      - uses: dtolnay/rust-toolchain@1.98
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+
+      - name: Cache the GStreamer installers
+        id: gst-cache
+        uses: actions/cache@v4
+        with:
+          path: gst-msi
+          key: gst-msi-${{ env.GST_VERSION }}
+
+      - name: Download GStreamer
+        if: steps.gst-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force gst-msi | Out-Null
+          $base = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GST_VERSION/msvc"
+          foreach ($f in "gstreamer-1.0-msvc-x86_64-$env:GST_VERSION.msi", "gstreamer-1.0-devel-msvc-x86_64-$env:GST_VERSION.msi") {
+            Invoke-WebRequest "$base/$f" -OutFile "gst-msi/$f"
+          }
+
+      - name: Install GStreamer
+        shell: pwsh
+        run: |
+          foreach ($msi in Get-ChildItem gst-msi/*.msi) {
+            $p = Start-Process msiexec -ArgumentList '/i', "`"$($msi.FullName)`"", '/qn', 'ADDLOCAL=ALL' -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "$($msi.Name) failed to install ($($p.ExitCode))" }
+          }
+          if (-not (Test-Path "$env:GST_ROOT\lib\pkgconfig\gstreamer-1.0.pc")) { throw "GStreamer is not in $env:GST_ROOT" }
+          "$env:GST_ROOT\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          "PKG_CONFIG_PATH=$env:GST_ROOT\lib\pkgconfig" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          if (Test-Path "$env:GST_ROOT\bin\pkg-config.exe") {
+            "PKG_CONFIG=$env:GST_ROOT\bin\pkg-config.exe" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          } else {
+            choco install pkgconfiglite -y --no-progress
+            "PKG_CONFIG=C:\ProgramData\chocolatey\bin\pkg-config.exe" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          cargo build -p streamit-app --release --locked
+          Copy-Item target/release/streamit.exe dist/streamit-windows-x64.exe
+          cargo build -p streamit-app --release --locked --features gst
+          Copy-Item target/release/streamit.exe dist/streamit-windows-x64-playout.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: streamit-windows-x64
+          path: dist/*.exe
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/streamit-windows-x64-playout.exe dist/streamit-windows-x64.exe `
+            --title "StreamIt ${{ github.ref_name }}" --generate-notes

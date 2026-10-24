@@ -1,12 +1,13 @@
 //! Screen 6: the Settings tab. A section list on the left; Equipment (the devices found
 //! on the network and their jobs, the restart note and the Simulation card), Inputs &
-//! routing, Timings & audio, YouTube, and Playout & NDI counter on the right; Save and
+//! routing, Timings & audio, YouTube, Playout & NDI counter, and Updates on the right; Save and
 //! Discard changes at the bottom.
 //!
 //! Every edit goes to the draft until Save. Save writes the shared config and the file
 //! (never when the file is not `writable`); timings and inputs apply at once, device
 //! settings when StreamIt restarts (R19). While simulating, Save still writes the real
 //! settings: the simulation's own copy is rebuilt from them the next time it is opened.
+use super::updates::UpdateAction;
 use super::{Pending, SimTip, StreamItApp};
 use crate::discovery::{self, BmdKind, DiscoveredDevice};
 use crate::session::{Mode, SwitchRefused};
@@ -40,14 +41,16 @@ pub(super) enum Section {
     Timings,
     YouTube,
     Playout,
+    Updates,
 }
 
-const SECTIONS: [(Section, &str); 5] = [
+const SECTIONS: [(Section, &str); 6] = [
     (Section::Equipment, "Equipment"),
     (Section::Routing, "Inputs & routing"),
     (Section::Timings, "Timings & audio"),
     (Section::YouTube, "YouTube"),
     (Section::Playout, "Playout & NDI counter"),
+    (Section::Updates, "Updates"),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -309,6 +312,7 @@ impl StreamItApp {
         section(ui, target == Some(Section::Timings), |ui| self.timings(ui));
         section(ui, target == Some(Section::YouTube), |ui| self.youtube(ui, simulating));
         section(ui, target == Some(Section::Playout), |ui| self.playout(ui));
+        section(ui, target == Some(Section::Updates), |ui| self.updates_section(ui, snap));
         self.save_bar(ui);
     }
 
@@ -558,6 +562,36 @@ impl StreamItApp {
             warn!("{e}");
             *notice = Some(e.0);
         }
+    }
+
+    // ---- Updates
+
+    fn updates_section(&mut self, ui: &mut Ui, snap: &Snapshot) {
+        heading(ui, "Updates");
+        sub(ui, &format!("New versions come from {}.", crate::update::RELEASES_PAGE));
+        ui.add_space(12.0);
+        let card = super::updates::update_card(&self.updates.state, snap);
+        ui.add(egui::Label::new(RichText::new(&card.text).size(16.0)).wrap());
+        ui.add_space(10.0);
+        let Some(action) = card.action else {
+            ui.spinner();
+            return;
+        };
+        let (label, kind) = match action {
+            UpdateAction::Check => ("Check now", Kind::Plain),
+            UpdateAction::Install => ("Install update", Kind::Primary),
+            UpdateAction::Restart => ("Restart StreamIt", Kind::Primary),
+        };
+        ui.horizontal(|ui| {
+            let r = theme::button_enabled(ui, !card.blocked, label, kind);
+            let r = if card.blocked { r.on_disabled_hover_text(crate::session::REFUSED) } else { r };
+            if r.clicked() {
+                self.update_action(action, snap);
+            }
+            if card.blocked {
+                amber_note(ui, crate::session::REFUSED);
+            }
+        });
     }
 
     // ---- Inputs & routing

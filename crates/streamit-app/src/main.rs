@@ -21,15 +21,16 @@ mod probe;
 mod session;
 mod theme;
 mod ui;
+mod update;
 mod view;
 mod wiring;
 
 use anyhow::anyhow;
+use session::{Paths, RealFactory, Sessions, SimFactory};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use session::{Paths, RealFactory, Sessions, SimFactory};
 use streamit_core::config::{Config, config_path};
 use streamit_core::engine::EngineHandle;
 use streamit_deck::DeckSurface;
@@ -86,19 +87,11 @@ fn run_app() -> anyhow::Result<()> {
     info!(path = %path.display(), writable, "config loaded");
     let shared = Arc::new(RwLock::new(config.clone()));
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_name("streamit-rt")
-        .build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("streamit-rt").build()?;
     // Always real mode first: the normal read-only startup.
     let (sessions, front) = rt.block_on(async {
-        let (sessions, front) = Sessions::start(
-            Arc::new(RealFactory),
-            Arc::new(SimFactory),
-            shared.clone(),
-            Paths::beside(&path),
-        )
-        .await;
+        let (sessions, front) =
+            Sessions::start(Arc::new(RealFactory), Arc::new(SimFactory), shared.clone(), Paths::beside(&path)).await;
         // The deck holds the front, so it keeps working across a mode switch.
         DeckSurface::run(EngineHandle { tx: front.tx.clone(), rx: front.rx.clone() });
         (Arc::new(sessions), front)

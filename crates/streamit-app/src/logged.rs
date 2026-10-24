@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use streamit_core::config::AudioSourceId;
 use streamit_core::devices::{
-    BroadcastCheck, BroadcastSummary, Broadcasts, Counter, Encoder, EncoderStatus, Fix, Health, Phase,
-    Player, PlayerEvent, Result, Router, StreamSwitcher, Switcher,
+    BroadcastCheck, BroadcastSummary, Broadcasts, Counter, Encoder, EncoderStatus, Fix, Health, Phase, Player,
+    PlayerEvent, Result, Router, StreamSwitcher, Switcher,
 };
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -226,7 +226,8 @@ mod tests {
         yt.transition("b1", Phase::Live).await.unwrap();
 
         let text = cap.text();
-        let line = |needle: &str| text.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle} in {text}"));
+        let line =
+            |needle: &str| text.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle} in {text}"));
         assert!(line("route(3, 5)").contains("INFO"), "{text}");
         assert!(line("route(3, 5)").contains("VideoHub"), "{text}");
         assert!(line("route(4, 6)").contains("WARN"), "{text}");
@@ -251,7 +252,8 @@ mod tests {
         counter.clear().await.unwrap();
 
         let text = cap.text();
-        let line = |needle: &str| text.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle} in {text}"));
+        let line =
+            |needle: &str| text.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle} in {text}"));
         assert!(line("show(41s)").contains("DEBUG"), "{text}");
         assert!(line("show(40s)").contains("WARN"), "{text}");
         assert!(line("clear()").contains("INFO"), "{text}");
