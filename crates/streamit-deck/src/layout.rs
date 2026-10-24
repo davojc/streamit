@@ -124,8 +124,10 @@ const UNMUTE: u8 = 23;
 const FIRST_PRESET: u8 = 8;
 const MV_KEYS: [u8; 4] = [19, 20, 27, 28];
 const FIRST_ATEM_INPUT: u8 = 16;
-/// An ATEM input that is not on program or preview.
-const INPUT_BG: Rgb = Rgb(42, 53, 80);
+/// An ATEM input that is not on program or preview, in a dark shade of its ATEM's colour
+/// (violet for the Stream ATEM, cyan for the Screens ATEM, as in the window).
+const STREAM_INPUT_BG: Rgb = Rgb(76, 52, 140);
+const SCREENS_INPUT_BG: Rgb = Rgb(14, 102, 120);
 /// Each view's colour, as in the window.
 pub const VIEW_COLOURS: [Rgb; 4] = [Rgb(76, 154, 255), Rgb(245, 165, 36), Rgb(61, 214, 140), Rgb(232, 121, 201)];
 const NAV: Rgb = Rgb(59, 42, 107);
@@ -515,7 +517,7 @@ fn atem_input_look(
     } else if state.on_preview(i) {
         look(text, GREEN, WHITE)
     } else {
-        look(text, INPUT_BG, WHITE)
+        look(text, if t == Target::StreamAtem { STREAM_INPUT_BG } else { SCREENS_INPUT_BG }, WHITE)
     }
 }
 
@@ -933,7 +935,8 @@ mod tests {
         let l = appearance(page, 17, &s, true);
         assert_eq!((l.text.as_str(), l.bg), ("IN 2\nCAM 2", RED), "input 2 is on program");
         assert_eq!(appearance(page, 18, &s, true).bg, GREEN, "input 3 is on preview");
-        assert_eq!(appearance(page, 16, &s, true).bg, INPUT_BG);
+        assert_eq!(appearance(page, 16, &s, true).bg, STREAM_INPUT_BG);
+        assert_ne!(STREAM_INPUT_BG, SCREENS_INPUT_BG);
         assert_eq!(appearance(page, 20, &s, true).text, "IN 5\n—", "not fed by the router");
         assert_eq!(appearance(page, 23, &s, true).text, "IN 8\nINPUT 13");
         s.job = Some("a video");

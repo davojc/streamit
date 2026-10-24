@@ -20,8 +20,10 @@ pub(super) const VIEW_COLOURS: [Color32; 4] = [
     Color32::from_rgb(61, 214, 140),
     Color32::from_rgb(232, 121, 201),
 ];
-/// An ATEM input's colour on its tile and badges.
-const ATEM_COLOUR: Color32 = Color32::from_rgb(143, 168, 255);
+/// Each ATEM's colour on its tiles, badges and preset chips: violet for the Stream ATEM,
+/// cyan for the Screens ATEM, apart from each other and from the MultiView's four.
+pub(super) const STREAM_ATEM_COLOUR: Color32 = Color32::from_rgb(167, 139, 250);
+pub(super) const SCREENS_ATEM_COLOUR: Color32 = Color32::from_rgb(34, 211, 238);
 /// How many inputs to list before the VideoHub has said.
 const DEFAULT_INPUTS: u16 = 40;
 const COL_W: f32 = 230.0;
@@ -89,7 +91,11 @@ pub(super) fn dests_on(t: &TargetState, input: u16) -> Vec<usize> {
 }
 
 fn colour(target: Target, i: usize) -> Color32 {
-    if target == Target::MultiView { VIEW_COLOURS[i % VIEW_COLOURS.len()] } else { ATEM_COLOUR }
+    match target {
+        Target::MultiView => VIEW_COLOURS[i % VIEW_COLOURS.len()],
+        Target::StreamAtem => STREAM_ATEM_COLOUR,
+        Target::ScreensAtem => SCREENS_ATEM_COLOUR,
+    }
 }
 
 /// What the hall or the stream sees, for the on-air question.
@@ -675,7 +681,12 @@ mod tests {
     #[test]
     fn colours_follow_the_target() {
         assert_eq!(colour(Target::MultiView, 2), VIEW_COLOURS[2]);
-        assert_eq!(colour(Target::StreamAtem, 2), ATEM_COLOUR);
+        assert_eq!(colour(Target::StreamAtem, 2), STREAM_ATEM_COLOUR);
+        assert_eq!(colour(Target::ScreensAtem, 2), SCREENS_ATEM_COLOUR);
+        let all = [VIEW_COLOURS.to_vec(), vec![STREAM_ATEM_COLOUR, SCREENS_ATEM_COLOUR]].concat();
+        for (i, a) in all.iter().enumerate() {
+            assert!(all[i + 1..].iter().all(|b| b != a), "every routing colour is different");
+        }
         assert_eq!(audience(Target::StreamAtem), "the stream shows");
         assert_eq!(audience(Target::ScreensAtem), "the hall sees");
     }
