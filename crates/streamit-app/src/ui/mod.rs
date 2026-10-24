@@ -2,6 +2,7 @@
 //! banner, and the tabs: Service (`service/`), Videos (`videos.rs`), Settings
 //! (`settings.rs`) and, in simulation only, Simulation (`simulation.rs`). Every press
 //! becomes the same `Command` the Stream Deck would send.
+mod profiles;
 mod routing;
 mod service;
 mod settings;
@@ -134,6 +135,9 @@ pub struct StreamItApp {
     /// The current session's YouTube (real or pretend); the broadcast list reloads when
     /// it changes.
     yt: watch::Receiver<Arc<dyn Broadcasts>>,
+    /// The current session's devices, for profile backups.
+    devices: watch::Receiver<Option<streamit_core::devices::Devices>>,
+    profiles: profiles::ProfilesUi,
     mode: watch::Receiver<Mode>,
     /// True while one session is being stopped and the next opened.
     switching: watch::Receiver<bool>,
@@ -238,6 +242,8 @@ impl StreamItApp {
             tx: s.tx,
             snap: s.rx,
             yt: s.yt,
+            devices: s.devices,
+            profiles: profiles::ProfilesUi::new(&file.path),
             mode: s.mode,
             switching: s.switching,
             sim: s.sim,
@@ -340,6 +346,7 @@ impl StreamItApp {
         Self::take_switch_result(&mut self.switch_job, &mut self.notice);
         Self::take_switch_result(&mut self.restart_job, &mut self.notice);
         self.poll_updates();
+        self.poll_profiles();
         if let Some(r) = self.broadcasts_job.take() {
             match r {
                 Ok(list) => {
@@ -701,6 +708,7 @@ impl eframe::App for StreamItApp {
         self.sync_cues(&snap);
         self.close_guard(ui, &snap);
         self.end_guard(ui.ctx(), &snap);
+        self.profile_dialogs(ui.ctx());
         self.follow_mode(&ui.ctx().clone());
         // Keep the timers, the countdown and device colours current.
         ui.ctx().request_repaint_after(Duration::from_millis(100));
@@ -783,6 +791,9 @@ impl StreamItApp {
                 theme::switching_badge(ui);
             } else {
                 theme::badge(ui, &h);
+            }
+            if let Some(p) = self.profiles.current() {
+                ui.label(RichText::new(format!("Profile · {p}")).size(14.0).color(theme::SOFT));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;

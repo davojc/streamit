@@ -18,6 +18,7 @@ mod discovery;
 mod logged;
 mod logging;
 mod probe;
+mod profiles;
 mod session;
 mod theme;
 mod ui;

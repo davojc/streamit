@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 use streamit_core::devices::{DeviceError, LabelKind, Router};
-use streamit_videohub::{Timings, VideoHub, format_label, format_route, parse_blocks};
+use streamit_videohub::{Timings, VideoHub, format_label, format_labels, format_route, format_routes, parse_blocks};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -327,4 +327,40 @@ async fn output_labels_are_read_and_labels_can_be_renamed() {
     assert!(hub.set_label(LabelKind::Output, 11, "Something else").await.is_err());
     let _s = refuse.await.unwrap();
     assert_eq!(hub.output_labels().await.unwrap()[10], "Stream ATEM 8");
+}
+
+#[test]
+fn many_labels_and_routes_go_as_one_block() {
+    let labels = vec![(1, "Cam 1".to_string()), (12, "Lectern".to_string())];
+    assert_eq!(format_labels(LabelKind::Input, &labels), "INPUT LABELS:\n0 Cam 1\n11 Lectern\n\n");
+    assert_eq!(format_routes(&[(11, 13), (37, 6)]), "VIDEO OUTPUT ROUTING:\n10 12\n36 5\n\n");
+}
+
+#[tokio::test]
+async fn routing_table_lists_every_output() {
+    let (l, addr) = fake().await;
+    let hub = VideoHub::connect_with(addr, fast()).await.unwrap();
+    let _s = accept_with_dump(&l).await;
+    wait_route(&hub, 11, 13).await;
+    let table = hub.routing_table().await.unwrap();
+    assert_eq!(table.len(), 11, "up to the highest output the dump routed");
+    assert_eq!(table[0], 1);
+    assert_eq!(table[10], 13);
+    assert_eq!(table[5], 0, "not in the dump");
+}
+
+#[tokio::test]
+async fn route_many_sends_one_block_and_waits_for_its_ack() {
+    let (l, addr) = fake().await;
+    let hub = VideoHub::connect_with(addr, fast()).await.unwrap();
+    let mut s = accept_with_dump(&l).await;
+    wait_route(&hub, 11, 13).await;
+    let peer = tokio::spawn(async move {
+        let msg = read_msg(&mut s).await;
+        s.write_all(b"ACK\n\n").await.unwrap();
+        (msg, s)
+    });
+    hub.route_many(&[(2, 3), (4, 5)]).await.unwrap();
+    let (msg, _s) = peer.await.unwrap();
+    assert_eq!(msg, "VIDEO OUTPUT ROUTING:\n1 2\n3 4\n\n");
 }

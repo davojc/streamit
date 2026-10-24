@@ -41,6 +41,31 @@ pub fn format_label(kind: LabelKind, n: u16, text: &str) -> String {
     format!("{block}:\n{} {}\n\n", n.saturating_sub(1), text.trim())
 }
 
+/// Many label changes as one block (the VideoHub ACKs a block once).
+pub fn format_labels(kind: LabelKind, labels: &[(u16, String)]) -> String {
+    let block = match kind {
+        LabelKind::Input => INPUT_LABELS,
+        LabelKind::Output => OUTPUT_LABELS,
+    };
+    let mut s = format!("{block}:\n");
+    for (n, text) in labels {
+        let text = text.replace(['\r', '\n'], " ");
+        s.push_str(&format!("{} {}\n", n.saturating_sub(1), text.trim()));
+    }
+    s.push('\n');
+    s
+}
+
+/// Many routes as one block: (output, input), 1-based.
+pub fn format_routes(routes: &[(u16, u16)]) -> String {
+    let mut s = format!("{ROUTING}:\n");
+    for &(o, i) in routes {
+        s.push_str(&format!("{} {}\n", o.saturating_sub(1), i.saturating_sub(1)));
+    }
+    s.push('\n');
+    s
+}
+
 pub struct VideoHub {
     /// 1-based output -> 1-based input.
     table: Arc<Mutex<HashMap<u16, u16>>>,
@@ -146,6 +171,36 @@ impl Router for VideoHub {
         let text = text.replace(['\r', '\n'], " ").trim().to_string();
         self.labels.lock().unwrap_or_else(|e| e.into_inner()).map(kind).insert(n, text);
         Ok(())
+    }
+
+    async fn routing_table(&self) -> Result<Vec<u16>> {
+        self.link.ensure_usable()?;
+        let t = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        let count = t.keys().copied().max().unwrap_or(0);
+        Ok((1..=count).map(|o| t.get(&o).copied().unwrap_or(0)).collect())
+    }
+
+    async fn set_labels(&self, kind: LabelKind, labels: &[(u16, String)]) -> Result<()> {
+        if labels.is_empty() {
+            return Ok(());
+        }
+        let what = format!("{} {kind:?} labels", labels.len()).to_lowercase();
+        self.link.command(format_labels(kind, labels), &what).await?;
+        let mut l = self.labels.lock().unwrap_or_else(|e| e.into_inner());
+        for (n, text) in labels {
+            l.map(kind).insert(*n, text.replace(['\r', '\n'], " ").trim().to_string());
+        }
+        Ok(())
+    }
+
+    async fn route_many(&self, routes: &[(u16, u16)]) -> Result<()> {
+        if routes.is_empty() {
+            return Ok(());
+        }
+        if routes.iter().any(|&(o, i)| o == 0 || i == 0) {
+            return Err(DeviceError::Other("outputs and inputs are numbered from 1".into()));
+        }
+        self.link.command(format_routes(routes), &format!("{} routes", routes.len())).await
     }
 }
 

@@ -38,8 +38,38 @@ pub fn parse_status(b: &Block) -> Option<EncoderStatus> {
     })
 }
 
+const STREAM_SETTINGS: &str = "STREAM SETTINGS";
+
+/// A streaming setting StreamIt never keeps or sends: the stream key (anyone with it can
+/// stream to the channel), and the lists of choices the device offers.
+pub fn is_private_or_list(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    n == "key" || n.contains("stream key") || n.starts_with("available")
+}
+
+/// The settings in a `STREAM SETTINGS` block, without the key or lists.
+pub fn parse_stream_settings(b: &Block) -> Vec<(String, String)> {
+    b.lines
+        .iter()
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .filter(|(k, _)| !is_private_or_list(k))
+        .collect()
+}
+
+/// The wire form of putting streaming settings back. The key is never sent.
+pub fn format_stream_settings(settings: &[(String, String)]) -> String {
+    let mut s = format!("{STREAM_SETTINGS}:\n");
+    for (k, v) in settings.iter().filter(|(k, _)| !is_private_or_list(k)) {
+        s.push_str(&format!("{}: {}\n", k.trim(), v.replace(['\r', '\n'], " ").trim()));
+    }
+    s.push('\n');
+    s
+}
+
 pub struct WebPresenter {
     status: Arc<Mutex<Option<EncoderStatus>>>,
+    settings: Arc<Mutex<Vec<(String, String)>>>,
     link: Link,
 }
 
@@ -52,19 +82,31 @@ impl WebPresenter {
 
     pub async fn connect_with(addr: SocketAddr, timings: Timings) -> Result<Arc<WebPresenter>> {
         let status: Arc<Mutex<Option<EncoderStatus>>> = Arc::default();
-        let s = status.clone();
+        let settings: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let (s, set) = (status.clone(), settings.clone());
         let on_block: OnBlock = Arc::new(move |b: &Block| {
             if let Some(st) = parse_status(b) {
                 *s.lock().unwrap_or_else(|e| e.into_inner()) = Some(st);
             }
+            if b.name == STREAM_SETTINGS {
+                // The device sends what changed: merge it into what we have.
+                let mut have = set.lock().unwrap_or_else(|e| e.into_inner());
+                for (k, v) in parse_stream_settings(b) {
+                    match have.iter_mut().find(|(hk, _)| *hk == k) {
+                        Some(slot) => slot.1 = v,
+                        None => have.push((k, v)),
+                    }
+                }
+            }
         });
-        let s = status.clone();
+        let (s, set) = (status.clone(), settings.clone());
         let on_reset: OnReset = Arc::new(move || {
             *s.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            set.lock().unwrap_or_else(|e| e.into_inner()).clear();
         });
         // Synced once the first STREAM STATE block has arrived.
         let link = Link::spawn("webpresenter", STREAM_STATE, addr, timings, on_block, on_reset);
-        Ok(Arc::new(WebPresenter { status, link }))
+        Ok(Arc::new(WebPresenter { status, settings, link }))
     }
 }
 
@@ -83,5 +125,18 @@ impl Encoder for WebPresenter {
         let st = self.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
         // Synced means a STREAM STATE block arrived, but it may have lacked a Status line.
         Ok(st.unwrap_or_else(|| EncoderStatus::Unknown("no status reported".into())))
+    }
+
+    async fn stream_settings(&self) -> Result<Vec<(String, String)>> {
+        self.link.ensure_usable()?;
+        Ok(self.settings.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    }
+
+    async fn set_stream_settings(&self, settings: &[(String, String)]) -> Result<()> {
+        let keep: Vec<(String, String)> = settings.iter().filter(|(k, _)| !is_private_or_list(k)).cloned().collect();
+        if keep.is_empty() {
+            return Ok(());
+        }
+        self.link.command(format_stream_settings(&keep), "stream settings").await
     }
 }

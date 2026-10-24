@@ -37,6 +37,7 @@ const FIELD_H: f32 = 40.0;
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(super) enum Section {
     #[default]
+    Profiles,
     Equipment,
     Routing,
     Timings,
@@ -45,7 +46,8 @@ pub(super) enum Section {
     Updates,
 }
 
-const SECTIONS: [(Section, &str); 6] = [
+const SECTIONS: [(Section, &str); 7] = [
+    (Section::Profiles, "Profiles"),
     (Section::Equipment, "Equipment"),
     (Section::Routing, "Inputs & routing"),
     (Section::Timings, "Timings & audio"),
@@ -358,6 +360,7 @@ impl StreamItApp {
         }
         let mut tops = Vec::with_capacity(SECTIONS.len());
         let mut add = |s: Section, r: egui::Rect| tops.push((s, r.top()));
+        add(Section::Profiles, section(ui, target == Some(Section::Profiles), |ui| self.profiles_section(ui, snap)));
         add(
             Section::Equipment,
             section(ui, target == Some(Section::Equipment), |ui| self.equipment(ui, snap, simulating)),

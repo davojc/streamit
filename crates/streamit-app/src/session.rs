@@ -224,6 +224,8 @@ pub struct Front {
     pub sim_defaults: watch::Receiver<Vec<&'static str>>,
     /// The current session's YouTube, for the window's broadcast list.
     pub yt: watch::Receiver<Arc<dyn Broadcasts>>,
+    /// The current session's devices, for profile backups; `None` while switching.
+    pub devices: watch::Receiver<Option<Devices>>,
     /// True while one session is being stopped and the next opened.
     pub switching: watch::Receiver<bool>,
 }
@@ -246,6 +248,7 @@ struct Outputs {
     sim: watch::Sender<Option<SimControl>>,
     sim_defaults: watch::Sender<Vec<&'static str>>,
     yt: watch::Sender<Arc<dyn Broadcasts>>,
+    devices: watch::Sender<Option<Devices>>,
     switching: watch::Sender<bool>,
 }
 
@@ -325,10 +328,11 @@ impl Sessions {
         let (sim_tx, sim_rx) = watch::channel(None);
         let (defaults, defaults_rx) = watch::channel(Vec::new());
         let (yt, yt_rx) = watch::channel(Absent::new("starting") as Arc<dyn Broadcasts>);
+        let (devices, devices_rx) = watch::channel(None);
         let (switching, switching_rx) = watch::channel(false);
         let inflight = Arc::new(AtomicUsize::new(0));
         spawn_router(front_rx, target_rx, inflight.clone());
-        let out = Outputs { target, inflight, snap, mode, sim: sim_tx, sim_defaults: defaults, yt, switching };
+        let out = Outputs { target, inflight, snap, mode, sim: sim_tx, sim_defaults: defaults, yt, devices, switching };
         let inner = Arc::new(Inner { real, sim, config, paths, out });
         let first = Inner::open(inner.clone(), Mode::Real).await;
         let sessions = Sessions { inner, current: tokio::sync::Mutex::new(Some(first)) };
@@ -339,6 +343,7 @@ impl Sessions {
             sim: sim_rx,
             sim_defaults: defaults_rx,
             yt: yt_rx,
+            devices: devices_rx,
             switching: switching_rx,
         };
         (sessions, front)
@@ -542,6 +547,7 @@ impl Inner {
         let out = &inner.out;
         tasks.push(spawn_forward(engine.clone(), out.snap.clone()));
         out.yt.send_replace(kit.devices.yt.clone());
+        out.devices.send_replace(Some(kit.devices.clone()));
         out.sim.send_replace(kit.sim.clone());
         out.sim_defaults.send_replace(kit.sim_defaults.clone());
         out.mode.send_replace(mode);
@@ -562,6 +568,7 @@ impl Inner {
         let Session { mode, kit, tx, tasks, engine, .. } = s;
         self.out.target.send_replace(None);
         self.out.yt.send_replace(Absent::new("switching mode"));
+        self.out.devices.send_replace(None);
         self.out.sim.send_replace(None);
         for t in &kit.device_tasks {
             t.abort();

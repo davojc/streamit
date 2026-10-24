@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 use streamit_core::devices::{DeviceError, Encoder, EncoderStatus};
-use streamit_webpresenter::{Timings, WebPresenter, format_action, parse_blocks, parse_status};
+use streamit_webpresenter::{
+    Timings, WebPresenter, format_action, format_stream_settings, parse_blocks, parse_status, parse_stream_settings,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -175,4 +177,28 @@ async fn disconnected_before_state_block_and_when_peer_closes() {
     assert!(matches!(wp.stop().await, Err(DeviceError::Disconnected(_))));
     let _s2 = accept_with_dump(&l).await;
     wait_status(&wp, EncoderStatus::Idle).await;
+}
+
+#[test]
+fn stream_settings_never_include_the_key() {
+    let blocks = parse_blocks(FIXTURE);
+    let b = blocks.iter().find(|b| b.name == "STREAM SETTINGS").unwrap();
+    let got = parse_stream_settings(b);
+    assert!(got.contains(&("Service".into(), "YouTube".into())));
+    assert!(got.contains(&("Server".into(), "rtmp://a.rtmp.youtube.com/live2".into())));
+    assert!(!got.iter().any(|(k, _)| k == "Key"), "{got:?}");
+    let back = format_stream_settings(&[("Service".into(), "YouTube".into()), ("Key".into(), "secret".into())]);
+    assert_eq!(back, "STREAM SETTINGS:\nService: YouTube\n\n");
+}
+
+#[tokio::test]
+async fn stream_settings_are_read_from_the_dump() {
+    let (l, addr) = fake().await;
+    let wp = WebPresenter::connect_with(addr, fast()).await.unwrap();
+    let (mut s, _) = l.accept().await.unwrap();
+    s.write_all(FIXTURE.as_bytes()).await.unwrap();
+    wait_status(&wp, EncoderStatus::Idle).await;
+    let got = wp.stream_settings().await.unwrap();
+    assert_eq!(got.iter().find(|(k, _)| k == "Service").map(|(_, v)| v.as_str()), Some("YouTube"));
+    assert!(!got.iter().any(|(k, _)| k == "Key"));
 }

@@ -62,6 +62,24 @@ pub trait Router: Send + Sync {
         let _ = (kind, n, text);
         Err(DeviceError::Refused("this router cannot rename its inputs and outputs".into()))
     }
+    /// The input on every output; index 0 is output 1, 0 where not known.
+    async fn routing_table(&self) -> Result<Vec<u16>> {
+        Ok(Vec::new())
+    }
+    /// Renames many inputs or outputs at once (1-based numbers).
+    async fn set_labels(&self, kind: LabelKind, labels: &[(u16, String)]) -> Result<()> {
+        for (n, text) in labels {
+            self.set_label(kind, *n, text).await?;
+        }
+        Ok(())
+    }
+    /// Makes many routes at once: (output, input), 1-based.
+    async fn route_many(&self, routes: &[(u16, u16)]) -> Result<()> {
+        for &(output, input) in routes {
+            self.route(output, input).await?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +96,16 @@ pub trait Encoder: Send + Sync {
     async fn start(&self) -> Result<()>;
     async fn stop(&self) -> Result<()>;
     async fn status(&self) -> Result<EncoderStatus>;
+    /// The streaming settings as name/value pairs (service, server, quality…), never the
+    /// stream key.
+    async fn stream_settings(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+    /// Puts streaming settings back (the stream key is never sent).
+    async fn set_stream_settings(&self, settings: &[(String, String)]) -> Result<()> {
+        let _ = settings;
+        Err(DeviceError::Refused("this encoder cannot take streaming settings".into()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -112,6 +112,19 @@ impl<T: Router + ?Sized> Router for Logged<T> {
     async fn output_labels(&self) -> Result<Vec<String>> {
         self.inner.output_labels().await
     }
+    async fn routing_table(&self) -> Result<Vec<u16>> {
+        self.inner.routing_table().await
+    }
+    async fn set_labels(&self, kind: LabelKind, labels: &[(u16, String)]) -> Result<()> {
+        done(
+            self.device,
+            format!("set_labels({kind:?}, {} labels)", labels.len()),
+            self.inner.set_labels(kind, labels).await,
+        )
+    }
+    async fn route_many(&self, routes: &[(u16, u16)]) -> Result<()> {
+        done(self.device, format!("route_many({routes:?})"), self.inner.route_many(routes).await)
+    }
     async fn set_label(&self, kind: LabelKind, n: u16, text: &str) -> Result<()> {
         done(self.device, format!("set_label({kind:?}, {n}, {text:?})"), self.inner.set_label(kind, n, text).await)
     }
@@ -124,6 +137,13 @@ impl<T: Encoder + ?Sized> Encoder for Logged<T> {
     }
     async fn stop(&self) -> Result<()> {
         done(self.device, "stop()".into(), self.inner.stop().await)
+    }
+    async fn stream_settings(&self) -> Result<Vec<(String, String)>> {
+        self.inner.stream_settings().await
+    }
+    async fn set_stream_settings(&self, settings: &[(String, String)]) -> Result<()> {
+        let names: Vec<&str> = settings.iter().map(|(k, _)| k.as_str()).collect();
+        done(self.device, format!("set_stream_settings({names:?})"), self.inner.set_stream_settings(settings).await)
     }
     async fn status(&self) -> Result<EncoderStatus> {
         self.inner.status().await
