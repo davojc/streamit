@@ -23,26 +23,10 @@ impl StreamItApp {
     }
 
     fn next_step_panel(&mut self, ui: &mut Ui, snap: &Snapshot, c: &Config, bottom: f32) {
-        let prepared = matches!(snap.stage, Stage::Prepared(_));
+        let step = view::next_step(snap);
         ui.spacing_mut().item_spacing.y = 6.0;
         theme::lbl(ui, "Next step");
-        let (title, text) = if prepared {
-            (
-                "Start the countdown",
-                format!(
-                    "Plays the countdown video on the hall screens and the stream. YouTube goes public \
-                     at {} and the stream cuts to the camera at 0:00.",
-                    view::fmt_mmss(c.timings.go_public_offset)
-                ),
-            )
-        } else {
-            (
-                "Prepare the stream",
-                "Puts the “Stream starting soon” still on air in silence, starts the Web Presenter, \
-                 and waits for YouTube to receive it privately. Do this 10–20 minutes before the service."
-                    .to_string(),
-            )
-        };
+        let (title, text) = view::next_step_text(snap, c);
         ui.label(RichText::new(title).font(theme::heading_font(44.0)));
         ui.add_space(4.0);
         ui.label(RichText::new(text).size(17.0).color(theme::SOFT));
@@ -62,33 +46,52 @@ impl StreamItApp {
             });
         }
         ui.add_space(18.0);
-        ui.columns(2, |cols| {
-            preview(
-                &mut cols[0],
-                "Online will see",
-                "Stream starting soon…",
-                true,
-                &format!("Opening still · media slot {} · mics silent", c.stream_atem.opening_still + 1),
-            );
-            preview(&mut cols[1], "Hall screens", "Unchanged", false, "The hall isn’t touched until the countdown");
-        });
+        // The previews show what Prepare puts on air: not what Recover does.
+        if step != view::NextStep::Recover {
+            ui.columns(2, |cols| {
+                preview(
+                    &mut cols[0],
+                    "Online will see",
+                    "Stream starting soon…",
+                    true,
+                    &format!("Opening still · media slot {} · mics silent", c.stream_atem.opening_still + 1),
+                );
+                preview(&mut cols[1], "Hall screens", "Unchanged", false, "The hall isn’t touched until the countdown");
+            });
+        }
         at_bottom(ui, bottom, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 let busy = snap.job.is_some();
-                if prepared {
-                    if theme::big_button(ui, "Start countdown", Kind::Warn, !busy).clicked() {
-                        self.send(Command::Countdown);
+                match step {
+                    view::NextStep::Countdown => {
+                        if theme::big_button(ui, "Start countdown", Kind::Warn, !busy).clicked() {
+                            self.send(Command::Countdown);
+                        }
+                        if theme::big_button(ui, "Start service now", Kind::DangerOutline, !busy).clicked() {
+                            self.send(Command::GoLive);
+                        }
+                        deck_hint(ui, "COUNTDOWN", "row 2, key 2");
                     }
-                    if theme::big_button(ui, "Start service now", Kind::DangerOutline, !busy).clicked() {
-                        self.send(Command::GoLive);
+                    // S6: Recover before Prepare, which would put the still on air.
+                    view::NextStep::Recover => {
+                        if theme::big_button(ui, "Recover", Kind::Primary, !busy).clicked() {
+                            self.send(Command::Recover);
+                        }
+                        let prepare = view::prepare_button(snap);
+                        let r = theme::big_button(ui, "Prepare", Kind::Plain, prepare.enabled);
+                        if let Some(why) = prepare.reason {
+                            r.on_disabled_hover_text(why);
+                            ui.label(RichText::new(why).size(15.0).color(theme::AMBER_SOFT));
+                        }
                     }
-                    deck_hint(ui, "COUNTDOWN", "row 2, key 2");
-                } else {
-                    if theme::big_button(ui, "Prepare", Kind::Primary, !busy).clicked() {
-                        self.send(Command::Prepare);
+                    view::NextStep::Prepare => {
+                        let prepare = view::prepare_button(snap);
+                        if theme::big_button(ui, "Prepare", Kind::Primary, prepare.enabled).clicked() {
+                            self.send(Command::Prepare);
+                        }
+                        deck_hint(ui, "PREPARE", "row 2, key 1");
                     }
-                    deck_hint(ui, "PREPARE", "row 2, key 1");
                 }
             });
         });

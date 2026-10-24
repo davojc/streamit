@@ -2,12 +2,12 @@
 //! (each on a Stream Deck key), and the settings of the selected one.
 use super::StreamItApp;
 use crate::theme::{self, Kind};
-use crate::view::{self, CueRow};
+use crate::view::{self, ClipLength, CueRow};
 use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, Stroke, Ui, UiBuilder, vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use streamit_core::config::Config;
 use streamit_core::engine::Snapshot;
 use streamit_core::rollin::{Destination, MAX_CUES};
@@ -19,10 +19,11 @@ const DESTINATIONS: [Destination; 4] =
     [Destination::HallAndOnline, Destination::HallOnly, Destination::OnlineOnly, Destination::AudioOnly];
 
 /// Clip lengths, read once per file on a background thread (never on the UI thread) and
-/// remembered by path. A length shows as "–:––" until its file has been read.
+/// remembered by path. A length shows as "–:––" until its file has been read, then as
+/// its length, "file missing" or "length unknown" (never the simulation's 30 s).
 #[derive(Default)]
 pub(super) struct Lengths {
-    known: Arc<Mutex<HashMap<PathBuf, Duration>>>,
+    known: Arc<Mutex<HashMap<PathBuf, ClipLength>>>,
     asked: HashSet<PathBuf>,
 }
 
@@ -33,12 +34,12 @@ impl Lengths {
         rt: &Handle,
         ctx: &egui::Context,
         paths: impl IntoIterator<Item = &'a Path>,
-    ) -> HashMap<PathBuf, Duration> {
+    ) -> HashMap<PathBuf, ClipLength> {
         for p in paths {
             if self.asked.insert(p.to_path_buf()) {
                 let (p, known, ctx) = (p.to_path_buf(), self.known.clone(), ctx.clone());
                 rt.spawn_blocking(move || {
-                    let d = streamit_sim::clip::clip_length(&p);
+                    let d = view::read_clip(&p);
                     known.lock().unwrap_or_else(|e| e.into_inner()).insert(p, d);
                     ctx.request_repaint();
                 });
@@ -111,9 +112,13 @@ fn thumb(ui: &mut Ui, size: egui::Vec2, text: &str, font: egui::FontId, color: C
 }
 
 impl StreamItApp {
-    pub(super) fn videos_tab(&mut self, ui: &mut Ui, snap: &Snapshot, config: &Config) {
+    /// `running`: in simulation, the config it opened with (its countdown video is the
+    /// one it plays).
+    pub(super) fn videos_tab(&mut self, ui: &mut Ui, snap: &Snapshot, config: &Config, running: Option<&Config>) {
+        let countdown = running.unwrap_or(config).playout.countdown_file.clone();
+        let note = view::sim_next_time_note(&countdown, &config.playout.countdown_file);
         let lengths = {
-            let paths = self.cues.iter().map(|c| c.path.as_path()).chain([config.playout.countdown_file.as_path()]);
+            let paths = self.cues.iter().map(|c| c.path.as_path()).chain([countdown.as_path()]);
             self.lengths.ask(&self.rt, &self.ctx, paths)
         };
         if !self.cues.is_empty() {
@@ -124,15 +129,21 @@ impl StreamItApp {
             ui,
             ASIDE_W,
             |app, ui| {
-                app.countdown_panel(ui, config, &lengths);
+                app.countdown_panel(ui, &countdown, note, &lengths);
                 app.list_panel(ui, snap, locked, &lengths);
             },
             |app, ui| app.selected_panel(ui, config, locked),
         );
     }
 
-    fn countdown_panel(&mut self, ui: &mut Ui, config: &Config, lengths: &HashMap<PathBuf, Duration>) {
-        let file = &config.playout.countdown_file;
+    /// `note`: the saved countdown video differs from the one the simulation plays.
+    fn countdown_panel(
+        &mut self,
+        ui: &mut Ui,
+        file: &Path,
+        note: Option<&str>,
+        lengths: &HashMap<PathBuf, ClipLength>,
+    ) {
         let length = view::length_text(lengths.get(file).copied());
         theme::panel().inner_margin(20).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -153,6 +164,13 @@ impl StreamItApp {
                         .size(15.0)
                         .color(theme::SOFT),
                     );
+                    if let Some(n) = note {
+                        ui.label(
+                            RichText::new(format!("The simulation plays this one; the new choice {n}."))
+                                .size(14.0)
+                                .color(theme::AMBER_SOFT),
+                        );
+                    }
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if theme::button_enabled(ui, !self.countdown_pick_job.running, "Change…", Kind::Plain).clicked() {
@@ -169,7 +187,7 @@ impl StreamItApp {
         });
     }
 
-    fn list_panel(&mut self, ui: &mut Ui, snap: &Snapshot, locked: bool, lengths: &HashMap<PathBuf, Duration>) {
+    fn list_panel(&mut self, ui: &mut Ui, snap: &Snapshot, locked: bool, lengths: &HashMap<PathBuf, ClipLength>) {
         let mut action: Option<Action> = None;
         let mut select: Option<usize> = None;
         theme::panel().inner_margin(20).show(ui, |ui| {

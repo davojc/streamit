@@ -2,7 +2,7 @@
 //! the drawing lives in `ui/`, so these choices can be tested.
 use crate::session::{Mode, REFUSED};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use streamit_core::config::Config;
 use streamit_core::devices::{EncoderStatus, Health};
@@ -151,17 +151,124 @@ pub fn header(s: &Snapshot, _c: &Config) -> HeaderView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoreMenu {
     pub start_now: bool,
+    /// Why Start service now is disabled, when there is a reason to give.
+    pub start_now_reason: Option<&'static str>,
+    /// From Idle, Start service now takes a second (confirm) click.
+    pub start_now_confirm: bool,
+    pub start_now_hint: &'static str,
     pub end_service: bool,
 }
 
+/// Why Prepare and Start service now wait while Recover is offered before the service.
+pub const RECOVER_FIRST: &str = "Recover first";
+
 /// Mirrors the engine: Start service now runs from Idle or Prepared when nothing else
 /// runs (the countdown has its own button); End Service starts when nothing runs, stops
-/// a video first, and a second press during End Service skips the closing hold.
+/// a video first, and a second press during End Service skips the closing hold. Before
+/// the service, a pending Recover comes first (S6), and from Idle Start service now asks
+/// for a confirm: the encoder is not streaming yet.
 pub fn more_menu(s: &Snapshot) -> MoreMenu {
+    let recover = recover_first(s);
+    let idle = s.stage == Stage::Idle;
     MoreMenu {
-        start_now: matches!(s.stage, Stage::Idle | Stage::Prepared(_)) && s.job.is_none(),
+        start_now: matches!(s.stage, Stage::Idle | Stage::Prepared(_)) && s.job.is_none() && !recover,
+        start_now_reason: recover.then_some(RECOVER_FIRST),
+        start_now_confirm: idle,
+        start_now_hint: if idle {
+            "Prepare first is safer — the encoder isn’t streaming yet."
+        } else {
+            "Cut to the camera and go public, skipping the countdown."
+        },
         end_service: s.playing.is_some() || matches!(s.job, None | Some("End Service") | Some("a video")),
     }
+}
+
+/// Before the service with Recover offered: a restart found something left on the
+/// DeckLink (or the mics down). Prepare would put the opening still on air and floor the
+/// mics, so Recover goes first.
+pub fn recover_first(s: &Snapshot) -> bool {
+    s.stage == Stage::Idle && s.offers.contains(&Offer::Recover)
+}
+
+/// The big step on the "before the service" screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextStep {
+    Prepare,
+    Recover,
+    Countdown,
+}
+
+pub fn next_step(s: &Snapshot) -> NextStep {
+    match s.stage {
+        Stage::Prepared(_) => NextStep::Countdown,
+        _ if recover_first(s) => NextStep::Recover,
+        _ => NextStep::Prepare,
+    }
+}
+
+/// The next step's heading and explanation.
+pub fn next_step_text(s: &Snapshot, c: &Config) -> (&'static str, String) {
+    match next_step(s) {
+        NextStep::Countdown => (
+            "Start the countdown",
+            format!(
+                "Plays the countdown video on the hall screens; the stream stays on the opening still. \
+                 YouTube goes public at {} and the stream cuts to the camera at 0:00.",
+                fmt_mmss(c.timings.go_public_offset)
+            ),
+        ),
+        NextStep::Recover => (
+            "Recover first",
+            "StreamIt restarted with the equipment left mid-video (or the mics down). Recover puts it \
+             back: the stream and hall off the video, mics up, input 8 back on its camera. Then carry on."
+                .to_string(),
+        ),
+        NextStep::Prepare => (
+            "Prepare the stream",
+            "Puts the “Stream starting soon” still on air in silence, starts the Web Presenter, \
+             and waits for YouTube to receive it privately. Do this 10–20 minutes before the service."
+                .to_string(),
+        ),
+    }
+}
+
+/// A step button: whether it can be pressed, and why not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepButton {
+    pub enabled: bool,
+    pub reason: Option<&'static str>,
+}
+
+/// Prepare waits for any running sequence, and for Recover when it is offered first.
+pub fn prepare_button(s: &Snapshot) -> StepButton {
+    let recover = recover_first(s);
+    StepButton { enabled: s.job.is_none() && !recover, reason: recover.then_some(RECOVER_FIRST) }
+}
+
+/// The Mics bar on the live screens.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MicBar {
+    pub fraction: f32,
+    pub tone: Tone,
+    pub text: &'static str,
+}
+
+/// "down for video" only while a video plays; mics down with no video (a restart, a
+/// failed fade up) are a problem Recover fixes.
+pub fn mic_bar(s: &Snapshot) -> MicBar {
+    match (s.mics_ducked, s.playing.is_some()) {
+        (false, _) => MicBar { fraction: 0.72, tone: Tone::Green, text: "live" },
+        (true, true) => MicBar { fraction: 0.04, tone: Tone::Amber, text: "down for video" },
+        (true, false) => MicBar { fraction: 0.04, tone: Tone::Red, text: "down — press Recover" },
+    }
+}
+
+/// Under a setting the running simulation took from the settings file when it opened:
+/// said when the saved value has changed since.
+pub const SIM_NEXT_TIME: &str = "applies next time you open simulation";
+
+pub fn sim_next_time_note(running: &Path, saved: &Path) -> Option<&'static str> {
+    (running != saved).then_some(SIM_NEXT_TIME)
 }
 
 /// The label of the online panel while a video plays, and whether it is on air.
@@ -225,7 +332,8 @@ pub fn countdown(s: &Snapshot, c: &Config) -> Option<CountdownView> {
         ndi_text: format!("NDI counter sending {text} as “{}”", c.ndi.source_name),
         ndi_ok: matches!(s.device_status.get(&DeviceKind::Ndi), Some(DeviceHealth::Ok)),
         progress,
-        show_retry_public: public_failed(s),
+        // A public countdown has nothing to retry, whatever an older offer says.
+        show_retry_public: public_failed(s) && !public,
         remaining: text,
     })
 }
@@ -278,9 +386,33 @@ pub fn deck_key(number: usize) -> u8 {
     if number <= 7 { 16 + n } else { 17 + n }
 }
 
-/// `M:SS` of a clip, or "–:––" while its length is not known.
-pub fn length_text(d: Option<Duration>) -> String {
-    d.map(fmt_mmss).unwrap_or_else(|| LENGTH_UNKNOWN.into())
+/// What reading a clip's length found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipLength {
+    Known(Duration),
+    /// No file at that path.
+    Missing,
+    /// The file is there but its length can't be read (not an mp4/mov StreamIt reads).
+    Unreadable,
+}
+
+/// Reads a clip's length from its header (blocking: call off the UI thread). Never the
+/// simulation's made-up 30 s.
+pub fn read_clip(path: &Path) -> ClipLength {
+    if !path.exists() {
+        return ClipLength::Missing;
+    }
+    streamit_sim::clip::read_length(path).map_or(ClipLength::Unreadable, ClipLength::Known)
+}
+
+/// `M:SS` of a clip, "file missing" or "length unknown", or "–:––" until it has been read.
+pub fn length_text(l: Option<ClipLength>) -> String {
+    match l {
+        None => LENGTH_UNKNOWN.into(),
+        Some(ClipLength::Known(d)) => fmt_mmss(d),
+        Some(ClipLength::Missing) => "file missing".into(),
+        Some(ClipLength::Unreadable) => "length unknown".into(),
+    }
 }
 
 /// The file's own name, for the small line under a video's name.
@@ -302,7 +434,7 @@ pub struct CueRow {
 }
 
 /// The row for the cue at `index` (0-based).
-pub fn cue_row(index: usize, cue: &Cue, lengths: &HashMap<PathBuf, Duration>) -> CueRow {
+pub fn cue_row(index: usize, cue: &Cue, lengths: &HashMap<PathBuf, ClipLength>) -> CueRow {
     CueRow {
         number: index + 1,
         deck_key: deck_key(index + 1),
@@ -316,7 +448,7 @@ pub fn cue_row(index: usize, cue: &Cue, lengths: &HashMap<PathBuf, Duration>) ->
 
 /// The Videos list for these cues (the window's copy while it is being edited). `lengths` are
 /// the clip lengths read so far.
-pub fn cue_rows(cues: &[Cue], lengths: &HashMap<PathBuf, Duration>) -> Vec<CueRow> {
+pub fn cue_rows(cues: &[Cue], lengths: &HashMap<PathBuf, ClipLength>) -> Vec<CueRow> {
     cues.iter().enumerate().map(|(i, c)| cue_row(i, c, lengths)).collect()
 }
 
@@ -556,7 +688,8 @@ mod tests {
     #[test]
     fn cue_row_texts() {
         let cues = [cue_at("Notices", r"C:\v\Notices 26-10.mp4", -2.0), cue_at("Mission", r"C:\v\Mission.mov", 0.0)];
-        let lengths = HashMap::from([(PathBuf::from(r"C:\v\Notices 26-10.mp4"), Duration::from_secs(150))]);
+        let lengths =
+            HashMap::from([(PathBuf::from(r"C:\v\Notices 26-10.mp4"), ClipLength::Known(Duration::from_secs(150)))]);
         let rows = cue_rows(&cues, &lengths);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].number, 1);
@@ -781,6 +914,116 @@ mod tests {
         assert!(!more_menu(&preparing).start_now && !more_menu(&preparing).end_service);
         let ended = more_menu(&Snapshot { stage: Stage::Ended, ..Snapshot::default() });
         assert!(!ended.start_now);
+    }
+
+    fn idle_recover() -> Snapshot {
+        Snapshot { offers: vec![Offer::Recover], ..Snapshot::default() }
+    }
+
+    /// S6/I1: a restart mid-video left something on the DeckLink. Recover is the next
+    /// step; Prepare (which would put the opening still on air) waits for it.
+    #[test]
+    fn recover_is_the_next_step_when_offered_at_idle() {
+        let c = Config::default();
+        let s = idle_recover();
+        assert_eq!(next_step(&s), NextStep::Recover);
+        let (title, text) = next_step_text(&s, &c);
+        assert_eq!(title, "Recover first");
+        assert!(text.contains("Recover"), "{text}");
+        assert_eq!(prepare_button(&s), StepButton { enabled: false, reason: Some("Recover first") });
+        // Nothing to recover: Prepare as usual.
+        assert_eq!(next_step(&Snapshot::default()), NextStep::Prepare);
+        assert_eq!(prepare_button(&Snapshot::default()), StepButton { enabled: true, reason: None });
+        // Busy: disabled, no reason needed (the spinner says what runs).
+        let busy = Snapshot { job: Some("Recover"), ..idle_recover() };
+        assert!(!prepare_button(&busy).enabled);
+        let prepared = Snapshot { stage: Stage::Prepared(Readiness::Ready), ..Snapshot::default() };
+        assert_eq!(next_step(&prepared), NextStep::Countdown);
+        // The More menu agrees: no Start service now until Recover has run.
+        let m = more_menu(&s);
+        assert!(!m.start_now);
+        assert_eq!(m.start_now_reason, Some("Recover first"));
+        assert!(m.end_service);
+    }
+
+    /// M3: the stream stays on the opening still during the countdown.
+    #[test]
+    fn prepared_text_matches_the_countdown_screen() {
+        let prepared = Snapshot { stage: Stage::Prepared(Readiness::Ready), ..Snapshot::default() };
+        let (title, text) = next_step_text(&prepared, &Config::default());
+        assert_eq!(title, "Start the countdown");
+        assert!(!text.contains("hall screens and the stream"), "{text}");
+        assert!(text.contains("hall screens") && text.contains("opening still"), "{text}");
+        assert!(text.contains("0:10") && text.contains("0:00"), "{text}");
+    }
+
+    /// M4: Start service now from Idle needs a second click, with the reason.
+    #[test]
+    fn start_now_from_idle_asks_for_a_confirm() {
+        let idle = more_menu(&Snapshot::default());
+        assert!(idle.start_now && idle.start_now_confirm);
+        assert_eq!(idle.start_now_hint, "Prepare first is safer — the encoder isn’t streaming yet.");
+        let prepared = more_menu(&Snapshot { stage: Stage::Prepared(Readiness::Ready), ..Snapshot::default() });
+        assert!(prepared.start_now && !prepared.start_now_confirm);
+        assert_eq!(prepared.start_now_hint, "Cut to the camera and go public, skipping the countdown.");
+    }
+
+    /// I2: a public countdown has nothing to retry.
+    #[test]
+    fn no_retry_box_once_the_countdown_is_public() {
+        let c = Config::default();
+        let public = Snapshot {
+            stage: Stage::Countdown { remaining: Duration::from_secs(5), public: true },
+            offers: vec![Offer::GoPublic],
+            ..Snapshot::default()
+        };
+        assert!(!countdown(&public, &c).unwrap().show_retry_public);
+    }
+
+    /// I6: the mic bar says why the mics are down.
+    #[test]
+    fn mic_bar_wording() {
+        let live = Snapshot { stage: Stage::Live, ..Snapshot::default() };
+        assert_eq!(mic_bar(&live), MicBar { fraction: 0.72, tone: Tone::Green, text: "live" });
+        let video = Snapshot { mics_ducked: true, playing: Some(0), ..live.clone() };
+        assert_eq!(mic_bar(&video), MicBar { fraction: 0.04, tone: Tone::Amber, text: "down for video" });
+        let left_down = Snapshot { mics_ducked: true, ..live };
+        assert_eq!(mic_bar(&left_down), MicBar { fraction: 0.04, tone: Tone::Red, text: "down — press Recover" });
+    }
+
+    /// I5: a length the app can't read says why, never a made-up 0:30.
+    #[test]
+    fn clip_length_texts() {
+        let dir = std::env::temp_dir().join(format!("streamit-view-{}-lengths", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing.mp4");
+        let junk = dir.join("junk.mp4");
+        std::fs::write(&junk, "not a movie").unwrap();
+        assert_eq!(read_clip(&missing), ClipLength::Missing);
+        assert_eq!(read_clip(&junk), ClipLength::Unreadable);
+        assert_eq!(length_text(Some(ClipLength::Missing)), "file missing");
+        assert_eq!(length_text(Some(ClipLength::Unreadable)), "length unknown");
+        assert_eq!(length_text(Some(ClipLength::Known(Duration::from_secs(150)))), "2:30");
+        assert_eq!(length_text(None), "–:––", "not read yet");
+        let cues = [cue_at("Gone", missing.to_str().unwrap(), 0.0)];
+        let lengths = HashMap::from([(missing.clone(), ClipLength::Missing)]);
+        assert_eq!(cue_rows(&cues, &lengths)[0].length_text, "file missing");
+    }
+
+    /// M6: in simulation the countdown names the file the simulation plays.
+    #[test]
+    fn simulation_names_its_own_countdown_file() {
+        let mut saved = Config::default();
+        saved.playout.countdown_file = PathBuf::from(r"C:\v\New countdown.mp4");
+        let mut running = Config::default();
+        running.playout.countdown_file = PathBuf::from(r"C:\v\Old countdown.mp4");
+        assert_eq!(countdown(&countdown_at(42), &running).unwrap().file_name, "Old countdown.mp4");
+        assert_eq!(
+            sim_next_time_note(&running.playout.countdown_file, &saved.playout.countdown_file),
+            Some("applies next time you open simulation")
+        );
+        assert_eq!(sim_next_time_note(&saved.playout.countdown_file, &saved.playout.countdown_file), None);
     }
 
     #[test]

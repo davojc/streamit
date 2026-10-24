@@ -2,8 +2,10 @@
 use super::*;
 
 impl StreamItApp {
-    pub(super) fn countdown_screen(&mut self, ui: &mut Ui, snap: &Snapshot, c: &Config, tall: f32) {
+    pub(super) fn countdown_screen(&mut self, ui: &mut Ui, snap: &Snapshot, c: &Config, saved: &Config, tall: f32) {
         let Some(v) = view::countdown(snap, c) else { return };
+        // In simulation `c` is what the simulation opened with (M6).
+        let file_note = view::sim_next_time_note(&c.playout.countdown_file, &saved.playout.countdown_file);
         self.columns(
             ui,
             440.0,
@@ -26,6 +28,13 @@ impl StreamItApp {
                                     .size(15.0)
                                     .color(theme::MUTED),
                             );
+                            if let Some(n) = file_note {
+                                ui.label(
+                                    RichText::new(format!("The new countdown video {n}"))
+                                        .size(14.0)
+                                        .color(theme::AMBER_SOFT),
+                                );
+                            }
                         });
                         ui.vertical(|ui| {
                             ui.add_space(40.0);

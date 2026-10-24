@@ -16,7 +16,7 @@ impl StreamItApp {
                                 .color(theme::MUTED),
                         );
                         ui.add_space(10.0);
-                        mics(ui, snap.mics_ducked);
+                        mics(ui, snap);
                     });
                     on_air_panel(&mut cols[1], "Hall screens", false, |ui| {
                         big_value(ui, "As usual", 40.0);

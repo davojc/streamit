@@ -120,7 +120,7 @@ impl StreamItApp {
                             ui.label(RichText::new("The video plays in the hall only").size(15.0).color(theme::MUTED));
                         }
                         ui.add_space(10.0);
-                        mics(ui, snap.mics_ducked);
+                        mics(ui, snap);
                     });
                     on_air_panel(&mut cols[1], "Hall screens", false, |ui| {
                         if hall {

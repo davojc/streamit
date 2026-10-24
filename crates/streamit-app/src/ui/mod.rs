@@ -133,6 +133,8 @@ pub struct StreamItApp {
     /// The close button was pressed during a service: ask first.
     confirm_close: bool,
     close_confirmed: bool,
+    /// "Start service now" from Idle was clicked once in the More menu: the next click sends it.
+    confirm_start_now: bool,
     /// The config the devices were built from.
     startup: Config,
     draft: Config,
@@ -214,6 +216,7 @@ impl StreamItApp {
             ctx: ctx.clone(),
             confirm_close: false,
             close_confirmed: false,
+            confirm_start_now: false,
             live_inputs_text: join_inputs(&draft.stream_atem.live_inputs),
             cues: startup.cues.clone(),
             engine_cues: startup.cues.clone(),
@@ -531,6 +534,10 @@ impl eframe::App for StreamItApp {
         ui.ctx().request_repaint_after(Duration::from_millis(100));
 
         let config = self.config.read().unwrap_or_else(|e| e.into_inner()).clone();
+        // What the running simulation was built from (M6): the Service screens describe
+        // what the engine does, so in simulation they use this; the settings file's newer
+        // edits apply the next time simulation opens.
+        let running = self.sim.borrow().as_ref().map(|s| s.config().clone());
         let simulating = *self.mode.borrow() == Mode::Simulation || snap.simulation;
         if simulating {
             egui::Panel::top("sim_banner").frame(egui::Frame::new()).show_separator_line(false).show(ui, |ui| {
@@ -573,8 +580,8 @@ impl eframe::App for StreamItApp {
             .show(ui, |ui| {
                 let viewport = ui.available_height();
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
-                    Tab::Service => self.service_tab(ui, &snap, &config, viewport),
-                    Tab::Videos => self.videos_tab(ui, &snap, &config),
+                    Tab::Service => self.service_tab(ui, &snap, running.as_ref().unwrap_or(&config), &config, viewport),
+                    Tab::Videos => self.videos_tab(ui, &snap, &config, running.as_ref()),
                     Tab::Settings => self.settings_tab(ui, &snap),
                     Tab::Simulation => self.simulation_tab(ui, &snap),
                 });

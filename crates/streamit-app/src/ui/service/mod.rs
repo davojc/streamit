@@ -30,15 +30,17 @@ fn at_bottom(ui: &mut Ui, bottom: f32, add: impl FnOnce(&mut Ui)) {
 
 impl StreamItApp {
     /// `viewport` is the height the tab is shown in: the main panel fills what the alerts
-    /// leave of it, with its buttons at the bottom, as in the mockups.
-    pub(super) fn service_tab(&mut self, ui: &mut Ui, snap: &Snapshot, c: &Config, viewport: f32) {
+    /// leave of it, with its buttons at the bottom, as in the mockups. `c` is the config
+    /// the engine runs on (in simulation, what it was opened with); `saved` the settings
+    /// file's.
+    pub(super) fn service_tab(&mut self, ui: &mut Ui, snap: &Snapshot, c: &Config, saved: &Config, viewport: f32) {
         let screen = view::service_screen(snap);
         let top = ui.cursor().top();
         self.alerts(ui, snap, screen);
         let tall = (viewport - (ui.cursor().top() - top) - 2.0).max(480.0);
         match screen {
             ServiceScreen::BeforeService => self.before_service(ui, snap, c, tall),
-            ServiceScreen::Countdown => self.countdown_screen(ui, snap, c, tall),
+            ServiceScreen::Countdown => self.countdown_screen(ui, snap, c, saved, tall),
             ServiceScreen::Live => self.live_screen(ui, snap, c),
             ServiceScreen::VideoPlaying => self.video_screen(ui, snap, c),
             ServiceScreen::Ending => self.ending_screen(ui, snap),
@@ -81,16 +83,37 @@ impl StreamItApp {
     /// the Stream Deck can when the deck is down.
     pub(in crate::ui) fn more_menu(&mut self, ui: &mut Ui, snap: &Snapshot) {
         let allowed = view::more_menu(snap);
+        if !allowed.start_now_confirm || !allowed.start_now {
+            self.confirm_start_now = false;
+        }
         let label = RichText::new("MORE ▾").font(theme::heading_font(17.0)).color(theme::MUTED);
-        ui.menu_button(label, |ui| {
+        // Clicks inside keep it open (each command closes it itself), so the confirm
+        // click of Start service now can land.
+        let config =
+            egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        let (_, menu) = egui::containers::menu::MenuButton::new(label).config(config).ui(ui, |ui| {
             ui.set_min_width(300.0);
+            // From Idle, Start service now takes a confirm click: Prepare is safer.
+            let start_text = if self.confirm_start_now { "Click again to start now" } else { "Start service now" };
+            let start = ui.add_enabled(allowed.start_now, egui::Button::new(RichText::new(start_text).size(16.0)));
+            let start = match allowed.start_now_reason {
+                Some(why) => start.on_disabled_hover_text(why),
+                None => start,
+            };
+            if start.clicked() {
+                if allowed.start_now_confirm && !self.confirm_start_now {
+                    self.confirm_start_now = true;
+                } else {
+                    self.confirm_start_now = false;
+                    self.send(Command::GoLive);
+                    ui.close();
+                }
+            }
+            let hint = allowed.start_now_reason.unwrap_or(allowed.start_now_hint);
+            let hint_color = if self.confirm_start_now { theme::AMBER_SOFT } else { theme::MUTED };
+            ui.label(RichText::new(hint).size(13.0).color(hint_color));
+            ui.add_space(4.0);
             let items = [
-                (
-                    "Start service now",
-                    "Cut to the camera and go public, skipping the countdown.",
-                    allowed.start_now,
-                    Command::GoLive,
-                ),
                 (
                     "Go public now",
                     "Make the YouTube broadcast visible. Picture and sound stay.",
@@ -119,6 +142,10 @@ impl StreamItApp {
                 ui.add_space(4.0);
             }
         });
+        // Closing the menu forgets a half-made confirm.
+        if menu.is_none() {
+            self.confirm_start_now = false;
+        }
     }
 
     /// Warnings, ignored presses, and what the engine offers (Recover, a retry...).
@@ -132,12 +159,15 @@ impl StreamItApp {
         if let Some(k) = snap.flash_key {
             warning_bar(ui, &view::flash_key_text(k));
         }
-        // On the countdown screen the retry has its own box.
+        // On the countdown screen the retry has its own box; before the service a Recover
+        // offered first is the screen's own next step.
+        let recover_step = screen == ServiceScreen::BeforeService && view::recover_first(snap);
         let offers: Vec<Offer> = snap
             .offers
             .iter()
             .copied()
             .filter(|o| !(screen == ServiceScreen::Countdown && *o == Offer::GoPublic))
+            .filter(|o| !(recover_step && *o == Offer::Recover))
             .collect();
         if offers.is_empty() {
             return;
@@ -240,13 +270,15 @@ fn big_value(ui: &mut Ui, text: &str, size: f32) {
     ui.add(egui::Label::new(RichText::new(text).font(theme::heading_font(size))).truncate());
 }
 
-fn mics(ui: &mut Ui, ducked: bool) {
+fn mics(ui: &mut Ui, snap: &Snapshot) {
     theme::lbl(ui, "Mics");
     ui.horizontal(|ui| {
-        let (frac, color, text, text_color) = if ducked {
-            (0.04, theme::AMBER, "down for video", theme::AMBER_SOFT)
-        } else {
-            (0.72, theme::GREEN, "live", theme::SOFT)
+        let bar = view::mic_bar(snap);
+        let (frac, text) = (bar.fraction, bar.text);
+        let (color, text_color) = match bar.tone {
+            Tone::Red => (theme::RED, theme::RED_TEXT),
+            Tone::Amber => (theme::AMBER, theme::AMBER_SOFT),
+            _ => (theme::GREEN, theme::SOFT),
         };
         let bar_w = (ui.available_width() - 140.0).max(60.0);
         ui.allocate_ui_with_layout(vec2(bar_w, 10.0), Layout::left_to_right(Align::Center), |ui| {
