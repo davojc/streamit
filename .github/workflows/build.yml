@@ -1,50 +1,76 @@
-# Builds the two Windows exes and, for a version tag, publishes them as a GitHub release
-# (StreamIt's Settings › Updates installs from the latest release):
+# Runs on every push to main. Tests first; only if they pass, and only when the version in
+# Cargo.toml has not been released yet, builds the two Windows exes and publishes them as
+# release v<version> (StreamIt's Settings › Updates installs from the latest release):
 #   streamit-windows-x64-playout.exe  with GStreamer (DeckLink playout, NDI counter): the playout PC
 #   streamit-windows-x64.exe          without GStreamer: any other PC
-# To release: set the version in Cargo.toml, commit, then push a tag `v<version>`.
-# A pull request that changes this file builds both exes without publishing anything.
-name: Release
+# To release: raise `version` in Cargo.toml and push to main.
+name: Build and release
 
 on:
   push:
-    tags: ["v*"]
-  pull_request:
-    paths: [".github/workflows/release.yml"]
-  workflow_dispatch:
+    branches: [main]
 
-permissions:
-  contents: write
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  # Built against 1.26; the playout PC needs a GStreamer 1.24+ runtime.
-  GST_VERSION: "1.26.7"
-  GST_ROOT: 'C:\Program Files\gstreamer\1.0\msvc_x86_64'
 
 jobs:
-  build:
+  test:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98
+        with:
+          components: rustfmt, clippy
+      # Caches the registry and the compiled dependencies; only StreamIt's own crates
+      # rebuild when nothing in Cargo.lock changed.
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
 
-      - name: Check the tag matches the version
-        if: github.ref_type == 'tag'
+  release:
+    needs: test
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      # Built against 1.26; the playout PC needs a GStreamer 1.24+ runtime.
+      GST_VERSION: "1.26.7"
+      GST_ROOT: 'C:\Program Files\gstreamer\1.0\msvc_x86_64'
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Is this version released yet?
+        id: version
         shell: pwsh
         run: |
           $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
           $v = ($meta.packages | Where-Object name -eq 'streamit-app').version
-          if ("v$v" -ne "${{ github.ref_name }}") {
-            throw "Tag ${{ github.ref_name }} does not match the version $v in Cargo.toml"
+          "tag=v$v" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          gh release view "v$v" --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Output "v$v is already released; raise the version in Cargo.toml to release again."
+            "skip=true" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          } else {
+            "skip=false" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
           }
+          exit 0
 
       - uses: dtolnay/rust-toolchain@1.98
+        if: steps.version.outputs.skip == 'false'
       - uses: Swatinem/rust-cache@v2
+        if: steps.version.outputs.skip == 'false'
         with:
           shared-key: release
 
       - name: Cache the GStreamer installers
+        if: steps.version.outputs.skip == 'false'
         id: gst-cache
         uses: actions/cache@v4
         with:
@@ -52,7 +78,7 @@ jobs:
           key: gst-msi-${{ env.GST_VERSION }}
 
       - name: Download GStreamer
-        if: steps.gst-cache.outputs.cache-hit != 'true'
+        if: steps.version.outputs.skip == 'false' && steps.gst-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force gst-msi | Out-Null
@@ -62,6 +88,7 @@ jobs:
           }
 
       - name: Install GStreamer
+        if: steps.version.outputs.skip == 'false'
         shell: pwsh
         run: |
           foreach ($msi in Get-ChildItem gst-msi/*.msi) {
@@ -79,6 +106,7 @@ jobs:
           }
 
       - name: Build
+        if: steps.version.outputs.skip == 'false'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -87,16 +115,10 @@ jobs:
           cargo build -p streamit-app --release --locked --features gst
           Copy-Item target/release/streamit.exe dist/streamit-windows-x64-playout.exe
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: streamit-windows-x64
-          path: dist/*.exe
-
       - name: Publish the release
-        if: github.ref_type == 'tag'
+        if: steps.version.outputs.skip == 'false'
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" dist/streamit-windows-x64-playout.exe dist/streamit-windows-x64.exe `
-            --title "StreamIt ${{ github.ref_name }}" --generate-notes
+          gh release create "${{ steps.version.outputs.tag }}" --target "${{ github.sha }}" `
+            dist/streamit-windows-x64-playout.exe dist/streamit-windows-x64.exe `
+            --title "StreamIt ${{ steps.version.outputs.tag }}" --generate-notes

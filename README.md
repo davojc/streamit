@@ -37,14 +37,7 @@ To install, download the right one into a folder you can write to, such as `%LOC
 
 **Updating:** StreamIt checks for a new release each time it starts. When one is out, an **Update ready** button shows in the header. It opens **Settings › Updates**, where **Install update** downloads the same kind of program (playout or not), checks it, and replaces the one you are running. Then **Restart StreamIt** starts the new version. Installing and restarting are only allowed between services (stage Idle or Ended, nothing running). **Check now** asks GitHub again.
 
-**Making a release** (developers): set `version` in the root `Cargo.toml`, commit and push, then tag that commit `v<version>` and push the tag:
-
-```
-git tag v1.1.0
-git push origin v1.1.0
-```
-
-The Release workflow builds both programs and publishes the release, usually within 10–15 minutes (the first build takes longer). It refuses a tag that does not match `Cargo.toml`. The CI workflow checks every push and pull request (format, clippy and the tests); both workflows cache the compiled crates.
+**Making a release** (developers): every push to `main` runs the Build and release workflow. It checks formatting, clippy and the tests first; only if they pass, and only when the `version` in the root `Cargo.toml` has not been released yet, does it build both programs and publish them as release `v<version>`, usually within 10–15 minutes (the first build takes longer). So to release, raise the version and push to main; a push that keeps the version only runs the checks. The compiled crates are cached between runs.
 
 ## Run StreamIt
 
