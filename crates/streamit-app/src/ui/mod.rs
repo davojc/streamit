@@ -2,7 +2,7 @@
 //! banner, and the tabs: Service (`service/`), Videos (`videos.rs`), Settings
 //! (`settings.rs`) and, in simulation only, Simulation (`simulation.rs`). Every press
 //! becomes the same `Command` the Stream Deck would send.
-mod multiview;
+mod routing;
 mod service;
 mod settings;
 mod simulation;
@@ -24,6 +24,7 @@ use streamit_core::devices::{BroadcastSummary, Broadcasts};
 use streamit_core::engine::{Command, Snapshot};
 use streamit_core::golive::Stage;
 use streamit_core::rollin::{Cue, Destination, MAX_CUES};
+use streamit_core::routing::Target;
 use streamit_sim::SimControl;
 use streamit_youtube::StreamSummary;
 use tokio::runtime::Handle;
@@ -87,7 +88,7 @@ impl<T: Send + 'static> Pending<T> {
 enum Tab {
     Service,
     Videos,
-    MultiView,
+    Routing,
     Settings,
     /// Only offered in simulation mode.
     Simulation,
@@ -208,7 +209,7 @@ pub struct StreamItApp {
     selected: usize,
     lengths: videos::Lengths,
     updates: updates::Updates,
-    mv: multiview::MvUi,
+    routes_ui: routing::RtUi,
 }
 
 impl StreamItApp {
@@ -283,7 +284,7 @@ impl StreamItApp {
             selected: 0,
             lengths: videos::Lengths::default(),
             updates: updates::Updates::default(),
-            mv: multiview::MvUi::default(),
+            routes_ui: routing::RtUi::default(),
         };
         app.load_broadcasts();
         app.load_channel();
@@ -501,16 +502,16 @@ impl StreamItApp {
         }
     }
 
-    /// Writes the MultiView presets to the shared settings and the file at once (like the
-    /// cue list, Save does not cover them), and gives them to the engine for the deck.
-    fn save_presets(&mut self, presets: Vec<streamit_core::multiview::Preset>) {
+    /// Writes a routing target's presets to the shared settings and the file at once (like
+    /// the cue list, Save does not cover them), and gives them to the engine for the deck.
+    fn save_presets(&mut self, target: Target, presets: Vec<streamit_core::routing::Preset>) {
         let c = {
             let mut shared = self.config.write().unwrap_or_else(|e| e.into_inner());
-            shared.multiview.presets = presets.clone();
+            shared.routing_mut(target).presets = presets.clone();
             shared.clone()
         };
-        self.draft.multiview.presets = presets.clone();
-        self.send(Command::SetPresets(presets));
+        self.draft.routing_mut(target).presets = presets.clone();
+        self.send(Command::SetPresets(target, presets));
         if !self.file.writable {
             self.notice = Some("Not saved: the settings file could not be backed up (see the log).".into());
             return;
@@ -693,7 +694,7 @@ impl eframe::App for StreamItApp {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
                     Tab::Service => self.service_tab(ui, &snap, running.as_ref().unwrap_or(&config), &config, viewport),
                     Tab::Videos => self.videos_tab(ui, &snap, &config, running.as_ref()),
-                    Tab::MultiView => self.multiview_tab(ui, &snap, config.multiview.outputs),
+                    Tab::Routing => self.routing_tab(ui, &snap),
                     Tab::Settings => self.settings_tab(ui, &snap),
                     Tab::Simulation => self.simulation_tab(ui, &snap),
                 });
@@ -725,14 +726,14 @@ impl StreamItApp {
                     &[
                         (Tab::Settings, "Settings"),
                         (Tab::Simulation, "Simulation"),
-                        (Tab::MultiView, "MultiView"),
+                        (Tab::Routing, "Routing"),
                         (Tab::Videos, "Videos"),
                         (Tab::Service, "Service"),
                     ]
                 } else {
                     &[
                         (Tab::Settings, "Settings"),
-                        (Tab::MultiView, "MultiView"),
+                        (Tab::Routing, "Routing"),
                         (Tab::Videos, "Videos"),
                         (Tab::Service, "Service"),
                     ]

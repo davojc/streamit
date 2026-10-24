@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use streamit_core::config::{AudioSourceId, Config};
 use streamit_core::engine::{DeviceKind, Snapshot};
+use streamit_core::routing::{STREAM_VIDEO_INPUT, Target};
 use streamit_youtube::{API_BASE, Auth, StreamSummary, YouTubeClient};
 use tracing::{info, warn};
 
@@ -180,6 +181,16 @@ fn router_number(ui: &mut Ui, v: &mut u16, prefix: &'static str) {
     let d = egui::DragValue::new(v)
         .range(0..=999)
         .custom_formatter(move |n, _| if n == 0.0 { "not set".into() } else { format!("{prefix}{n}") })
+        .custom_parser(router_digits);
+    ui.add_sized([w, FIELD_H], d);
+}
+
+/// The router output feeding a routing destination, where 0 means "not from the router".
+fn feed_number(ui: &mut Ui, v: &mut u16) {
+    let w = ui.available_width();
+    let d = egui::DragValue::new(v)
+        .range(0..=999)
+        .custom_formatter(|n, _| if n == 0.0 { "Not from the router".into() } else { format!("Output {n}") })
         .custom_parser(router_digits);
     ui.add_sized([w, FIELD_H], d);
 }
@@ -360,20 +371,7 @@ impl StreamItApp {
             field(&mut c[3], "Stream encoder", |ui| opt_text(ui, &mut d.web_presenter.address, "not set"));
         });
         ui.add_space(14.0);
-        theme::lbl(ui, "MultiView");
-        sub(
-            ui,
-            "The MultiView 4 is not on the network. Say which router output feeds each of its views, \
-             and the MultiView tab shows and changes them. Applies when you Save.",
-        );
-        ui.columns(4, |c| {
-            let d = &mut self.draft;
-            for (v, name) in streamit_core::multiview::VIEWS.iter().enumerate() {
-                field(&mut c[v], &format!("{name} (MV in {})", v + 1), |ui| {
-                    router_number(ui, &mut d.multiview.outputs[v], "Output ")
-                });
-            }
-        });
+        self.routing_card(ui);
         // While simulating, the note at the top of Settings says this (and more).
         if !simulating {
             ui.add_space(14.0);
@@ -388,6 +386,56 @@ impl StreamItApp {
         }
         ui.add_space(16.0);
         self.simulation_card(ui, snap);
+    }
+
+    /// Which router output feeds each routing destination. Applies when you Save.
+    fn routing_card(&mut self, ui: &mut Ui) {
+        theme::lbl(ui, "Routing");
+        sub(
+            ui,
+            "What the router feeds: the MultiView 4's views and the ATEMs' inputs. For each, the router \
+             output that feeds it, or \"not from the router\" (plugged straight in). The Routing tab \
+             shows and changes them. Applies when you Save.",
+        );
+        let video_out = self.draft.videohub.input8_output;
+        for t in Target::ALL {
+            ui.add_space(6.0);
+            ui.label(RichText::new(t.name()).strong());
+            let d = self.draft.routing_mut(t);
+            if d.outputs.len() < t.size() {
+                d.outputs.resize(t.size(), 0);
+            }
+            let per_row = 4;
+            for row in 0..t.size().div_ceil(per_row) {
+                ui.columns(per_row, |c| {
+                    for (k, col) in c.iter_mut().enumerate() {
+                        let i = row * per_row + k;
+                        if i >= t.size() {
+                            continue;
+                        }
+                        let name = if t == Target::MultiView {
+                            format!("{} (MV in {})", t.dest_name(i), i + 1)
+                        } else {
+                            t.dest_name(i)
+                        };
+                        field(col, &name, |ui| {
+                            if t == Target::StreamAtem && i == STREAM_VIDEO_INPUT {
+                                // One setting: the output StreamIt routes videos through.
+                                let text = if video_out == 0 {
+                                    "Set in Inputs & routing".to_string()
+                                } else {
+                                    format!("Output {video_out} (videos)")
+                                };
+                                ui.add_sized([ui.available_width(), FIELD_H], egui::Label::new(text))
+                                    .on_hover_text("Router output to input 8, in Inputs & routing");
+                            } else {
+                                feed_number(ui, &mut d.outputs[i]);
+                            }
+                        });
+                    }
+                });
+            }
+        }
     }
 
     fn add_by_ip(&mut self, ui: &mut Ui) {
@@ -857,7 +905,9 @@ impl StreamItApp {
         let saved = self.config.read().unwrap_or_else(|e| e.into_inner()).clone();
         let mut d = self.draft.clone();
         d.cues = saved.cues.clone();
-        d.multiview.presets = saved.multiview.presets.clone();
+        for t in Target::ALL {
+            d.routing_mut(t).presets = saved.routing(t).presets.clone();
+        }
         d != saved || self.live_inputs_text != join_inputs(&saved.stream_atem.live_inputs)
     }
 
@@ -891,7 +941,9 @@ impl StreamItApp {
             let mut shared = self.config.write().unwrap_or_else(|e| e.into_inner());
             let mut c = self.draft.clone();
             c.cues = shared.cues.clone();
-            c.multiview.presets = shared.multiview.presets.clone();
+            for t in Target::ALL {
+                c.routing_mut(t).presets = shared.routing(t).presets.clone();
+            }
             *shared = c.clone();
             c
         };

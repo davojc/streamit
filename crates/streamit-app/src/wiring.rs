@@ -19,6 +19,7 @@ use streamit_core::devices::{
 };
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
 use streamit_core::golive::Stage;
+use streamit_core::routing::{Target, TargetRead};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{Instrument, info, warn};
@@ -573,17 +574,26 @@ impl Probes {
         }
     }
 
-    /// The input on each MultiView view (fed by `outputs`; 0 = not set) and the
-    /// VideoHub's input labels. A view whose output is unset or unreadable is `None`.
-    pub async fn read_multiview(&self, outputs: [u16; 4]) -> ([Option<u16>; 4], Vec<String>) {
-        let hub = &self.devices.hub;
-        let mut views = [None; 4];
-        for (v, out) in outputs.into_iter().enumerate() {
-            if out != 0 {
-                views[v] = hub.route_of(out).await.ok().filter(|&i| i != 0);
+    /// For each routing target: the router output feeding each destination (from `c`), the
+    /// input on each (`None` when not fed or unreadable) and, for the ATEMs, their program
+    /// and preview. Also the VideoHub's input labels.
+    pub async fn read_routing(&self, c: &Config) -> (Vec<String>, [TargetRead; 3]) {
+        let d = &self.devices;
+        let mut reads: [TargetRead; 3] = Default::default();
+        for t in Target::ALL {
+            let outputs = c.routing_outputs(t);
+            let mut dests = Vec::with_capacity(outputs.len());
+            for &out in &outputs {
+                dests.push(if out == 0 { None } else { d.hub.route_of(out).await.ok().filter(|&i| i != 0) });
             }
+            let (program, preview) = match t {
+                Target::MultiView => (None, None),
+                Target::StreamAtem => (d.stream.program().await.ok(), d.stream.preview().await.ok()),
+                Target::ScreensAtem => (d.screens.program().await.ok(), d.screens.preview().await.ok()),
+            };
+            reads[t.index()] = TargetRead { outputs, dests, program, preview };
         }
-        (views, hub.input_labels().await.unwrap_or_default())
+        (d.hub.input_labels().await.unwrap_or_default(), reads)
     }
 
     /// One read per device, all at once.
@@ -634,17 +644,17 @@ pub fn spawn_health_poll(
     // Runs in the caller's span, so a simulation's polls log to the simulation log.
     tokio::spawn(
         async move {
-            let mut last_mv = None;
+            let mut last_routing = None;
             loop {
-                // The MultiView's views and the VideoHub's labels, sent when they change.
-                let outputs = config.read().unwrap_or_else(|e| e.into_inner()).multiview.outputs;
-                let mv = probes.read_multiview(outputs).await;
-                if last_mv.as_ref() != Some(&mv) {
-                    let (views, labels) = mv.clone();
-                    if tx.send(Command::MultiViewRead { views, labels }).await.is_err() {
+                // What the VideoHub feeds and the ATEMs show, sent when it changes.
+                let c = config.read().unwrap_or_else(|e| e.into_inner()).clone();
+                let routing = probes.read_routing(&c).await;
+                if last_routing.as_ref() != Some(&routing) {
+                    let (labels, targets) = routing.clone();
+                    if tx.send(Command::RoutingRead { labels, targets }).await.is_err() {
                         return;
                     }
-                    last_mv = Some(mv);
+                    last_routing = Some(routing);
                 }
                 tokio::time::sleep(POLL_EVERY).await;
                 let out = config.read().unwrap_or_else(|e| e.into_inner()).videohub.input8_output;
@@ -895,13 +905,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multiview_read_skips_unset_and_unrouted_views() {
+    async fn routing_read_skips_unset_and_unrouted_destinations() {
         let (d, _log, h) = fake_devices();
         h.hub.set_route(37, 6);
         h.hub.set_route(39, 12);
+        h.hub.set_route(11, 13);
+        h.stream.set_program_state(3);
+        let mut c = Config::default();
+        c.multiview.outputs = vec![37, 0, 39, 40];
+        c.videohub.input8_output = 11;
         let p = Probes::new(d, Late::new("x"), Late::new("x"));
-        let (views, labels) = p.read_multiview([37, 0, 39, 40]).await;
-        assert_eq!(views, [Some(6), None, Some(12), None], "output 40 reads 0: nothing routed");
+        let (labels, reads) = p.read_routing(&c).await;
         assert!(labels.is_empty());
+        let mv = &reads[Target::MultiView.index()];
+        assert_eq!(mv.dests, vec![Some(6), None, Some(12), None], "output 40 reads 0: nothing routed");
+        assert_eq!(mv.program, None);
+        let stream = &reads[Target::StreamAtem.index()];
+        assert_eq!(stream.outputs, vec![0, 0, 0, 0, 0, 0, 0, 11], "input 8 is the video output");
+        assert_eq!(stream.dests[7], Some(13));
+        assert_eq!(stream.program, Some(3));
     }
 }

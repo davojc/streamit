@@ -1,5 +1,6 @@
 //! StreamIt configuration: device addresses, input numbers and timings.
 
+use crate::routing::{RoutingConfig, STREAM_VIDEO_INPUT, Target};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -177,14 +178,42 @@ pub struct Config {
     pub timings: Timings,
     pub playout: PlayoutConfig,
     pub ndi: NdiConfig,
-    /// The MultiView 4's feeds and presets.
-    pub multiview: crate::multiview::MultiViewConfig,
+    /// Routing: what feeds the MultiView 4's views and the ATEMs' inputs, and the presets.
+    pub multiview: RoutingConfig,
+    pub stream_routing: RoutingConfig,
+    pub screens_routing: RoutingConfig,
     /// The roll-in cue list, saved so it survives a restart.
     #[serde(default)]
     pub cues: Vec<Cue>,
 }
 
 impl Config {
+    pub fn routing(&self, t: Target) -> &RoutingConfig {
+        match t {
+            Target::MultiView => &self.multiview,
+            Target::StreamAtem => &self.stream_routing,
+            Target::ScreensAtem => &self.screens_routing,
+        }
+    }
+
+    pub fn routing_mut(&mut self, t: Target) -> &mut RoutingConfig {
+        match t {
+            Target::MultiView => &mut self.multiview,
+            Target::StreamAtem => &mut self.stream_routing,
+            Target::ScreensAtem => &mut self.screens_routing,
+        }
+    }
+
+    /// The VideoHub output feeding each destination of `t` (0 = not from the router).
+    /// Stream ATEM input 8 is always the output StreamIt uses for videos.
+    pub fn routing_outputs(&self, t: Target) -> Vec<u16> {
+        let mut outputs = self.routing(t).outputs_for(t.size());
+        if t == Target::StreamAtem {
+            outputs[STREAM_VIDEO_INPUT] = self.videohub.input8_output;
+        }
+        outputs
+    }
+
     /// Load from `path`. A missing file yields the defaults.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
         match std::fs::read_to_string(path) {

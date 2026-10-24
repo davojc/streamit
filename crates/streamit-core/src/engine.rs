@@ -21,9 +21,9 @@ use crate::config::Config;
 use crate::devices::{self, BroadcastCheck, BroadcastSummary, DeviceError, Devices, Fix, Phase};
 use crate::end::{EndOutcome, end_service};
 use crate::golive::{self, CountdownOutcome, CountdownReport, Readiness, Stage, Stage0Report, T0Error};
-use crate::multiview::{MultiView, Preset, VIEWS};
 use crate::recovery::{self, Assessment, Offer};
 use crate::rollin::{self, Cue, CueList, CueState, RollinOutcome, RollinReport};
+use crate::routing::{Preset, RoutingState, Target, TargetRead, TargetState, locked};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,20 +65,22 @@ pub enum Command {
     /// Replace the cue list (after an edit in the window). Ignored with a warning
     /// while a video plays, so the playing index keeps meaning the same cue.
     SetCues(Vec<Cue>),
-    /// Show `input` on MultiView view `view` (0..4): route the view's VideoHub output.
-    /// Allowed at any time, during a service too; it never touches the stream.
-    RouteView {
-        view: usize,
+    /// Show `input` on destination `dest` of `target`: route the VideoHub output feeding
+    /// it. Allowed during a service too, except Stream ATEM input 8 while a sequence runs.
+    /// The window and the deck ask first when it changes an input on program.
+    Route {
+        target: Target,
+        dest: usize,
         input: u16,
     },
-    /// Route every view to the preset in `slot` (1..=8).
-    RecallPreset(u8),
-    /// Replace the presets (after a save or a clear in the window).
-    SetPresets(Vec<Preset>),
-    /// What the VideoHub reports for the MultiView, from the health poll.
-    MultiViewRead {
-        views: [Option<u16>; 4],
+    /// Route `target` to the preset in `slot` (1..=8).
+    RecallPreset(Target, u8),
+    /// Replace a target's presets (after a save or a clear in the window).
+    SetPresets(Target, Vec<Preset>),
+    /// What the VideoHub and the ATEMs report for routing, from the health poll.
+    RoutingRead {
         labels: Vec<String>,
+        targets: [TargetRead; 3],
     },
 }
 
@@ -128,7 +130,7 @@ pub struct Snapshot {
     pub activity: Vec<Activity>,
     /// The engine drives pretend devices: nothing is live.
     pub simulation: bool,
-    pub multiview: MultiView,
+    pub routing: RoutingState,
 }
 
 /// How far the playing roll-in is.
@@ -167,7 +169,7 @@ impl Default for Snapshot {
             on_air_since: None,
             activity: Vec::new(),
             simulation: false,
-            multiview: MultiView::default(),
+            routing: RoutingState::default(),
         }
     }
 }
@@ -342,8 +344,8 @@ impl Engine {
         let (tx, rx) = mpsc::channel(32);
         let (aux, aux_rx) = mpsc::unbounded_channel();
         let cues = CueList::from_cues(read(&c).cues);
-        let multiview = MultiView { presets: read(&c).multiview.presets, ..MultiView::default() };
-        let first = Snapshot { cues: cue_rows(&cues), simulation, multiview, ..Snapshot::default() };
+        let first =
+            Snapshot { cues: cue_rows(&cues), simulation, routing: routing_from(&read(&c)), ..Snapshot::default() };
         let (stx, srx) = watch::channel(first);
         let engine = Engine {
             d,
@@ -634,63 +636,103 @@ impl Engine {
                     s.flash = None;
                 });
             }
-            Command::RouteView { view, input } => {
-                let (view, input) = (*view, *input);
-                if view >= VIEWS.len() || input == 0 {
-                    return self.ignore(&cmd, "no such view or input");
+            Command::Route { target, dest, input } => {
+                let (target, dest, input) = (*target, *dest, *input);
+                if dest >= target.size() || input == 0 {
+                    return self.ignore(&cmd, "no such destination or input");
                 }
-                self.route_views(vec![(view, input)], format!("{}: input {input}", VIEWS[view]));
+                if let Some(why) = self.locked_why(target, dest) {
+                    set_warning(&self.snap, why.clone());
+                    return self.ignore(&cmd, &why);
+                }
+                let what = format!("{} {}: input {input}", target.name(), target.dest_name(dest));
+                self.route_dests(target, vec![(dest, input)], what);
             }
-            Command::RecallPreset(slot) => {
-                let Some(p) = self.snap.borrow().multiview.preset(*slot).cloned() else {
-                    return self.ignore(&cmd, "that preset slot is empty");
+            Command::RecallPreset(target, slot) => {
+                let target = *target;
+                let (p, mut routes) = {
+                    let s = self.snap.borrow();
+                    let t = s.routing.target(target);
+                    let Some(p) = t.preset(*slot).cloned() else {
+                        drop(s);
+                        return self.ignore(&cmd, "that preset slot is empty");
+                    };
+                    let routes = t.changes(&p);
+                    (p, routes)
                 };
-                let current = self.snap.borrow().multiview.views;
-                let routes: Vec<(usize, u16)> =
-                    (0..VIEWS.len()).filter(|&v| current[v] != Some(p.inputs[v])).map(|v| (v, p.inputs[v])).collect();
-                if routes.is_empty() {
-                    return self.ignore(&cmd, "the views already show that preset");
+                if let Some(why) = routes.iter().find_map(|&(d, _)| self.locked_why(target, d)) {
+                    set_warning(&self.snap, format!("{why} The rest of the preset is routed."));
+                    routes.retain(|&(d, _)| self.locked_why(target, d).is_none());
                 }
-                self.route_views(routes, format!("preset {}, {}", p.slot, p.name));
+                if routes.is_empty() {
+                    return self.ignore(&cmd, "nothing to change for that preset");
+                }
+                self.route_dests(target, routes, format!("{} preset {}, {}", target.name(), p.slot, p.name));
             }
-            Command::SetPresets(presets) => {
-                let presets = presets.clone();
-                info!(count = presets.len(), "MultiView presets replaced");
-                self.set(|s| s.multiview.presets = presets);
+            Command::SetPresets(target, presets) => {
+                let (target, presets) = (*target, presets.clone());
+                info!(target = target.name(), count = presets.len(), "routing presets replaced");
+                self.set(|s| s.routing.target_mut(target).presets = presets);
             }
-            Command::MultiViewRead { views, labels } => {
-                let (views, labels) = (*views, labels.clone());
+            Command::RoutingRead { labels, targets } => {
+                let (labels, targets) = (labels.clone(), targets.clone());
                 self.set(|s| {
-                    s.multiview.views = views;
+                    for (state, read) in s.routing.targets.iter_mut().zip(targets) {
+                        state.outputs = read.outputs;
+                        state.dests = read.dests;
+                        state.program = read.program;
+                        state.preview = read.preview;
+                    }
                     if !labels.is_empty() {
-                        s.multiview.labels = labels;
+                        s.routing.labels = labels;
                     }
                 });
             }
         }
     }
 
-    /// Routes each `(view, input)` through that view's VideoHub output, one after another,
-    /// in the background: MultiView routing never waits for, or holds up, a sequence.
-    /// Each view shows its new input once the VideoHub accepts it; a refusal is a warning.
-    fn route_views(&self, routes: Vec<(usize, u16)>, what: String) {
-        let outputs = self.config().multiview.outputs;
-        if routes.iter().any(|(v, _)| outputs[*v] == 0) {
-            set_warning(&self.snap, "MultiView: set which VideoHub output feeds each view (Settings)".into());
+    /// Why `dest` of `target` cannot be routed now, if it cannot.
+    fn locked_why(&self, target: Target, dest: usize) -> Option<String> {
+        let job = self.running.as_ref().map(|r| r.job.name());
+        locked(target, dest, job.is_some()).then(|| {
+            format!(
+                "Stream ATEM input 8 carries StreamIt's videos: it can't be routed while {} is running.",
+                job.unwrap_or("a sequence")
+            )
+        })
+    }
+
+    /// Routes each `(dest, input)` of `target` through the VideoHub output feeding it, one
+    /// after another, in the background: routing never waits for, or holds up, a sequence.
+    /// Each destination shows its new input once the VideoHub accepts it; a refusal is a
+    /// warning.
+    fn route_dests(&self, target: Target, routes: Vec<(usize, u16)>, what: String) {
+        let outputs = self.config().routing_outputs(target);
+        if let Some(&(d, _)) = routes.iter().find(|(d, _)| outputs[*d] == 0) {
+            let msg = format!("{} {}: set which router output feeds it (Settings)", target.name(), target.dest_name(d));
+            set_warning(&self.snap, msg);
             return;
         }
-        info!(what = %what, "MultiView routing");
+        info!(what = %what, "routing");
         let (hub, snap) = (self.d.hub.clone(), self.snap.clone());
         tokio::spawn(
             async move {
-                for (view, input) in routes {
-                    match hub.route(outputs[view], input).await {
-                        Ok(()) => snap.send_modify(|s| s.multiview.views[view] = Some(input)),
+                for (dest, input) in routes {
+                    match hub.route(outputs[dest], input).await {
+                        Ok(()) => snap.send_modify(|s| {
+                            let t = s.routing.target_mut(target);
+                            if t.dests.len() < target.size() {
+                                t.dests.resize(target.size(), None);
+                            }
+                            t.dests[dest] = Some(input);
+                        }),
                         Err(e) => {
-                            set_warning(
-                                &snap,
-                                format!("MultiView {}: could not route input {input}: {e}", VIEWS[view]),
+                            let msg = format!(
+                                "{} {}: could not route input {input}: {e}",
+                                target.name(),
+                                target.dest_name(dest)
                             );
+                            set_warning(&snap, msg);
                             return;
                         }
                     }
@@ -1430,6 +1472,21 @@ fn store_levels(levels: &Mutex<LiveLevels>, l: LiveLevels, file: Option<&PathBuf
 fn set_warning(snap: &Shared, msg: String) {
     info!(warning = %msg, "warning");
     snap.send_modify(|s| warn_in(s, msg));
+}
+
+/// The routing the window and the deck start from: the outputs and presets in `c`,
+/// nothing known yet about what is on each destination.
+fn routing_from(c: &Config) -> RoutingState {
+    RoutingState {
+        labels: Vec::new(),
+        targets: Target::ALL.map(|t| TargetState {
+            outputs: c.routing_outputs(t),
+            dests: vec![None; t.size()],
+            presets: c.routing(t).presets.clone(),
+            program: None,
+            preview: None,
+        }),
+    }
 }
 
 fn cue_rows(l: &CueList) -> Vec<(Cue, CueState)> {
@@ -2915,99 +2972,157 @@ mod tests {
         assert!(!snap(&e).simulation);
     }
 
-    // ---- MultiView
+    // ---- routing
 
-    /// The MultiView fed by VideoHub outputs 37..=40.
-    fn mv_cfg() -> Arc<RwLock<Config>> {
+    /// The MultiView fed by VideoHub outputs 37..=40; the Stream ATEM's inputs 1-4 by 1-4.
+    fn rt_cfg() -> Arc<RwLock<Config>> {
         let c = cfg(vec![]);
-        c.write().unwrap().multiview.outputs = [37, 38, 39, 40];
+        {
+            let mut w = c.write().unwrap();
+            w.multiview.outputs = vec![37, 38, 39, 40];
+            w.stream_routing.outputs = vec![1, 2, 3, 4];
+        }
         c
     }
 
-    fn preset(slot: u8, inputs: [u16; 4]) -> Preset {
-        Preset { slot, name: format!("P{slot}"), inputs }
+    fn preset(slot: u8, inputs: &[u16]) -> Preset {
+        Preset { slot, name: format!("P{slot}"), inputs: inputs.to_vec() }
+    }
+
+    fn read(mv: [u16; 4], stream: [u16; 4], program: u16) -> Command {
+        let mut targets: [TargetRead; 3] = Default::default();
+        targets[0] =
+            TargetRead { outputs: vec![37, 38, 39, 40], dests: mv.map(Some).to_vec(), ..TargetRead::default() };
+        let mut dests: Vec<Option<u16>> = stream.map(Some).to_vec();
+        dests.resize(8, None);
+        targets[1] =
+            TargetRead { outputs: vec![1, 2, 3, 4, 0, 0, 0, OUT], dests, program: Some(program), preview: None };
+        Command::RoutingRead { labels: vec![], targets }
+    }
+
+    fn hub_routes(log: &CallLog) -> Vec<Call> {
+        log.calls().into_iter().filter(|c| matches!(c, Call::HubRoute { output, .. } if *output != OUT)).collect()
     }
 
     #[tokio::test(start_paused = true)]
-    async fn route_view_routes_its_output_and_shows_the_input() {
+    async fn route_routes_the_output_feeding_the_destination() {
         let (d, log, _h) = rig();
-        let mut e = Engine::spawn(d, mv_cfg());
-        send(&e, Command::RouteView { view: 2, input: 12 }).await;
+        let mut e = Engine::spawn(d, rt_cfg());
+        send(&e, Command::Route { target: Target::MultiView, dest: 2, input: 12 }).await;
         until_call(&log, Call::HubRoute { output: 39, input: 12 }).await;
-        let s = until(&mut e, "view 2 on input 12", |s| s.multiview.views[2] == Some(12)).await;
-        assert_eq!(s.multiview.views, [None, None, Some(12), None]);
+        let s = until(&mut e, "view 2 on input 12", |s| s.routing.target(Target::MultiView).dest(2) == Some(12)).await;
+        assert_eq!(s.routing.target(Target::MultiView).dests, vec![None, None, Some(12), None]);
+        send(&e, Command::Route { target: Target::StreamAtem, dest: 3, input: 25 }).await;
+        until_call(&log, Call::HubRoute { output: 4, input: 25 }).await;
     }
 
     #[tokio::test(start_paused = true)]
-    async fn route_view_works_during_a_service() {
+    async fn route_works_during_a_service() {
         let (d, log, h) = rig();
         h.yt.set_life_cycle("live");
-        let mut e = Engine::spawn(d, mv_cfg());
+        let mut e = Engine::spawn(d, rt_cfg());
         until(&mut e, "live", |s| s.stage == Stage::Live).await;
-        send(&e, Command::RouteView { view: 0, input: 3 }).await;
-        until_call(&log, Call::HubRoute { output: 37, input: 3 }).await;
+        send(&e, Command::Route { target: Target::StreamAtem, dest: 0, input: 3 }).await;
+        until_call(&log, Call::HubRoute { output: 1, input: 3 }).await;
     }
 
     #[tokio::test(start_paused = true)]
-    async fn route_view_without_an_output_set_warns_and_routes_nothing() {
+    async fn stream_input_8_uses_the_video_output_and_locks_while_a_sequence_runs() {
         let (d, log, _h) = rig();
-        let mut e = Engine::spawn(d, cfg(vec![]));
-        send(&e, Command::RouteView { view: 1, input: 3 }).await;
+        let mut e = Engine::spawn(d, rt_cfg());
+        assert_eq!(snap(&e).routing.target(Target::StreamAtem).output(7), OUT, "the input-8 output");
+        send(&e, Command::Countdown).await;
+        until(&mut e, "the countdown", |s| s.job.is_some()).await;
+        send(&e, Command::Route { target: Target::StreamAtem, dest: 7, input: 9 }).await;
+        let s = until(&mut e, "a warning", |s| s.last_warning.as_deref().is_some_and(|w| w.contains("input 8"))).await;
+        assert!(s.last_warning.unwrap().contains("the countdown"), "names what is running");
+        assert!(!log.calls().contains(&Call::HubRoute { output: OUT, input: 9 }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_destination_not_fed_by_the_router_warns_and_routes_nothing() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, rt_cfg());
+        send(&e, Command::Route { target: Target::ScreensAtem, dest: 1, input: 3 }).await;
         let s =
-            until(&mut e, "a warning", |s| s.last_warning.as_deref().is_some_and(|w| w.contains("MultiView"))).await;
-        assert_eq!(s.multiview.views, [None; 4]);
-        assert!(!log.calls().iter().any(|c| matches!(c, Call::HubRoute { output: 38, .. })));
+            until(&mut e, "a warning", |s| s.last_warning.as_deref().is_some_and(|w| w.contains("Screens ATEM"))).await;
+        assert!(s.last_warning.unwrap().contains("Input 2"));
+        assert!(hub_routes(&log).is_empty());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_refused_route_warns_and_keeps_the_view() {
+    async fn a_refused_route_warns_and_keeps_the_destination() {
         let (d, _log, h) = rig();
-        let mut e = Engine::spawn(d, mv_cfg());
-        send(&e, Command::MultiViewRead { views: [Some(1), Some(2), Some(3), Some(4)], labels: vec![] }).await;
-        until(&mut e, "the read", |s| s.multiview.views[0] == Some(1)).await;
+        let mut e = Engine::spawn(d, rt_cfg());
+        send(&e, read([1, 2, 3, 4], [1, 2, 3, 4], 1)).await;
+        until(&mut e, "the read", |s| s.routing.target(Target::MultiView).dest(0) == Some(1)).await;
         h.hub.fail_next("route");
-        send(&e, Command::RouteView { view: 0, input: 9 }).await;
+        send(&e, Command::Route { target: Target::MultiView, dest: 0, input: 9 }).await;
         let s = until(&mut e, "a warning", |s| s.last_warning.as_deref().is_some_and(|w| w.contains("Top left"))).await;
-        assert_eq!(s.multiview.views[0], Some(1));
+        assert_eq!(s.routing.target(Target::MultiView).dest(0), Some(1));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn recall_routes_only_the_views_that_differ() {
+    async fn recall_routes_only_what_differs() {
         let (d, log, _h) = rig();
-        let mut e = Engine::spawn(d, mv_cfg());
-        send(&e, Command::SetPresets(vec![preset(3, [1, 2, 7, 8])])).await;
-        send(&e, Command::MultiViewRead { views: [Some(1), Some(2), Some(3), Some(4)], labels: vec![] }).await;
-        until(&mut e, "the read", |s| s.multiview.views[0] == Some(1)).await;
-        send(&e, Command::RecallPreset(3)).await;
-        let s = until(&mut e, "the preset", |s| s.multiview.views == [Some(1), Some(2), Some(7), Some(8)]).await;
-        assert!(s.multiview.is_current(&preset(3, [1, 2, 7, 8])));
-        let routed: Vec<_> =
-            log.calls().into_iter().filter(|c| matches!(c, Call::HubRoute { output: 37..=40, .. })).collect();
-        assert_eq!(routed, vec![Call::HubRoute { output: 39, input: 7 }, Call::HubRoute { output: 40, input: 8 }]);
+        let mut e = Engine::spawn(d, rt_cfg());
+        send(&e, Command::SetPresets(Target::MultiView, vec![preset(3, &[1, 2, 7, 8])])).await;
+        send(&e, read([1, 2, 3, 4], [1, 2, 3, 4], 1)).await;
+        until(&mut e, "the read", |s| s.routing.target(Target::MultiView).dest(0) == Some(1)).await;
+        send(&e, Command::RecallPreset(Target::MultiView, 3)).await;
+        let s = until(&mut e, "the preset", |s| {
+            s.routing.target(Target::MultiView).dests == vec![Some(1), Some(2), Some(7), Some(8)]
+        })
+        .await;
+        assert!(s.routing.target(Target::MultiView).is_current(&preset(3, &[1, 2, 7, 8])));
+        assert_eq!(
+            hub_routes(&log),
+            vec![Call::HubRoute { output: 39, input: 7 }, Call::HubRoute { output: 40, input: 8 }]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_atem_preset_skips_inputs_not_fed_by_the_router() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, rt_cfg());
+        send(&e, Command::SetPresets(Target::StreamAtem, vec![preset(1, &[5, 2, 3, 4, 9, 0, 0, 0])])).await;
+        send(&e, read([1, 2, 3, 4], [1, 2, 3, 4], 2)).await;
+        until(&mut e, "the read", |s| s.routing.target(Target::StreamAtem).dest(0) == Some(1)).await;
+        send(&e, Command::RecallPreset(Target::StreamAtem, 1)).await;
+        until_call(&log, Call::HubRoute { output: 1, input: 5 }).await;
+        send(&e, Command::Refresh).await;
+        sleep(MS(500)).await;
+        assert_eq!(hub_routes(&log), vec![Call::HubRoute { output: 1, input: 5 }], "input 5 is not fed");
     }
 
     #[tokio::test(start_paused = true)]
     async fn an_empty_preset_does_nothing() {
         let (d, log, _h) = rig();
-        let e = Engine::spawn(d, mv_cfg());
-        send(&e, Command::RecallPreset(5)).await;
+        let e = Engine::spawn(d, rt_cfg());
+        send(&e, Command::RecallPreset(Target::StreamAtem, 5)).await;
         send(&e, Command::Refresh).await;
         sleep(MS(500)).await;
-        assert!(!log.calls().iter().any(|c| matches!(c, Call::HubRoute { output: 37..=40, .. })));
+        assert!(hub_routes(&log).is_empty());
     }
 
     #[tokio::test(start_paused = true)]
     async fn presets_start_from_the_config_and_reads_keep_the_labels() {
         let (d, _log, _h) = rig();
-        let c = mv_cfg();
-        c.write().unwrap().multiview.presets = vec![preset(2, [1, 1, 1, 1])];
+        let c = rt_cfg();
+        c.write().unwrap().screens_routing.presets = vec![preset(2, &[1, 1])];
         let mut e = Engine::spawn(d, c);
-        assert_eq!(snap(&e).multiview.presets, vec![preset(2, [1, 1, 1, 1])]);
-        send(&e, Command::MultiViewRead { views: [Some(1); 4], labels: vec!["Cam 1".into()] }).await;
-        until(&mut e, "labels", |s| s.multiview.label(1) == "Cam 1").await;
+        assert_eq!(snap(&e).routing.target(Target::ScreensAtem).presets, vec![preset(2, &[1, 1])]);
+        let mut first = read([1; 4], [1; 4], 1);
+        if let Command::RoutingRead { labels, .. } = &mut first {
+            *labels = vec!["Cam 1".into()];
+        }
+        send(&e, first).await;
+        until(&mut e, "labels", |s| s.routing.label(1) == "Cam 1").await;
         // A read without labels (the VideoHub did not resend them) keeps the ones it had.
-        send(&e, Command::MultiViewRead { views: [Some(2); 4], labels: vec![] }).await;
-        let s = until(&mut e, "the second read", |s| s.multiview.views[0] == Some(2)).await;
-        assert_eq!(s.multiview.label(1), "Cam 1");
+        send(&e, read([2; 4], [2; 4], 3)).await;
+        let s = until(&mut e, "the second read", |s| s.routing.target(Target::MultiView).dest(0) == Some(2)).await;
+        assert_eq!(s.routing.label(1), "Cam 1");
+        assert_eq!(s.routing.target(Target::StreamAtem).program, Some(3));
+        assert!(s.routing.target(Target::StreamAtem).on_air(2));
     }
 }

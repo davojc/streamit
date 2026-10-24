@@ -12,9 +12,10 @@ pub mod render;
 
 use elgato_streamdeck::info::Kind;
 use elgato_streamdeck::{AsyncStreamDeck, DeviceStateUpdate, StreamDeckError, list_devices, new_hidapi};
-use layout::{KEYS, KeyLook, Page, Press, appearance, press_for};
+use layout::{KEYS, KeyLook, Page, Press, appearance_with, needs_second_press, press_for};
 use std::time::Duration;
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind, EngineHandle, Snapshot};
+use streamit_core::routing::Target;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, block_in_place};
 use tokio::time::{MissedTickBehavior, interval};
@@ -25,6 +26,19 @@ pub const RECONNECT_EVERY: Duration = Duration::from_secs(2);
 /// Blink toggle period: toggling every 250 ms is a 2 Hz blink (two on/off cycles a second).
 pub const BLINK_TOGGLE: Duration = Duration::from_millis(250);
 const BRIGHTNESS: u8 = 80;
+/// How long a preset that would change what is on air waits for its second press.
+pub const SECOND_PRESS: Duration = Duration::from_secs(3);
+
+/// A preset waiting for its second press, and until when.
+type Armed = Option<(Target, u8, tokio::time::Instant)>;
+
+/// A press of the preset in `slot` of `t`: whether to recall it now, and what is armed
+/// after. A preset that changes what is on air (`needs`) recalls only on a second press
+/// within `SECOND_PRESS`; any other press disarms.
+fn second_press(armed: Armed, t: Target, slot: u8, needs: bool, now: tokio::time::Instant) -> (bool, Armed) {
+    let waiting = armed.is_some_and(|(at, aslot, until)| at == t && aslot == slot && now < until);
+    if needs && !waiting { (false, Some((t, slot, now + SECOND_PRESS))) } else { (true, None) }
+}
 
 pub fn is_xl(kind: Kind) -> bool {
     matches!(kind, Kind::Xl | Kind::XlV2 | Kind::XlV2Module)
@@ -106,11 +120,13 @@ async fn draw(
     page: Page,
     snap: &Snapshot,
     phase: bool,
+    armed: Armed,
     cache: &mut [Option<KeyLook>],
 ) -> Result<(), SessionError> {
     let mut changed = false;
+    let armed = armed.map(|(t, slot, _)| (t, slot));
     for key in 0..KEYS {
-        let look = appearance(page, key, snap, phase);
+        let look = appearance_with(page, key, snap, phase, armed);
         if cache[key as usize].as_ref() == Some(&look) {
             continue;
         }
@@ -158,11 +174,12 @@ async fn session(dev: &AsyncStreamDeck, handle: &mut EngineHandle) -> Result<(),
         let mut cache: Vec<Option<KeyLook>> = vec![None; KEYS as usize];
         // Each connection starts on Home; the deck changes page only when a key says so.
         let mut page = Page::Home;
+        let mut armed: Armed = None;
         let mut phase = true;
         let mut ticker = interval(BLINK_TOGGLE);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut snap = handle.rx.borrow_and_update().clone();
-        draw(dev, page, &snap, phase, &mut cache).await?;
+        draw(dev, page, &snap, phase, armed, &mut cache).await?;
         loop {
             tokio::select! {
                 changed = handle.rx.changed() => {
@@ -170,22 +187,35 @@ async fn session(dev: &AsyncStreamDeck, handle: &mut EngineHandle) -> Result<(),
                         return Ok(());
                     }
                     snap = handle.rx.borrow_and_update().clone();
-                    draw(dev, page, &snap, phase, &mut cache).await?;
+                    draw(dev, page, &snap, phase, armed, &mut cache).await?;
                 }
                 _ = ticker.tick() => {
                     phase = !phase;
-                    draw(dev, page, &snap, phase, &mut cache).await?;
+                    if armed.is_some_and(|(_, _, until)| tokio::time::Instant::now() >= until) {
+                        armed = None;
+                    }
+                    draw(dev, page, &snap, phase, armed, &mut cache).await?;
                 }
                 press = key_rx.recv() => match press {
                     Some(Ok(key)) => match decide_press(page, key, &handle.rx) {
                         Some(Press::Go(to)) => {
                             page = to;
-                            draw(dev, page, &snap, phase, &mut cache).await?;
+                            armed = None;
+                            draw(dev, page, &snap, phase, armed, &mut cache).await?;
                         }
                         Some(Press::Command(cmd)) => {
                             if handle.tx.send(cmd).await.is_err() {
                                 return Ok(());
                             }
+                        }
+                        Some(Press::Recall(t, slot)) => {
+                            let needs = needs_second_press(&handle.rx.borrow(), t, slot);
+                            let (recall, next) = second_press(armed, t, slot, needs, tokio::time::Instant::now());
+                            armed = next;
+                            if recall && handle.tx.send(Command::RecallPreset(t, slot)).await.is_err() {
+                                return Ok(());
+                            }
+                            draw(dev, page, &snap, phase, armed, &mut cache).await?;
                         }
                         None => {}
                     },
@@ -213,5 +243,25 @@ mod tests {
         // The offer is withdrawn; the receiver never polled changed().
         tx.send(Snapshot::default()).unwrap();
         assert_eq!(decide_press(Page::Stream, 15, &rx), None);
+    }
+
+    #[test]
+    fn an_on_air_preset_recalls_on_the_second_press_within_3_s() {
+        let t0 = tokio::time::Instant::now();
+        let (recall, armed) = second_press(None, Target::StreamAtem, 2, true, t0);
+        assert!(!recall, "the first press only arms");
+        assert_eq!(armed, Some((Target::StreamAtem, 2, t0 + SECOND_PRESS)));
+        let (recall, armed2) = second_press(armed, Target::StreamAtem, 2, true, t0 + Duration::from_secs(2));
+        assert!(recall, "pressed again in time");
+        assert_eq!(armed2, None);
+        // Too late: it arms again instead.
+        let (recall, _) = second_press(armed, Target::StreamAtem, 2, true, t0 + Duration::from_secs(4));
+        assert!(!recall);
+        // Another preset does not count as the second press.
+        let (recall, armed3) = second_press(armed, Target::StreamAtem, 3, true, t0);
+        assert!(!recall);
+        assert_eq!(armed3.map(|a| a.1), Some(3));
+        // Nothing on air changes: recalled at once.
+        assert_eq!(second_press(None, Target::MultiView, 1, false, t0), (true, None));
     }
 }

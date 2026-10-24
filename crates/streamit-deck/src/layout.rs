@@ -3,9 +3,9 @@
 use std::time::Duration;
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind, FlashKey, Snapshot};
 use streamit_core::golive::{Readiness, Stage};
-use streamit_core::multiview::PRESET_SLOTS;
 use streamit_core::recovery::Offer;
 use streamit_core::rollin::CueState;
+use streamit_core::routing::{PRESET_SLOTS, Target, TargetState, VIEW_KEYS, locked};
 
 pub const KEYS: u8 = 32;
 pub const COLS: u8 = 8;
@@ -41,14 +41,19 @@ pub enum Page {
     Home,
     Stream,
     Videos,
-    MultiView,
+    /// Picks what to route: the MultiView or one of the ATEMs.
+    Routing,
+    /// One routing target: its presets and what each destination shows.
+    Target(Target),
 }
 
-/// What a key press does: an engine command, or a move to another page.
+/// What a key press does: an engine command, a move to another page, or a preset to
+/// recall (the deck asks for a second press first when it would change what is on air).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Press {
     Command(Command),
     Go(Page),
+    Recall(Target, u8),
 }
 
 /// Every device's health, across the top of Home.
@@ -75,7 +80,13 @@ const VIDEOS_STATUS: [(DeviceKind, &str); 4] = [
     (DeviceKind::DeckLink, "DECKLINK"),
     (DeviceKind::Ndi, "NDI"),
 ];
+const ROUTING_STATUS: [(DeviceKind, &str); 1] = [(DeviceKind::VideoHub, "VIDEO\nHUB")];
+/// A target page: HOME, then ROUTING (back) at key 1, then these from key 2.
 const MULTIVIEW_STATUS: [(DeviceKind, &str); 1] = [(DeviceKind::VideoHub, "VIDEO\nHUB")];
+const STREAM_ROUTING_STATUS: [(DeviceKind, &str); 2] =
+    [(DeviceKind::VideoHub, "VIDEO\nHUB"), (DeviceKind::StreamAtem, "STREAM\nATEM")];
+const SCREENS_ROUTING_STATUS: [(DeviceKind, &str); 2] =
+    [(DeviceKind::VideoHub, "VIDEO\nHUB"), (DeviceKind::ScreensAtem, "SCREENS\nATEM")];
 
 /// The key that shows the service stage (top right), on every page.
 pub const PHASE_KEY: u8 = 7;
@@ -84,8 +95,15 @@ pub const HOME_KEY: u8 = 0;
 
 // Home: the three pages.
 const GO_STREAM: u8 = 17;
-const GO_MULTIVIEW: u8 = 19;
+const GO_ROUTING: u8 = 19;
 const GO_VIDEOS: u8 = 21;
+
+// Routing: the three targets, in the same places.
+const GO_MULTIVIEW: u8 = 17;
+const GO_STREAM_ATEM: u8 = 19;
+const GO_SCREENS_ATEM: u8 = 21;
+/// Back to Routing, on a target page.
+pub const ROUTING_KEY: u8 = 1;
 
 // Stream: the service keys (row 1).
 const PREPARE: u8 = 8;
@@ -101,9 +119,13 @@ const RECOVER: u8 = 15;
 const STOP_VIDEO: u8 = 15;
 const UNMUTE: u8 = 23;
 
-// MultiView: the presets (row 1), and the four views laid out like the MultiView.
+// A target page: the presets (row 1); below, the MultiView's four views laid out like the
+// MultiView, or an ATEM's eight inputs along row 2.
 const FIRST_PRESET: u8 = 8;
-const VIEW_KEYS: [u8; 4] = [19, 20, 27, 28];
+const MV_KEYS: [u8; 4] = [19, 20, 27, 28];
+const FIRST_ATEM_INPUT: u8 = 16;
+/// An ATEM input that is not on program or preview.
+const INPUT_BG: Rgb = Rgb(42, 53, 80);
 /// Each view's colour, as in the window.
 pub const VIEW_COLOURS: [Rgb; 4] = [Rgb(76, 154, 255), Rgb(245, 165, 36), Rgb(61, 214, 140), Rgb(232, 121, 201)];
 const NAV: Rgb = Rgb(59, 42, 107);
@@ -140,6 +162,13 @@ fn go_live_pressable(snap: &Snapshot) -> bool {
     matches!(snap.stage, Stage::Idle | Stage::Prepared(_) | Stage::Countdown { .. }) || offered(snap, Offer::GoLive)
 }
 
+/// Recalling the preset in `slot` of `t` would change an input on program: the deck asks
+/// for a second press first.
+pub fn needs_second_press(snap: &Snapshot, t: Target, slot: u8) -> bool {
+    let state = snap.routing.target(t);
+    state.preset(slot).is_some_and(|p| state.touches_on_air(&state.changes(p)))
+}
+
 /// UNMUTE lifts a roll-in's mic duck, so it only works while a video plays. The mics
 /// are also down on the holding still or after a failed T-0; UNMUTE is inert then.
 fn unmute_pressable(snap: &Snapshot) -> bool {
@@ -155,10 +184,26 @@ pub fn press_for(page: Page, key: u8, snap: &Snapshot) -> Option<Press> {
         Page::Home => {
             return match key {
                 GO_STREAM => Some(Press::Go(Page::Stream)),
-                GO_MULTIVIEW => Some(Press::Go(Page::MultiView)),
+                GO_ROUTING => Some(Press::Go(Page::Routing)),
                 GO_VIDEOS => Some(Press::Go(Page::Videos)),
                 _ => None,
             };
+        }
+        Page::Routing => {
+            return match key {
+                GO_MULTIVIEW => Some(Press::Go(Page::Target(Target::MultiView))),
+                GO_STREAM_ATEM => Some(Press::Go(Page::Target(Target::StreamAtem))),
+                GO_SCREENS_ATEM => Some(Press::Go(Page::Target(Target::ScreensAtem))),
+                _ => None,
+            };
+        }
+        Page::Target(t) => {
+            if key == ROUTING_KEY {
+                return Some(Press::Go(Page::Routing));
+            }
+            return preset_slot(key)
+                .filter(|&slot| snap.routing.target(t).preset(slot).is_some())
+                .map(|slot| Press::Recall(t, slot));
         }
         Page::Stream => match key {
             PREPARE => Some(Command::Prepare),
@@ -178,9 +223,6 @@ pub fn press_for(page: Page, key: u8, snap: &Snapshot) -> Option<Press> {
             (None, UNMUTE) => unmute_pressable(snap).then_some(Command::UnmuteMics),
             _ => None,
         },
-        Page::MultiView => {
-            preset_slot(key).filter(|&slot| snap.multiview.preset(slot).is_some()).map(Command::RecallPreset)
-        }
     };
     cmd.map(Press::Command)
 }
@@ -263,6 +305,18 @@ const CUE_LINE_WIDTH: usize = 9;
 
 /// How `key` on `page` should look. `blink_phase` is the 2 Hz toggle: true is the "on" half.
 pub fn appearance(page: Page, key: u8, snap: &Snapshot, blink_phase: bool) -> KeyLook {
+    appearance_with(page, key, snap, blink_phase, None)
+}
+
+/// `appearance`, with `armed` the preset waiting for its second press (it blinks PRESS
+/// AGAIN).
+pub fn appearance_with(
+    page: Page,
+    key: u8,
+    snap: &Snapshot,
+    blink_phase: bool,
+    armed: Option<(Target, u8)>,
+) -> KeyLook {
     if key == PHASE_KEY {
         let mut l = phase_look(&snap.stage);
         if snap.simulation {
@@ -274,13 +328,23 @@ pub fn appearance(page: Page, key: u8, snap: &Snapshot, blink_phase: bool) -> Ke
     if page != Page::Home && key == HOME_KEY {
         return look("HOME", HOME_BG, WHITE);
     }
+    if matches!(page, Page::Target(_)) && key == ROUTING_KEY {
+        return look("ROUTING", HOME_BG, WHITE);
+    }
     let status: &[(DeviceKind, &str)] = match page {
         Page::Home => &HOME_STATUS,
         Page::Stream => &STREAM_STATUS,
         Page::Videos => &VIDEOS_STATUS,
-        Page::MultiView => &MULTIVIEW_STATUS,
+        Page::Routing => &ROUTING_STATUS,
+        Page::Target(Target::MultiView) => &MULTIVIEW_STATUS,
+        Page::Target(Target::StreamAtem) => &STREAM_ROUTING_STATUS,
+        Page::Target(Target::ScreensAtem) => &SCREENS_ROUTING_STATUS,
     };
-    let first_status = if page == Page::Home { 0 } else { 1 };
+    let first_status = match page {
+        Page::Home => 0,
+        Page::Target(_) => 2,
+        _ => 1,
+    };
     if let Some((kind, label)) = key.checked_sub(first_status).and_then(|i| status.get(i as usize)) {
         return status_look(snap, *kind, label);
     }
@@ -288,7 +352,8 @@ pub fn appearance(page: Page, key: u8, snap: &Snapshot, blink_phase: bool) -> Ke
         Page::Home => home_look(key, snap),
         Page::Stream => stream_look(key, snap, blink_phase),
         Page::Videos => videos_look(key, snap, blink_phase),
-        Page::MultiView => multiview_look(key, snap),
+        Page::Routing => routing_look(key),
+        Page::Target(t) => target_look(t, key, snap, blink_phase, armed),
     }
 }
 
@@ -308,7 +373,7 @@ fn status_look(snap: &Snapshot, kind: DeviceKind, label: &str) -> KeyLook {
 fn home_look(key: u8, snap: &Snapshot) -> KeyLook {
     match key {
         GO_STREAM => look("STREAM", NAV, WHITE),
-        GO_MULTIVIEW => look("MULTI\nVIEW", NAV, WHITE),
+        GO_ROUTING => look("ROUTING", NAV, WHITE),
         // A playing video shows here too, so it is not forgotten on another page.
         GO_VIDEOS if snap.playing.is_some() => look("VIDEOS\nPLAYING", RED, WHITE),
         GO_VIDEOS => look("VIDEOS", NAV, WHITE),
@@ -384,32 +449,82 @@ fn videos_look(key: u8, snap: &Snapshot, blink_phase: bool) -> KeyLook {
     }
 }
 
-fn multiview_look(key: u8, snap: &Snapshot) -> KeyLook {
-    let mv = &snap.multiview;
+fn routing_look(key: u8) -> KeyLook {
+    match key {
+        GO_MULTIVIEW => look("MULTI\nVIEW", NAV, WHITE),
+        GO_STREAM_ATEM => look("STREAM\nATEM", NAV, WHITE),
+        GO_SCREENS_ATEM => look("SCREENS\nATEM", NAV, WHITE),
+        _ => blank(),
+    }
+}
+
+fn target_look(t: Target, key: u8, snap: &Snapshot, blink_phase: bool, armed: Option<(Target, u8)>) -> KeyLook {
+    let state = snap.routing.target(t);
+    let label = |i: Option<u16>| i.map_or_else(|| "?".to_string(), |i| snap.routing.label(i).to_uppercase());
     if let Some(slot) = preset_slot(key) {
-        return match mv.preset(slot) {
+        return match state.preset(slot) {
+            Some(_) if armed == Some((t, slot)) => {
+                let mut l = look("PRESS\nAGAIN", AMBER, BLACK);
+                l.blink = true;
+                if !blink_phase {
+                    l.bg = DIM_BG;
+                    l.fg = WHITE;
+                }
+                l
+            }
             Some(p) => {
-                let bg = if mv.is_current(p) { GREEN } else { SLATE };
+                let bg = if state.is_current(p) { GREEN } else { SLATE };
                 look(wrap_cue_name(&p.name.to_uppercase(), CUE_LINE_WIDTH), bg, WHITE)
             }
             None => look(format!("{slot}\nEMPTY"), DIM_BG, DIM_FG),
         };
     }
-    if let Some(v) = VIEW_KEYS.iter().position(|&k| k == key) {
-        let shows = mv.views[v].map_or_else(|| "?".to_string(), |i| mv.label(i).to_uppercase());
-        let name = streamit_core::multiview::VIEW_KEYS[v];
-        // In the view's own colour, so the key matches that view in the window.
-        return look(format!("{name}\n{}", wrap_cue_name(&shows, CUE_LINE_WIDTH)), VIEW_COLOURS[v], BLACK);
+    if t == Target::MultiView {
+        if let Some(v) = MV_KEYS.iter().position(|&k| k == key) {
+            let text = format!("{}\n{}", VIEW_KEYS[v], wrap_cue_name(&label(state.dest(v)), CUE_LINE_WIDTH));
+            // In the view's own colour, so the key matches that view in the window.
+            return look(text, VIEW_COLOURS[v], BLACK);
+        }
+        return blank();
+    }
+    if let Some(i) = key.checked_sub(FIRST_ATEM_INPUT).map(usize::from).filter(|&i| i < t.size()) {
+        return atem_input_look(t, i, state, snap, &label);
     }
     blank()
+}
+
+/// An ATEM input on a routing page: red on program, green on preview, dim when the router
+/// does not feed it.
+fn atem_input_look(
+    t: Target,
+    i: usize,
+    state: &TargetState,
+    snap: &Snapshot,
+    label: &dyn Fn(Option<u16>) -> String,
+) -> KeyLook {
+    let name = format!("IN {}", i + 1);
+    if state.output(i) == 0 {
+        return look(format!("{name}\n—"), DIM_BG, DIM_FG);
+    }
+    if locked(t, i, snap.job.is_some()) {
+        return look(format!("{name}\nLOCKED"), DIM_BG, AMBER);
+    }
+    let text = format!("{name}\n{}", wrap_cue_name(&label(state.dest(i)), CUE_LINE_WIDTH));
+    if state.on_air(i) {
+        look(text, RED, WHITE)
+    } else if state.on_preview(i) {
+        look(text, GREEN, WHITE)
+    } else {
+        look(text, INPUT_BG, WHITE)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use streamit_core::multiview::{MultiView, Preset};
     use streamit_core::rollin::{Cue, Destination};
+    use streamit_core::routing::{Preset, RoutingState, TargetState};
 
     fn cue(name: &str) -> Cue {
         Cue {
@@ -438,9 +553,9 @@ mod tests {
     fn home_opens_the_three_pages_and_home_comes_back() {
         let s = Snapshot::default();
         assert_eq!(press_for(Page::Home, 17, &s), Some(Press::Go(Page::Stream)));
-        assert_eq!(press_for(Page::Home, 19, &s), Some(Press::Go(Page::MultiView)));
+        assert_eq!(press_for(Page::Home, 19, &s), Some(Press::Go(Page::Routing)));
         assert_eq!(press_for(Page::Home, 21, &s), Some(Press::Go(Page::Videos)));
-        for page in [Page::Stream, Page::Videos, Page::MultiView] {
+        for page in [Page::Stream, Page::Videos, Page::Routing, Page::Target(Target::StreamAtem)] {
             assert_eq!(press_for(page, HOME_KEY, &s), Some(Press::Go(Page::Home)), "{page:?}");
             assert_eq!(appearance(page, HOME_KEY, &s, true).text, "HOME");
         }
@@ -468,7 +583,7 @@ mod tests {
     #[test]
     fn the_stage_key_is_on_every_page() {
         let s = Snapshot { stage: Stage::Live, ..Snapshot::default() };
-        for page in [Page::Home, Page::Stream, Page::Videos, Page::MultiView] {
+        for page in [Page::Home, Page::Stream, Page::Videos, Page::Routing, Page::Target(Target::ScreensAtem)] {
             assert_eq!(appearance(page, PHASE_KEY, &s, true).text, "LIVE", "{page:?}");
             assert_eq!(press_for(page, PHASE_KEY, &s), None);
         }
@@ -488,9 +603,13 @@ mod tests {
         assert_eq!(text(Page::Stream, 6), "");
         assert_eq!(text(Page::Videos, 3), "DECKLINK");
         assert_eq!(text(Page::Videos, 4), "NDI");
-        assert_eq!(text(Page::MultiView, 1), "VIDEO\nHUB");
-        assert_eq!(appearance(Page::MultiView, 1, &s, true).bg, GREEN);
-        assert_eq!(text(Page::MultiView, 2), "");
+        assert_eq!(text(Page::Routing, 1), "VIDEO\nHUB");
+        assert_eq!(appearance(Page::Routing, 1, &s, true).bg, GREEN);
+        assert_eq!(text(Page::Target(Target::MultiView), 1), "ROUTING");
+        assert_eq!(text(Page::Target(Target::MultiView), 2), "VIDEO\nHUB");
+        assert_eq!(text(Page::Target(Target::MultiView), 3), "");
+        assert_eq!(text(Page::Target(Target::StreamAtem), 3), "STREAM\nATEM");
+        assert_eq!(text(Page::Target(Target::ScreensAtem), 3), "SCREENS\nATEM");
     }
 
     #[test]
@@ -530,7 +649,7 @@ mod tests {
     #[test]
     fn service_keys_are_only_on_the_stream_page() {
         let s = Snapshot { offers: vec![Offer::GoLive, Offer::Recover], ..Snapshot::default() };
-        for page in [Page::Home, Page::Videos, Page::MultiView] {
+        for page in [Page::Home, Page::Videos, Page::Routing, Page::Target(Target::StreamAtem)] {
             for k in [8, 9, 11, 12, 13, 14] {
                 assert_ne!(cmd(page, k, &s), Some(Command::Prepare), "{page:?} {k}");
                 assert!(!matches!(cmd(page, k, &s), Some(Command::GoLive | Command::EndService)), "{page:?} {k}");
@@ -726,53 +845,116 @@ mod tests {
         assert_eq!(appearance(Page::Videos, 23, &s, true).bg, DIM_BG);
     }
 
-    // ---- MultiView
+    // ---- Routing
 
-    fn mv_snap() -> Snapshot {
-        Snapshot {
-            multiview: MultiView {
-                views: [Some(1), Some(2), Some(3), None],
-                labels: vec!["Cam 1".into(), "Cam 2".into(), "Choir".into()],
-                presets: vec![
-                    Preset { slot: 1, name: "Service".into(), inputs: [1, 2, 3, 4] },
-                    Preset { slot: 3, name: "Cameras".into(), inputs: [5, 6, 7, 8] },
-                ],
-            },
-            ..Snapshot::default()
+    fn rt_snap() -> Snapshot {
+        let mut routing =
+            RoutingState { labels: vec!["Cam 1".into(), "Cam 2".into(), "Choir".into()], ..RoutingState::default() };
+        routing.targets[0] = TargetState {
+            outputs: vec![37, 38, 39, 40],
+            dests: vec![Some(1), Some(2), Some(3), None],
+            presets: vec![
+                Preset { slot: 1, name: "Service".into(), inputs: vec![1, 2, 3, 4] },
+                Preset { slot: 3, name: "Cameras".into(), inputs: vec![5, 6, 7, 8] },
+            ],
+            program: None,
+            preview: None,
+        };
+        routing.targets[1] = TargetState {
+            outputs: vec![1, 2, 3, 4, 0, 0, 0, 11],
+            dests: vec![Some(1), Some(2), Some(3), Some(4), None, None, None, Some(13)],
+            presets: vec![
+                Preset { slot: 1, name: "Normal".into(), inputs: vec![1, 2, 3, 4, 0, 0, 0, 13] },
+                Preset { slot: 2, name: "Band".into(), inputs: vec![1, 25, 3, 4, 0, 0, 0, 13] },
+                Preset { slot: 4, name: "Lectern".into(), inputs: vec![1, 2, 21, 4, 0, 0, 0, 13] },
+            ],
+            program: Some(2),
+            preview: Some(3),
+        };
+        Snapshot { routing, ..Snapshot::default() }
+    }
+
+    #[test]
+    fn routing_opens_each_target_and_target_pages_go_back() {
+        let s = rt_snap();
+        assert_eq!(press_for(Page::Routing, 17, &s), Some(Press::Go(Page::Target(Target::MultiView))));
+        assert_eq!(press_for(Page::Routing, 19, &s), Some(Press::Go(Page::Target(Target::StreamAtem))));
+        assert_eq!(press_for(Page::Routing, 21, &s), Some(Press::Go(Page::Target(Target::ScreensAtem))));
+        assert_eq!(appearance(Page::Routing, 19, &s, true).text, "STREAM\nATEM");
+        for t in Target::ALL {
+            assert_eq!(press_for(Page::Target(t), ROUTING_KEY, &s), Some(Press::Go(Page::Routing)));
+            assert_eq!(press_for(Page::Target(t), HOME_KEY, &s), Some(Press::Go(Page::Home)));
         }
+        assert_eq!(appearance(Page::Home, 19, &s, true).text, "ROUTING");
     }
 
     #[test]
     fn preset_keys_recall_saved_presets_only() {
-        let s = mv_snap();
-        assert_eq!(cmd(Page::MultiView, 8, &s), Some(Command::RecallPreset(1)));
-        assert_eq!(cmd(Page::MultiView, 10, &s), Some(Command::RecallPreset(3)));
-        assert_eq!(press_for(Page::MultiView, 9, &s), None, "slot 2 is empty");
-        assert_eq!(press_for(Page::MultiView, 15, &s), None, "slot 8 is empty");
-        assert_eq!(appearance(Page::MultiView, 9, &s, true).text, "2\nEMPTY");
-        assert_eq!(appearance(Page::MultiView, 8, &s, true).text, "SERVICE");
+        let s = rt_snap();
+        let mv = Page::Target(Target::MultiView);
+        assert_eq!(press_for(mv, 8, &s), Some(Press::Recall(Target::MultiView, 1)));
+        assert_eq!(press_for(mv, 10, &s), Some(Press::Recall(Target::MultiView, 3)));
+        assert_eq!(press_for(mv, 9, &s), None, "slot 2 is empty");
+        assert_eq!(press_for(mv, 15, &s), None, "slot 8 is empty");
+        assert_eq!(appearance(mv, 9, &s, true).text, "2\nEMPTY");
+        assert_eq!(appearance(mv, 8, &s, true).text, "SERVICE");
+        assert_eq!(press_for(Page::Target(Target::StreamAtem), 9, &s), Some(Press::Recall(Target::StreamAtem, 2)));
     }
 
     #[test]
-    fn the_preset_on_the_views_now_is_green() {
-        let mut s = mv_snap();
-        assert_eq!(appearance(Page::MultiView, 8, &s, true).bg, SLATE, "view 4 is not known yet");
-        s.multiview.views[3] = Some(4);
-        assert_eq!(appearance(Page::MultiView, 8, &s, true).bg, GREEN);
-        assert_eq!(appearance(Page::MultiView, 10, &s, true).bg, SLATE);
+    fn the_preset_on_the_destinations_now_is_green() {
+        let mut s = rt_snap();
+        let mv = Page::Target(Target::MultiView);
+        assert_eq!(appearance(mv, 8, &s, true).bg, SLATE, "view 4 is not known yet");
+        s.routing.targets[0].dests[3] = Some(4);
+        assert_eq!(appearance(mv, 8, &s, true).bg, GREEN);
+        assert_eq!(appearance(mv, 10, &s, true).bg, SLATE);
+        assert_eq!(appearance(Page::Target(Target::StreamAtem), 8, &s, true).bg, GREEN, "Normal is up");
     }
 
     #[test]
     fn view_keys_show_what_each_view_has_on_it() {
-        let s = mv_snap();
-        let l = appearance(Page::MultiView, 19, &s, true);
+        let s = rt_snap();
+        let mv = Page::Target(Target::MultiView);
+        let l = appearance(mv, 19, &s, true);
         assert_eq!((l.text.as_str(), l.bg), ("TL\nCAM 1", VIEW_COLOURS[0]));
-        assert_eq!(appearance(Page::MultiView, 20, &s, true).text, "TR\nCAM 2");
-        assert_eq!(appearance(Page::MultiView, 27, &s, true).text, "BL\nCHOIR");
-        assert_eq!(appearance(Page::MultiView, 28, &s, true).text, "BR\n?", "not known");
+        assert_eq!(appearance(mv, 20, &s, true).text, "TR\nCAM 2");
+        assert_eq!(appearance(mv, 27, &s, true).text, "BL\nCHOIR");
+        assert_eq!(appearance(mv, 28, &s, true).text, "BR\n?", "not known");
         for k in [19, 20, 27, 28] {
-            assert_eq!(press_for(Page::MultiView, k, &s), None, "the view keys only show");
+            assert_eq!(press_for(mv, k, &s), None, "the view keys only show");
         }
+    }
+
+    #[test]
+    fn atem_input_keys_show_program_preview_and_unfed_inputs() {
+        let mut s = rt_snap();
+        let page = Page::Target(Target::StreamAtem);
+        let l = appearance(page, 17, &s, true);
+        assert_eq!((l.text.as_str(), l.bg), ("IN 2\nCAM 2", RED), "input 2 is on program");
+        assert_eq!(appearance(page, 18, &s, true).bg, GREEN, "input 3 is on preview");
+        assert_eq!(appearance(page, 16, &s, true).bg, INPUT_BG);
+        assert_eq!(appearance(page, 20, &s, true).text, "IN 5\n—", "not fed by the router");
+        assert_eq!(appearance(page, 23, &s, true).text, "IN 8\nINPUT 13");
+        s.job = Some("a video");
+        assert_eq!(appearance(page, 23, &s, true).text, "IN 8\nLOCKED");
+        for k in 16..24 {
+            assert_eq!(press_for(page, k, &s), None, "the input keys only show");
+        }
+    }
+
+    #[test]
+    fn a_preset_that_changes_the_on_air_input_needs_a_second_press() {
+        let s = rt_snap();
+        assert!(needs_second_press(&s, Target::StreamAtem, 2), "Band changes input 2, on program");
+        assert!(!needs_second_press(&s, Target::StreamAtem, 4), "Lectern changes input 3, on preview");
+        assert!(!needs_second_press(&s, Target::MultiView, 3), "the MultiView is never on air");
+        assert!(!needs_second_press(&s, Target::StreamAtem, 7), "empty slot");
+        let page = Page::Target(Target::StreamAtem);
+        let on = appearance_with(page, 9, &s, true, Some((Target::StreamAtem, 2)));
+        assert_eq!((on.text.as_str(), on.bg, on.blink), ("PRESS\nAGAIN", AMBER, true));
+        assert_eq!(appearance_with(page, 9, &s, false, Some((Target::StreamAtem, 2))).bg, DIM_BG);
+        assert_eq!(appearance_with(page, 9, &s, true, Some((Target::ScreensAtem, 2))).text, "BAND");
     }
 
     #[test]
