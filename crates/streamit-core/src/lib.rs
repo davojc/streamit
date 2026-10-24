@@ -6,5 +6,6 @@ pub mod engine;
 #[cfg(feature = "fakes")]
 pub mod fakes;
 pub mod golive;
+pub mod multiview;
 pub mod recovery;
 pub mod rollin;

@@ -573,6 +573,19 @@ impl Probes {
         }
     }
 
+    /// The input on each MultiView view (fed by `outputs`; 0 = not set) and the
+    /// VideoHub's input labels. A view whose output is unset or unreadable is `None`.
+    pub async fn read_multiview(&self, outputs: [u16; 4]) -> ([Option<u16>; 4], Vec<String>) {
+        let hub = &self.devices.hub;
+        let mut views = [None; 4];
+        for (v, out) in outputs.into_iter().enumerate() {
+            if out != 0 {
+                views[v] = hub.route_of(out).await.ok().filter(|&i| i != 0);
+            }
+        }
+        (views, hub.input_labels().await.unwrap_or_default())
+    }
+
     /// One read per device, all at once.
     pub async fn poll(&self, hub_output: u16) -> Vec<(DeviceKind, DeviceHealth)> {
         let (stream, screens, hub, encoder, yt) = tokio::join!(
@@ -621,7 +634,18 @@ pub fn spawn_health_poll(
     // Runs in the caller's span, so a simulation's polls log to the simulation log.
     tokio::spawn(
         async move {
+            let mut last_mv = None;
             loop {
+                // The MultiView's views and the VideoHub's labels, sent when they change.
+                let outputs = config.read().unwrap_or_else(|e| e.into_inner()).multiview.outputs;
+                let mv = probes.read_multiview(outputs).await;
+                if last_mv.as_ref() != Some(&mv) {
+                    let (views, labels) = mv.clone();
+                    if tx.send(Command::MultiViewRead { views, labels }).await.is_err() {
+                        return;
+                    }
+                    last_mv = Some(mv);
+                }
                 tokio::time::sleep(POLL_EVERY).await;
                 let out = config.read().unwrap_or_else(|e| e.into_inner()).videohub.input8_output;
                 let mut came_up = Vec::new();
@@ -868,5 +892,16 @@ mod tests {
         }
         assert!(cmds.contains(&Command::DeviceHealth(DeviceKind::VideoHub, DeviceHealth::Ok)), "{cmds:?}");
         assert!(!cmds.contains(&Command::Refresh), "{cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn multiview_read_skips_unset_and_unrouted_views() {
+        let (d, _log, h) = fake_devices();
+        h.hub.set_route(37, 6);
+        h.hub.set_route(39, 12);
+        let p = Probes::new(d, Late::new("x"), Late::new("x"));
+        let (views, labels) = p.read_multiview([37, 0, 39, 40]).await;
+        assert_eq!(views, [Some(6), None, Some(12), None], "output 40 reads 0: nothing routed");
+        assert!(labels.is_empty());
     }
 }

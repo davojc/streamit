@@ -132,6 +132,22 @@ impl StreamSwitcher for SimSwitcher {
     }
 }
 
+/// The pretend VideoHub's input labels (input 1 first); the rest have none.
+const SIM_LABELS: [&str; 10] = [
+    "Camera 1 Wide",
+    "Camera 2 Pulpit",
+    "Camera 3 Choir",
+    "Camera 4 Organ",
+    "ProPresenter",
+    "Stream ATEM PGM",
+    "Screens ATEM PGM",
+    "Stream ATEM PVW",
+    "Lectern laptop",
+    "Hall camera",
+];
+/// How many inputs the pretend VideoHub has.
+const SIM_INPUTS: usize = 40;
+
 #[derive(Clone)]
 pub struct SimRouter {
     sim: SimHandle,
@@ -158,6 +174,11 @@ impl Router for SimRouter {
         w.check_plugged(DeviceKind::VideoHub)?;
         w.pending_routes.insert(output, PendingRoute { input, done_at });
         Ok(())
+    }
+
+    async fn input_labels(&self) -> Result<Vec<String>> {
+        self.sim.lock().check_plugged(DeviceKind::VideoHub)?;
+        Ok((0..SIM_INPUTS).map(|i| SIM_LABELS.get(i).map_or_else(String::new, |l| l.to_string())).collect())
     }
 }
 

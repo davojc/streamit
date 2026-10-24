@@ -106,6 +106,9 @@ impl<T: Router + ?Sized> Router for Logged<T> {
     async fn route(&self, output: u16, input: u16) -> Result<()> {
         done(self.device, format!("route({output}, {input})"), self.inner.route(output, input).await)
     }
+    async fn input_labels(&self) -> Result<Vec<String>> {
+        self.inner.input_labels().await
+    }
 }
 
 #[async_trait]

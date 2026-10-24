@@ -42,6 +42,10 @@ pub trait StreamSwitcher: Switcher {
 pub trait Router: Send + Sync {
     async fn route_of(&self, output: u16) -> Result<u16>;
     async fn route(&self, output: u16, input: u16) -> Result<()>;
+    /// The input labels the router reports; index 0 is input 1.
+    async fn input_labels(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

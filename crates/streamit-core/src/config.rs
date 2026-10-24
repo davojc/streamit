@@ -177,6 +177,8 @@ pub struct Config {
     pub timings: Timings,
     pub playout: PlayoutConfig,
     pub ndi: NdiConfig,
+    /// The MultiView 4's feeds and presets.
+    pub multiview: crate::multiview::MultiViewConfig,
     /// The roll-in cue list, saved so it survives a restart.
     #[serde(default)]
     pub cues: Vec<Cue>,

@@ -251,3 +251,41 @@ async fn non_utf8_label_does_not_break_link() {
     s.write_all(b"INPUT LABELS:\n0 Caf\xe9 Chapel\n\nVIDEO OUTPUT ROUTING:\n10 5\n\n").await.unwrap();
     wait_route(&hub, 11, 6).await; // same connection: no reconnect happened
 }
+
+#[tokio::test]
+async fn input_labels_are_one_based_and_cover_every_input() {
+    let (l, addr) = fake().await;
+    let hub = VideoHub::connect_with(addr, fast()).await.unwrap();
+    let (mut s, _) = l.accept().await.unwrap();
+    s.write_all(FIXTURE.as_bytes()).await.unwrap();
+    wait_route(&hub, 11, 8).await;
+    let labels = hub.input_labels().await.unwrap();
+    assert_eq!(labels.len(), 40, "Video inputs: 40");
+    assert_eq!(labels[0], "Camera 1");
+    assert_eq!(labels[7], "Camera 8");
+    assert_eq!(labels[11], "DeckLink");
+    assert_eq!(labels[1], "", "no label");
+    // A label changed on the VideoHub arrives as its own block.
+    s.write_all(
+        b"INPUT LABELS:
+1 Pulpit camera
+
+",
+    )
+    .await
+    .unwrap();
+    for _ in 0..100 {
+        if hub.input_labels().await.unwrap()[1] == "Pulpit camera" {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the new label never arrived");
+}
+
+#[tokio::test]
+async fn input_labels_before_the_dump_are_disconnected() {
+    let (_l, addr) = fake().await;
+    let hub = VideoHub::connect_with(addr, fast()).await.unwrap();
+    assert!(matches!(hub.input_labels().await, Err(DeviceError::Disconnected(_))));
+}
