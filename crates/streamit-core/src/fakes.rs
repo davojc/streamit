@@ -77,6 +77,7 @@ struct SwitcherState {
     program: u16,
     preview: u16,
     levels: HashMap<AudioSourceId, f32>,
+    inputs: HashMap<AudioSourceId, AudioInput>,
     /// How long an `auto` takes to land (zero: at once).
     auto_delay: Duration,
     /// A running mix: when it lands, and the (program, preview) it lands on.
@@ -114,6 +115,7 @@ impl FakeSwitcher {
                 program: 1,
                 preview: 2,
                 levels: HashMap::new(),
+                inputs: HashMap::new(),
                 auto_delay: Duration::ZERO,
                 pending: None,
             })),
@@ -143,6 +145,10 @@ impl FakeSwitcher {
     /// Script an audio level without logging a call.
     pub fn set_audio_level_state(&self, src: AudioSourceId, db: f32) {
         self.st.lock().unwrap().levels.insert(src, db);
+    }
+    /// Script what `audio_input` reports for `src`.
+    pub fn set_audio_input_state(&self, src: AudioSourceId, input: AudioInput) {
+        self.st.lock().unwrap().inputs.insert(src, input);
     }
     fn rec(&self, stream: Call, screens: Call) {
         self.log.push(if self.kind == Kind::Stream { stream } else { screens });
@@ -232,6 +238,16 @@ impl StreamSwitcher for FakeSwitcher {
         self.log.push(Call::StreamSetAudioOn(src, on));
         self.fails.check("set_audio_on")
     }
+    async fn audio_input(&self, src: AudioSourceId) -> Result<AudioInput> {
+        self.fails.check("audio_input")?;
+        self.st
+            .lock()
+            .unwrap()
+            .inputs
+            .get(&src)
+            .copied()
+            .ok_or_else(|| DeviceError::Refused(format!("no audio input {}/{}", src.input, src.source)))
+    }
 }
 
 #[derive(Clone)]
@@ -316,6 +332,7 @@ struct YtState {
     check: BroadcastCheck,
     health: Health,
     life_cycle: String,
+    live: LiveDetails,
 }
 
 #[derive(Clone)]
@@ -363,6 +380,9 @@ impl FakeBroadcasts {
     pub fn set_transition_hangs(&self, v: bool) {
         self.hang_transition.store(v, std::sync::atomic::Ordering::SeqCst);
     }
+    pub fn set_live_details(&self, d: LiveDetails) {
+        self.st.lock().unwrap().live = d;
+    }
     pub fn set_life_cycle(&self, l: &str) {
         self.st.lock().unwrap().life_cycle = l.to_string();
     }
@@ -396,6 +416,10 @@ impl Broadcasts for FakeBroadcasts {
         self.delay("life_cycle").await;
         self.fails.check("life_cycle")?;
         Ok(self.st.lock().unwrap().life_cycle.clone())
+    }
+    async fn live_details(&self, _id: &str) -> Result<LiveDetails> {
+        self.fails.check("live_details")?;
+        Ok(self.st.lock().unwrap().live.clone())
     }
     async fn transition(&self, _id: &str, to: Phase) -> Result<()> {
         self.log.push(Call::YtTransition(to));
@@ -552,6 +576,7 @@ pub fn fake_devices() -> (Devices, CallLog, FakeHandles) {
             check: BroadcastCheck { bound_to_ours: true, auto_start: false, auto_stop: true, monitor_stream: true },
             health: Health::Good,
             life_cycle: "ready".into(),
+            live: LiveDetails::default(),
         })),
         hang_transition: Default::default(),
         delays: Default::default(),

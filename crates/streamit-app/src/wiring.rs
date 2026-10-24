@@ -17,7 +17,7 @@ use streamit_core::devices::{
     self, BroadcastCheck, BroadcastSummary, Broadcasts, Counter, DeviceError, Devices, Encoder, EncoderStatus, Fix,
     Health, Lighting, LightingStatus, Phase, Player, PlayerEvent, Router, StreamSwitcher, Switcher,
 };
-use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
+use streamit_core::engine::{AudioReading, Command, DeviceHealth, DeviceKind, Snapshot};
 use streamit_core::golive::Stage;
 use streamit_core::routing::{RoutingRead, Target, TargetRead};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -659,6 +659,16 @@ impl Probes {
         }
         self.devices.lights.status().await.ok()
     }
+
+    /// The audio inputs Settings picks to show, as the Stream ATEM reports them.
+    pub async fn read_audio(&self, c: &Config) -> Vec<AudioReading> {
+        let mut out = Vec::with_capacity(c.stream_atem.shown_audio.len());
+        for a in &c.stream_atem.shown_audio {
+            let input = self.devices.stream.audio_input(a.source).await.ok();
+            out.push(AudioReading { name: a.name.clone(), source: a.source, input });
+        }
+        out
+    }
 }
 
 fn log_health(kind: DeviceKind, h: &DeviceHealth) {
@@ -690,6 +700,7 @@ pub fn spawn_health_poll(
         async move {
             let mut last_routing = None;
             let mut last_lighting = None;
+            let mut last_audio = None;
             let mut stream_checked: Option<tokio::time::Instant> = None;
             let mut stream_sent = false;
             loop {
@@ -708,12 +719,23 @@ pub fn spawn_health_poll(
                         if tx.send(Command::StreamHealthRead(Some(h))).await.is_err() {
                             return;
                         }
+                        // The viewer count and the chat, on the same beat (1 quota unit).
+                        let id = snap.borrow().broadcast.as_ref().map(|b| b.id.clone());
+                        let live = match id {
+                            Some(id) => probes.devices.yt.live_details(&id).await.ok(),
+                            None => None,
+                        };
+                        if tx.send(Command::LiveDetailsRead(live)).await.is_err() {
+                            return;
+                        }
                         stream_sent = true;
                     }
                 } else if stream_sent {
                     stream_checked = None;
                     stream_sent = false;
-                    if tx.send(Command::StreamHealthRead(None)).await.is_err() {
+                    if tx.send(Command::StreamHealthRead(None)).await.is_err()
+                        || tx.send(Command::LiveDetailsRead(None)).await.is_err()
+                    {
                         return;
                     }
                 }
@@ -726,6 +748,13 @@ pub fn spawn_health_poll(
                 }
                 // What the VideoHub feeds and the ATEMs show, sent when it changes.
                 let c = config.read().unwrap_or_else(|e| e.into_inner()).clone();
+                let audio = probes.read_audio(&c).await;
+                if last_audio.as_ref() != Some(&audio) {
+                    if tx.send(Command::AudioRead(audio.clone())).await.is_err() {
+                        return;
+                    }
+                    last_audio = Some(audio);
+                }
                 let routing = probes.read_routing(&c).await;
                 if last_routing.as_ref() != Some(&routing) {
                     let (labels, output_labels, targets) = routing.clone();

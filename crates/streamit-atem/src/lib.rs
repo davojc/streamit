@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use streamit_core::config::AudioSourceId;
-use streamit_core::devices::{DeviceError, Result, StreamSwitcher, Switcher};
+use streamit_core::devices::{AudioInput, AudioMix, DeviceError, Result, StreamSwitcher, Switcher};
 use tokio::sync::{mpsc, oneshot, watch};
 
 pub use packet::ATEM_PORT;
@@ -275,6 +275,16 @@ impl StreamSwitcher for AtemClient {
             )));
         }
         self.send(Cfsp::mix_option(src.input, src.source, option).encode()).await
+    }
+
+    async fn audio_input(&self, src: AudioSourceId) -> Result<AudioInput> {
+        let f = self.fairlight(src)?;
+        let mix = match f.mix_option {
+            mix_option::ON => AudioMix::On,
+            mix_option::AUDIO_FOLLOW_VIDEO => AudioMix::FollowVideo,
+            _ => AudioMix::Off,
+        };
+        Ok(AudioInput { mix, fader_db: f.fader_gain as f32 / 100.0 })
     }
 }
 

@@ -753,7 +753,11 @@ impl eframe::App for StreamItApp {
                 .frame(egui::Frame::new().fill(theme::GROUND).inner_margin(Margin::symmetric(28, 14)))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        theme::step_strip(ui, view::steps(&snap));
+                        // Live: End service is the fourth step, pressed there (it asks first).
+                        let end = (snap.stage == Stage::Live && view::more_menu(&snap).end_service).then_some(3);
+                        if theme::step_strip(ui, view::steps(&snap), end) {
+                            self.end_service(&snap);
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             self.more_menu(ui, &snap)
                         });
@@ -795,7 +799,18 @@ impl StreamItApp {
             if switching {
                 theme::switching_badge(ui);
             } else {
-                theme::badge(ui, &h);
+                let badge = theme::badge(ui, &h);
+                // Under way, the badge opens the broadcast in YouTube Studio's live control room.
+                let under_way = matches!(snap.stage, Stage::Prepared(_) | Stage::Countdown { .. } | Stage::Live);
+                if let Some(b) = snap.broadcast.as_ref().filter(|_| under_way && !snap.simulation) {
+                    let badge = badge
+                        .interact(egui::Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Open the live control room in YouTube Studio");
+                    if badge.clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(view::studio_url(&b.id)));
+                    }
+                }
             }
             if let Some(p) = self.profiles.current() {
                 ui.label(RichText::new(format!("Profile · {p}")).size(14.0).color(theme::SOFT));
@@ -831,9 +846,14 @@ impl StreamItApp {
                         self.scroll_to = Some(Section::Updates);
                     }
                 }
-                if summary {
+                // The equipment summary gives way first, so the broadcast name keeps its room.
+                let summary_w = (ui.available_width() - 240.0).min(360.0);
+                if summary && summary_w > 80.0 {
                     ui.add_space(18.0);
-                    ui.label(RichText::new(&h.equipment).size(14.0).color(theme::MUTED));
+                    let layout = egui::Layout::right_to_left(egui::Align::Center);
+                    ui.allocate_ui_with_layout(egui::vec2(summary_w, 20.0), layout, |ui| {
+                        ui.add(egui::Label::new(RichText::new(&h.equipment).size(14.0).color(theme::MUTED)).truncate());
+                    });
                     theme::dot(ui, theme::tone_color(h.equipment_tone));
                     ui.add_space(6.0);
                 }

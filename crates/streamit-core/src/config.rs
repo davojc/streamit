@@ -29,6 +29,13 @@ pub struct AudioSourceId {
     pub source: i64,
 }
 
+/// An audio input shown on the Service screens, with the name to show it by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShownAudio {
+    pub name: String,
+    pub source: AudioSourceId,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StreamAtemConfig {
@@ -40,6 +47,8 @@ pub struct StreamAtemConfig {
     pub live_inputs: Vec<u16>,
     pub default_live_input: u16,
     pub mic_sources: Vec<AudioSourceId>,
+    /// The audio inputs the Service screens show, in order.
+    pub shown_audio: Vec<ShownAudio>,
     pub duck_db: f32,
     #[serde(with = "millis")]
     pub fade: Duration,
@@ -56,6 +65,7 @@ impl Default for StreamAtemConfig {
             live_inputs: vec![1, 2, 3],
             default_live_input: 1,
             mic_sources: vec![AudioSourceId { input: 1001, source: -65280 }],
+            shown_audio: Vec::new(),
             duck_db: -100.0,
             fade: Duration::from_secs(1),
         }

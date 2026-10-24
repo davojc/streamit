@@ -17,7 +17,7 @@ use eframe::egui::{self, Align, Color32, Layout, Margin, RichText, Shape, Stroke
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
-use streamit_core::config::{AudioSourceId, Config, OscFraming};
+use streamit_core::config::{AudioSourceId, Config, OscFraming, ShownAudio};
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
 use streamit_core::routing::Target;
 use streamit_youtube::{API_BASE, Auth, StreamSummary, YouTubeClient};
@@ -822,6 +822,31 @@ impl StreamItApp {
         }
         if ui.button("Add stream audio source").clicked() {
             c.stream_atem.mic_sources.push(AudioSourceId { input: 1001, source: -65280 });
+        }
+        ui.add_space(12.0);
+        theme::lbl(ui, "Audio inputs shown on the Service screens");
+        sub(
+            ui,
+            "Each one shows whether it is on, off or following video (AFV) on the Stream ATEM,              with its fader. Use the Fairlight input and source numbers, as above.",
+        );
+        let mut remove = None;
+        let shown = &mut c.stream_atem.shown_audio;
+        for (i, a) in shown.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut a.name).hint_text("Name, e.g. Band mix").desired_width(220.0));
+                ui.add(egui::DragValue::new(&mut a.source.input).prefix("Input "));
+                ui.add(egui::DragValue::new(&mut a.source.source).prefix("Source "));
+                if ui.button("Remove").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            shown.remove(i);
+        }
+        if ui.button("Add an audio input to show").clicked() {
+            let input = shown.last().map_or(1001, |a| a.source.input + 1);
+            shown.push(ShownAudio { name: String::new(), source: AudioSourceId { input, source: -65280 } });
         }
     }
 

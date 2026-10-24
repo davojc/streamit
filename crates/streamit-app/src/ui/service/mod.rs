@@ -4,18 +4,18 @@
 mod before;
 mod countdown;
 mod live;
-mod video;
+mod panels;
 
-use super::{StreamItApp, Tab};
+use super::{Section, StreamItApp, Tab};
 use crate::theme::{self, Kind};
 use crate::view::{self, ServiceScreen, Tone};
 use eframe::egui::{self, Align, Layout, RichText, Ui, vec2};
 use streamit_core::config::Config;
-use streamit_core::devices::Fix;
-use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
+use streamit_core::devices::{AudioMix, Fix};
+use streamit_core::engine::{Command, DeviceKind, Snapshot};
 use streamit_core::golive::{Readiness, Stage};
 use streamit_core::recovery::Offer;
-use streamit_core::rollin::{CueState, Destination, MAX_CUES};
+use streamit_core::rollin::{CueState, MAX_CUES};
 
 const GAP: f32 = 20.0;
 /// Activity lines shown on a screen.
@@ -37,15 +37,15 @@ impl StreamItApp {
         let screen = view::service_screen(snap);
         let top = ui.cursor().top();
         self.alerts(ui, snap, screen);
-        if let Some(h) = &snap.stream_health {
-            stream_health_strip(ui, h, snap.stream_alarm);
+        // From Prepare until the service ends.
+        if matches!(snap.stage, Stage::Prepared(_) | Stage::Countdown { .. } | Stage::Live | Stage::Ending { .. }) {
+            self.status_panels(ui, snap, c);
         }
         let tall = (viewport - (ui.cursor().top() - top) - 2.0).max(480.0);
         match screen {
             ServiceScreen::BeforeService => self.before_service(ui, snap, c, tall),
             ServiceScreen::Countdown => self.countdown_screen(ui, snap, c, saved, tall),
-            ServiceScreen::Live => self.live_screen(ui, snap, c),
-            ServiceScreen::VideoPlaying => self.video_screen(ui, snap, c),
+            ServiceScreen::Live | ServiceScreen::VideoPlaying => self.live_screen(ui, snap),
             ServiceScreen::Ending => self.ending_screen(ui, snap),
         }
     }
@@ -222,27 +222,6 @@ impl StreamItApp {
 
 // ---------------------------------------------------------------- shared pieces
 
-/// What YouTube says about the stream, from Prepare until the service ends.
-fn stream_health_strip(ui: &mut Ui, h: &streamit_core::devices::Health, alarm: bool) {
-    let (tone, text) = view::stream_health_line(h, alarm);
-    let (fill, stroke, colour) = match tone {
-        Tone::Green => (theme::GREEN_DARK, theme::GREEN_BORDER, theme::TEXT),
-        Tone::Red => (theme::RED_DARK, theme::RED, theme::RED_SOFT),
-        _ => (theme::AMBER_DARK, theme::AMBER_BORDER, theme::AMBER_TEXT),
-    };
-    theme::panel().fill(fill).stroke(egui::Stroke::new(1.0, stroke)).inner_margin(egui::Margin::symmetric(16, 8)).show(
-        ui,
-        |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                theme::dot(ui, theme::tone_color(tone));
-                ui.label(RichText::new(text).color(colour).strong());
-            });
-        },
-    );
-    ui.add_space(10.0);
-}
-
 fn warning_bar(ui: &mut Ui, text: &str) {
     theme::panel()
         .fill(theme::AMBER_DARK)
@@ -273,46 +252,6 @@ fn preview(ui: &mut Ui, label: &str, screen: &str, heading: bool, note: &str) {
         let font = if heading { theme::heading_font(24.0) } else { egui::FontId::proportional(16.0) };
         theme::screen_box(ui, 140.0, screen, font);
         ui.label(RichText::new(note).size(14.0).color(theme::MUTED));
-    });
-}
-
-fn on_air_panel(ui: &mut Ui, label: &str, on_air: bool, add: impl FnOnce(&mut Ui)) {
-    let border = if on_air { theme::RED_BORDER } else { theme::BORDER };
-    theme::panel().stroke(egui::Stroke::new(1.0, border)).inner_margin(18).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            theme::lbl(ui, label);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if on_air {
-                    theme::chip(ui, "Program", theme::RED_SOFT, theme::RED);
-                } else {
-                    theme::chip(ui, "Program", theme::SOFT, theme::BUTTON_BORDER);
-                }
-            });
-        });
-        add(ui);
-    });
-}
-
-fn big_value(ui: &mut Ui, text: &str, size: f32) {
-    ui.add(egui::Label::new(RichText::new(text).font(theme::heading_font(size))).truncate());
-}
-
-fn mics(ui: &mut Ui, snap: &Snapshot) {
-    theme::lbl(ui, "Stream audio");
-    ui.horizontal(|ui| {
-        let bar = view::mic_bar(snap);
-        let (frac, text) = (bar.fraction, bar.text);
-        let (color, text_color) = match bar.tone {
-            Tone::Red => (theme::RED, theme::RED_TEXT),
-            Tone::Amber => (theme::AMBER, theme::AMBER_SOFT),
-            _ => (theme::GREEN, theme::SOFT),
-        };
-        let bar_w = (ui.available_width() - 140.0).max(60.0);
-        ui.allocate_ui_with_layout(vec2(bar_w, 10.0), Layout::left_to_right(Align::Center), |ui| {
-            theme::progress(ui, frac, color);
-        });
-        ui.label(RichText::new(text).font(theme::mono(14.0)).color(text_color));
     });
 }
 

@@ -32,7 +32,6 @@ pub const BLUE_FILL: Color32 = Color32::from_rgb(0x25, 0x63, 0xEB);
 pub const BLUE_DARK: Color32 = Color32::from_rgb(0x1D, 0x3B, 0x6E);
 pub const BLUE_SOFT: Color32 = Color32::from_rgb(0x9C, 0xC2, 0xFF);
 pub const BLUE_PANEL: Color32 = Color32::from_rgb(0x12, 0x1A, 0x26);
-pub const BLUE_BORDER: Color32 = Color32::from_rgb(0x2B, 0x5F, 0xB8);
 pub const RED_FILL: Color32 = Color32::from_rgb(0xB4, 0x23, 0x18);
 pub const RED_DARK: Color32 = Color32::from_rgb(0x4A, 0x15, 0x12);
 pub const RED_BORDER: Color32 = Color32::from_rgb(0x7A, 0x25, 0x22);
@@ -257,7 +256,9 @@ const STEP_NAMES: [(&str, &str); 4] =
 
 /// Prepare → Countdown → Live → End service: done steps ticked green, the current one lit
 /// in its own colour (blue, amber, red, red).
-pub fn step_strip(ui: &mut Ui, steps: [StepState; 4]) {
+/// Step `button` (if any) is a button, drawn in red outline; returns true when it is clicked.
+pub fn step_strip(ui: &mut Ui, steps: [StepState; 4], button: Option<usize>) -> bool {
+    let mut clicked = false;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
         for (i, (state, (todo, done))) in steps.iter().zip(STEP_NAMES).enumerate() {
@@ -271,6 +272,7 @@ pub fn step_strip(ui: &mut Ui, steps: [StepState; 4]) {
                     };
                     (format!("{}  {todo}", i + 1), fill, border, color)
                 }
+                StepState::Todo if button == Some(i) => (format!("{}  {todo}", i + 1), RED_DARK, RED, RED_SOFT),
                 StepState::Todo => (format!("{}  {todo}", i + 1), Color32::TRANSPARENT, BORDER, DIM),
             };
             let mut job = egui::text::LayoutJob::default();
@@ -278,13 +280,20 @@ pub fn step_strip(ui: &mut Ui, steps: [StepState; 4]) {
             format.extra_letter_spacing = 1.0;
             job.append(&text.to_uppercase(), 0.0, format);
             let galley = ui.painter().layout_job(job);
-            let (rect, _) = ui.allocate_exact_size(vec2(galley.size().x + 36.0, 52.0), Sense::hover());
+            let sense = if button == Some(i) { Sense::click() } else { Sense::hover() };
+            let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 36.0, 52.0), sense);
+            let width = if button == Some(i) { 2.0 } else { 1.0 };
+            let fill = if button == Some(i) && resp.hovered() { RED_FILL } else { fill };
+            if button == Some(i) {
+                clicked |= resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+            }
             let p = ui.painter();
-            p.rect(rect, 8.0, fill, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+            p.rect(rect, 8.0, fill, Stroke::new(width, border), egui::StrokeKind::Inside);
             let pos = Align2::LEFT_CENTER.align_size_within_rect(galley.size(), rect.shrink2(vec2(18.0, 0.0))).min;
             p.galley(pos, galley, color);
         }
     });
+    clicked
 }
 
 /// The striped amber banner shown on every screen in simulation. Returns true when its

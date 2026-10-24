@@ -17,9 +17,10 @@
 //! the running job), Go Public and End Broadcast (each its own short task), Select
 //! Broadcast, Fix, Refresh and device health. Every ignored command is logged at `info`.
 use crate::audio::LiveLevels;
-use crate::config::Config;
+use crate::config::{AudioSourceId, Config};
 use crate::devices::{
-    self, BroadcastCheck, BroadcastSummary, DeviceError, Devices, Fix, Health, LabelKind, LightingStatus, Phase,
+    self, AudioInput, BroadcastCheck, BroadcastSummary, DeviceError, Devices, Fix, Health, LabelKind, LightingStatus,
+    LiveDetails, Phase,
 };
 use crate::end::{EndOutcome, end_service};
 use crate::golive::{self, CountdownOutcome, CountdownReport, Readiness, Stage, Stage0Report, T0Error};
@@ -97,6 +98,19 @@ pub enum Command {
     /// YouTube's health for the stream key, from the poll while a service is under way
     /// (`None`: not being checked).
     StreamHealthRead(Option<Health>),
+    /// The shown audio inputs as the Stream ATEM reports them, from the health poll.
+    AudioRead(Vec<AudioReading>),
+    /// The viewer count and chat of the selected broadcast, from the poll while a service
+    /// is under way (`None`: not being checked).
+    LiveDetailsRead(Option<LiveDetails>),
+}
+
+/// One shown audio input: its name and what the switcher says (`None`: no answer).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioReading {
+    pub name: String,
+    pub source: AudioSourceId,
+    pub input: Option<AudioInput>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -154,6 +168,10 @@ pub struct Snapshot {
     pub stream_health: Option<Health>,
     /// Live, and YouTube has not been receiving the stream for `STREAM_ALARM_AFTER`.
     pub stream_alarm: bool,
+    /// The audio inputs Settings picks to show, as last read.
+    pub audio: Vec<AudioReading>,
+    /// The selected broadcast's viewer count and chat, while a service is under way.
+    pub live: Option<LiveDetails>,
 }
 
 /// How far the playing roll-in is.
@@ -196,6 +214,8 @@ impl Default for Snapshot {
             lighting: None,
             stream_health: None,
             stream_alarm: false,
+            audio: Vec::new(),
+            live: None,
         }
     }
 }
@@ -743,6 +763,14 @@ impl Engine {
                     }
                     .in_current_span(),
                 );
+            }
+            Command::AudioRead(audio) => {
+                let audio = audio.clone();
+                self.set(|s| s.audio = audio);
+            }
+            Command::LiveDetailsRead(live) => {
+                let live = live.clone();
+                self.set(|s| s.live = live);
             }
             Command::StreamHealthRead(health) => {
                 let health = health.clone();
@@ -3272,6 +3300,25 @@ mod tests {
         until(&mut e, "the status", |s| s.lighting == Some(st.clone())).await;
         send(&e, Command::LightingRead(None)).await;
         until(&mut e, "no status", |s| s.lighting.is_none()).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn audio_and_live_details_follow_the_poll() {
+        let (d, _log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        let src = AudioSourceId { input: 1002, source: -65280 };
+        let audio = vec![AudioReading {
+            name: "Band".into(),
+            source: src,
+            input: Some(AudioInput { mix: devices::AudioMix::On, fader_db: -3.0 }),
+        }];
+        send(&e, Command::AudioRead(audio.clone())).await;
+        until(&mut e, "the audio", |s| s.audio == audio).await;
+        let live = LiveDetails { viewers: Some(12), chat_id: Some("chat".into()) };
+        send(&e, Command::LiveDetailsRead(Some(live.clone()))).await;
+        until(&mut e, "the details", |s| s.live == Some(live.clone())).await;
+        send(&e, Command::LiveDetailsRead(None)).await;
+        until(&mut e, "no details", |s| s.live.is_none()).await;
     }
 
     // ---- stream health

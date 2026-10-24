@@ -36,6 +36,27 @@ pub trait StreamSwitcher: Switcher {
     async fn audio_level(&self, src: AudioSourceId) -> Result<f32>;
     async fn set_audio_level(&self, src: AudioSourceId, db: f32) -> Result<()>;
     async fn set_audio_on(&self, src: AudioSourceId, on: bool) -> Result<()>;
+    /// An audio input's mix state and fader, for the Live screen.
+    async fn audio_input(&self, src: AudioSourceId) -> Result<AudioInput> {
+        let _ = src;
+        Err(DeviceError::Refused("this switcher cannot report its audio inputs".into()))
+    }
+}
+
+/// How an audio input is mixed into the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioMix {
+    On,
+    Off,
+    /// Audio follows video: heard only while the input is on program.
+    FollowVideo,
+}
+
+/// An audio input as the switcher reports it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioInput {
+    pub mix: AudioMix,
+    pub fader_db: f32,
 }
 
 /// A VideoHub label: an input's or an output's.
@@ -147,6 +168,15 @@ pub enum Phase {
     Complete,
 }
 
+/// What YouTube says about a broadcast while it runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiveDetails {
+    /// People watching now, when YouTube shows it.
+    pub viewers: Option<u64>,
+    /// The broadcast's live chat, while it has one.
+    pub chat_id: Option<String>,
+}
+
 #[async_trait]
 pub trait Broadcasts: Send + Sync {
     async fn signed_in(&self) -> Result<bool>;
@@ -157,6 +187,11 @@ pub trait Broadcasts: Send + Sync {
     async fn health(&self) -> Result<Health>;
     async fn life_cycle(&self, id: &str) -> Result<String>;
     async fn transition(&self, id: &str, to: Phase) -> Result<()>;
+    /// The viewer count and the live chat of broadcast `id`.
+    async fn live_details(&self, id: &str) -> Result<LiveDetails> {
+        let _ = id;
+        Ok(LiveDetails::default())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

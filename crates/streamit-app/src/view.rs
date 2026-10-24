@@ -5,11 +5,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use streamit_core::config::Config;
-use streamit_core::devices::{EncoderStatus, Health};
+use streamit_core::devices::{AudioInput, AudioMix, EncoderStatus, Health};
 use streamit_core::engine::{DeviceHealth, DeviceKind, FlashKey, Snapshot};
 use streamit_core::golive::{Readiness, Stage};
 use streamit_core::recovery::Offer;
 use streamit_core::rollin::{Cue, CueState, Destination};
+use streamit_core::routing::Target;
 use streamit_sim::{Fault, Input8Source, PlayerView, Speed};
 
 /// The colour family of a badge, a dot or a step.
@@ -254,7 +255,7 @@ pub fn prepare_button(s: &Snapshot) -> StepButton {
     StepButton { enabled: s.job.is_none() && !recover, reason: recover.then_some(RECOVER_FIRST) }
 }
 
-/// The Mics bar on the live screens.
+/// The stream audio bar on the Service screens.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MicBar {
     pub fraction: f32,
@@ -262,9 +263,17 @@ pub struct MicBar {
     pub text: &'static str,
 }
 
-/// "down for video" only while a video plays; mics down with no video (a restart, a
-/// failed fade up) are a problem Recover fixes.
+/// Before T-0 and during the close the stream audio is down by design. Live, "down for
+/// video" only while a video plays; down with no video (a restart, a failed fade up) is a
+/// problem Recover fixes.
 pub fn mic_bar(s: &Snapshot) -> MicBar {
+    match s.stage {
+        Stage::Prepared(_) | Stage::Countdown { .. } => {
+            return MicBar { fraction: 0.04, tone: Tone::Grey, text: "silent until live" };
+        }
+        Stage::Ending { .. } => return MicBar { fraction: 0.04, tone: Tone::Grey, text: "down for the close" },
+        _ => {}
+    }
     match (s.mics_ducked, s.playing.is_some()) {
         (false, _) => MicBar { fraction: 0.72, tone: Tone::Green, text: "live" },
         (true, true) => MicBar { fraction: 0.04, tone: Tone::Amber, text: "down for video" },
@@ -278,11 +287,6 @@ pub const SIM_NEXT_TIME: &str = "applies next time you open simulation";
 
 pub fn sim_next_time_note(running: &Path, saved: &Path) -> Option<&'static str> {
     (running != saved).then_some(SIM_NEXT_TIME)
-}
-
-/// The label of the online panel while a video plays, and whether it is on air.
-pub fn online_panel(s: &Snapshot) -> (&'static str, bool) {
-    if s.stage == Stage::Live { ("Online · on air", true) } else { ("Online · not live yet", false) }
 }
 
 /// What to say when the engine ignored a key press.
@@ -652,17 +656,88 @@ pub fn yt_state_text(life_cycle: Option<&str>) -> String {
     }
 }
 
-/// The Service tab's YouTube strip: its colour and words, from YouTube's stream health.
-pub fn stream_health_line(h: &Health, alarm: bool) -> (Tone, String) {
-    match h {
-        Health::Good => (Tone::Green, "YouTube is receiving the stream".into()),
-        Health::Bad(why) if why.starts_with("could not check") => (Tone::Amber, format!("YouTube stream health {why}")),
-        Health::Bad(why) => (Tone::Amber, format!("YouTube is receiving the stream, but it is poor ({why})")),
-        Health::NotReceiving if alarm => {
-            (Tone::Red, "YouTube is NOT receiving the stream. Check the Web Presenter and the internet.".into())
+/// The Service screens' YouTube panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YouTubePanel {
+    pub tone: Tone,
+    pub headline: String,
+    pub detail: String,
+    /// "Public" or "Private", while the service is under way and it is known.
+    pub visibility: Option<&'static str>,
+    pub viewers: Option<u64>,
+}
+
+/// What the YouTube panel says: is YouTube receiving the stream, is the broadcast public,
+/// how many are watching.
+pub fn youtube_panel(s: &Snapshot) -> YouTubePanel {
+    let (tone, headline, detail) = match &s.stream_health {
+        None => (Tone::Grey, "Checking…".to_string(), "Asking YouTube about the stream".to_string()),
+        Some(Health::Good) => (Tone::Green, "Receiving".into(), "Stream health good".into()),
+        Some(Health::Bad(why)) if why.starts_with("could not check") => {
+            (Tone::Amber, "Can’t check".into(), format!("Stream health {why}"))
         }
-        Health::NotReceiving => (Tone::Amber, "YouTube is not receiving the stream yet".into()),
+        Some(Health::Bad(why)) => (Tone::Amber, "Receiving, poor".into(), format!("YouTube says: {why}")),
+        Some(Health::NotReceiving) if s.stream_alarm => {
+            (Tone::Red, "NOT RECEIVING".into(), "Nothing is arriving. Check the Web Presenter and the internet.".into())
+        }
+        Some(Health::NotReceiving) if s.stage == Stage::Live => {
+            (Tone::Amber, "Not receiving".into(), "For a moment: the alarm sounds after 20 s".into())
+        }
+        Some(Health::NotReceiving) => (Tone::Amber, "Not receiving yet".into(), "Waiting for the stream".into()),
+    };
+    let visibility = match s.stage {
+        Stage::Prepared(_) => Some("Private"),
+        Stage::Countdown { public, .. } => Some(if public { "Public" } else { "Private" }),
+        Stage::Live => Some(if s.offers.contains(&Offer::GoPublic) { "Not public" } else { "Public" }),
+        _ => None,
+    };
+    YouTubePanel { tone, headline, detail, visibility, viewers: s.live.as_ref().and_then(|l| l.viewers) }
+}
+
+/// What an ATEM input is called on the Service screens: the video playing into it, the
+/// media player's still, or the VideoHub input that feeds it.
+pub fn atem_input_name(s: &Snapshot, c: &Config, target: Target, input: u16) -> String {
+    let video_input = match target {
+        Target::StreamAtem => c.stream_atem.decklink_input,
+        _ => c.screens_atem.decklink_input,
+    };
+    if input == video_input
+        && let Some((cue, _)) = s.playing.and_then(|i| s.cues.get(i))
+    {
+        return format!("Video: {}", cue.name);
     }
+    if target == Target::StreamAtem && input == 3000 + 10 * u16::from(c.stream_atem.media_player) {
+        return "Holding still".into();
+    }
+    let t = s.routing.target(target);
+    let fed = input.checked_sub(1).map(usize::from).filter(|&i| i < t.outputs.len() && t.output(i) != 0);
+    match fed.and_then(|i| t.dest(i)) {
+        Some(hub_input) => s.routing.label(hub_input),
+        None if (1..=99).contains(&input) => format!("Input {input}"),
+        None => format!("Source {input}"),
+    }
+}
+
+/// An ATEM's program and preview as the Service screens name them; `None` until it says.
+pub fn atem_sees(s: &Snapshot, c: &Config, target: Target) -> (Option<String>, Option<String>) {
+    let t = s.routing.target(target);
+    let name = |n: Option<u16>| n.map(|n| atem_input_name(s, c, target, n));
+    (name(t.program), name(t.preview))
+}
+
+/// A shown audio input's state as a short tag and its colour.
+pub fn audio_tag(input: Option<AudioInput>) -> (&'static str, Tone) {
+    match input.map(|i| i.mix) {
+        Some(AudioMix::On) => ("ON", Tone::Green),
+        Some(AudioMix::FollowVideo) => ("AFV", Tone::Grey),
+        Some(AudioMix::Off) => ("OFF", Tone::Grey),
+        None => ("—", Tone::Grey),
+    }
+}
+
+/// The YouTube Studio page for running a live broadcast.
+pub fn studio_url(broadcast_id: &str) -> String {
+    format!("https://studio.youtube.com/video/{broadcast_id}/livestreaming")
 }
 
 pub fn health_text(h: &Health) -> String {
@@ -696,7 +771,7 @@ pub fn mic_fraction(db: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use streamit_core::devices::BroadcastSummary;
+    use streamit_core::devices::{BroadcastSummary, LiveDetails};
 
     fn cue_at(name: &str, path: &str, gain: f32) -> streamit_core::rollin::Cue {
         streamit_core::rollin::Cue {
@@ -915,14 +990,9 @@ mod tests {
     }
 
     #[test]
-    fn online_panel_is_on_air_only_when_live() {
+    fn a_video_playing_before_live_still_has_its_screen() {
         let idle_video = Snapshot { playing: Some(0), ..Snapshot::default() };
         assert_eq!(service_screen(&idle_video), ServiceScreen::VideoPlaying);
-        assert_eq!(online_panel(&idle_video), ("Online · not live yet", false));
-        let live_video = Snapshot { stage: Stage::Live, playing: Some(0), ..Snapshot::default() };
-        assert_eq!(online_panel(&live_video), ("Online · on air", true));
-        let prepared = Snapshot { stage: Stage::Prepared(Readiness::Ready), ..idle_video };
-        assert!(!online_panel(&prepared).1);
     }
 
     #[test]
@@ -1020,6 +1090,8 @@ mod tests {
         assert_eq!(mic_bar(&video), MicBar { fraction: 0.04, tone: Tone::Amber, text: "down for video" });
         let left_down = Snapshot { mics_ducked: true, ..live };
         assert_eq!(mic_bar(&left_down), MicBar { fraction: 0.04, tone: Tone::Red, text: "down — press Recover" });
+        let prepared = Snapshot { stage: Stage::Prepared(Readiness::Ready), ..Snapshot::default() };
+        assert_eq!(mic_bar(&prepared).text, "silent until live");
     }
 
     /// I5: a length the app can't read says why, never a made-up 0:30.
@@ -1174,16 +1246,59 @@ mod tests {
     }
 
     #[test]
-    fn the_youtube_strip_says_what_youtube_sees() {
-        assert_eq!(stream_health_line(&Health::Good, false).0, Tone::Green);
-        let (tone, text) = stream_health_line(&Health::Bad("bad".into()), false);
-        assert_eq!(tone, Tone::Amber);
-        assert!(text.contains("poor (bad)"), "{text}");
-        assert_eq!(stream_health_line(&Health::NotReceiving, false).0, Tone::Amber, "before the alarm");
-        let (tone, text) = stream_health_line(&Health::NotReceiving, true);
-        assert_eq!(tone, Tone::Red);
-        assert!(text.contains("NOT receiving"), "{text}");
-        let (_, text) = stream_health_line(&Health::Bad("could not check: offline".into()), false);
-        assert_eq!(text, "YouTube stream health could not check: offline");
+    fn the_youtube_panel_says_what_youtube_sees() {
+        let live = |h: Health, alarm: bool| Snapshot {
+            stage: Stage::Live,
+            stream_health: Some(h),
+            stream_alarm: alarm,
+            ..Snapshot::default()
+        };
+        let p = youtube_panel(&live(Health::Good, false));
+        assert_eq!((p.tone, p.headline.as_str(), p.visibility), (Tone::Green, "Receiving", Some("Public")));
+        let p = youtube_panel(&live(Health::Bad("bad".into()), false));
+        assert_eq!((p.tone, p.detail.as_str()), (Tone::Amber, "YouTube says: bad"));
+        assert_eq!(youtube_panel(&live(Health::NotReceiving, false)).tone, Tone::Amber, "before the alarm");
+        let p = youtube_panel(&live(Health::NotReceiving, true));
+        assert_eq!((p.tone, p.headline.as_str()), (Tone::Red, "NOT RECEIVING"));
+        let p = youtube_panel(&live(Health::Bad("could not check: offline".into()), false));
+        assert_eq!(p.headline, "Can’t check");
+        let mut s = live(Health::Good, false);
+        s.offers = vec![Offer::GoPublic];
+        s.live = Some(LiveDetails { viewers: Some(37), chat_id: None });
+        let p = youtube_panel(&s);
+        assert_eq!((p.visibility, p.viewers), (Some("Not public"), Some(37)));
+        let prepared = Snapshot { stage: Stage::Prepared(Readiness::Ready), ..Snapshot::default() };
+        let p = youtube_panel(&prepared);
+        assert_eq!((p.tone, p.visibility), (Tone::Grey, Some("Private")));
+    }
+
+    #[test]
+    fn atem_inputs_are_named_by_what_feeds_them() {
+        let c = Config::default();
+        let mut s = Snapshot::default();
+        s.routing.labels = vec!["Camera 1 Wide".into(), "Camera 2 Pulpit".into()];
+        let t = s.routing.target_mut(Target::StreamAtem);
+        t.outputs = vec![5, 6, 0];
+        t.dests = vec![Some(2), None, None];
+        t.program = Some(1);
+        t.preview = Some(3);
+        assert_eq!(atem_sees(&s, &c, Target::StreamAtem), (Some("Camera 2 Pulpit".into()), Some("Input 3".into())));
+        assert_eq!(atem_input_name(&s, &c, Target::StreamAtem, 2), "Input 2", "fed, but the route is not known");
+        assert_eq!(atem_input_name(&s, &c, Target::StreamAtem, 3010), "Holding still");
+        assert_eq!(atem_input_name(&s, &c, Target::ScreensAtem, 3010), "Source 3010");
+        s.cues = vec![(cue_at("Mission update", "m.mp4", 0.0), CueState::Playing)];
+        s.playing = Some(0);
+        assert_eq!(atem_input_name(&s, &c, Target::StreamAtem, c.stream_atem.decklink_input), "Video: Mission update");
+        assert_eq!(atem_sees(&Snapshot::default(), &c, Target::ScreensAtem), (None, None));
+    }
+
+    #[test]
+    fn audio_inputs_are_tagged_on_afv_or_off() {
+        let at = |mix| Some(AudioInput { mix, fader_db: 0.0 });
+        assert_eq!(audio_tag(at(AudioMix::On)), ("ON", Tone::Green));
+        assert_eq!(audio_tag(at(AudioMix::FollowVideo)).0, "AFV");
+        assert_eq!(audio_tag(at(AudioMix::Off)).0, "OFF");
+        assert_eq!(audio_tag(None).0, "—");
+        assert_eq!(studio_url("abc"), "https://studio.youtube.com/video/abc/livestreaming");
     }
 }

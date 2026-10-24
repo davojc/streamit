@@ -1,6 +1,6 @@
 use serde_json::json;
 use std::sync::Arc;
-use streamit_core::devices::{Broadcasts, DeviceError, Fix, Health, Phase};
+use streamit_core::devices::{Broadcasts, DeviceError, Fix, Health, LiveDetails, Phase};
 use streamit_youtube::{Auth, MemoryStore, YouTubeClient};
 use url::Url;
 use wiremock::matchers::{body_partial_json, header, method, path, query_param};
@@ -462,4 +462,27 @@ async fn channel_title_is_none_for_an_account_without_a_channel() {
         .mount(&s)
         .await;
     assert_eq!(client(&s, None).channel_title().await, Ok(None));
+}
+
+#[tokio::test]
+async fn live_details_reads_viewers_and_the_chat() {
+    let s = MockServer::start().await;
+    token_ok(&s).await;
+    Mock::given(method("GET"))
+        .and(path("/youtube/v3/videos"))
+        .and(query_param("part", "liveStreamingDetails"))
+        .and(query_param("id", "b1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[{"liveStreamingDetails":
+            {"concurrentViewers":"37","activeLiveChatId":"chat-1"}}]})))
+        .mount(&s)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/youtube/v3/videos"))
+        .and(query_param("id", "b2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[{"liveStreamingDetails":{}}]})))
+        .mount(&s)
+        .await;
+    let c = client(&s, None);
+    assert_eq!(c.live_details("b1").await.unwrap(), LiveDetails { viewers: Some(37), chat_id: Some("chat-1".into()) });
+    assert_eq!(c.live_details("b2").await.unwrap(), LiveDetails::default());
 }

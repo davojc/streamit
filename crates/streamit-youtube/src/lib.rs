@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use std::time::Duration;
-use streamit_core::devices::{BroadcastCheck, BroadcastSummary, Broadcasts, DeviceError, Fix, Health, Phase, Result};
+use streamit_core::devices::{
+    BroadcastCheck, BroadcastSummary, Broadcasts, DeviceError, Fix, Health, LiveDetails, Phase, Result,
+};
 use url::Url;
 
 pub const API_BASE: &str = "https://www.googleapis.com/youtube/v3";
@@ -258,6 +260,18 @@ impl Broadcasts for YouTubeClient {
             "" => Health::Bad("unknown".into()),
             other => Health::Bad(other.into()),
         })
+    }
+
+    /// From `videos.list` (1 quota unit): a broadcast's id is its video's id.
+    async fn live_details(&self, id: &str) -> Result<LiveDetails> {
+        let v = self.call(Method::GET, "videos", &[("part", "liveStreamingDetails"), ("id", id)], None).await?;
+        let d = &v["items"][0]["liveStreamingDetails"];
+        // YouTube sends the count as a string.
+        let viewers = match &d["concurrentViewers"] {
+            Value::String(s) => s.parse().ok(),
+            n => n.as_u64(),
+        };
+        Ok(LiveDetails { viewers, chat_id: d["activeLiveChatId"].as_str().map(String::from) })
     }
 
     async fn life_cycle(&self, id: &str) -> Result<String> {

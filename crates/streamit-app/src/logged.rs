@@ -1,6 +1,7 @@
 //! Logging decorators for the device traits. Every action call is logged at `info` with
 //! its arguments and result (`warn` when it fails); read getters (program, route_of,
-//! status, signed_in, upcoming, check, health, life_cycle, audio_level, position) are
+//! status, signed_in, upcoming, check, health, life_cycle, live_details, audio_level,
+//! audio_input, position) are
 //! not logged, because the health poll calls them every 2 s. The countdown counter's
 //! `show`, called ten times a second, is logged at `debug` (a failure still at `warn`). Arguments are numbers,
 //! file paths and broadcast ids only: no tokens or secrets pass through these traits.
@@ -11,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use streamit_core::config::AudioSourceId;
 use streamit_core::devices::{
-    BroadcastCheck, BroadcastSummary, Broadcasts, Counter, Encoder, EncoderStatus, Fix, Health, LabelKind, Lighting,
-    LightingStatus, Phase, Player, PlayerEvent, Result, Router, StreamSwitcher, Switcher,
+    AudioInput, BroadcastCheck, BroadcastSummary, Broadcasts, Counter, Encoder, EncoderStatus, Fix, Health, LabelKind,
+    Lighting, LightingStatus, LiveDetails, Phase, Player, PlayerEvent, Result, Router, StreamSwitcher, Switcher,
 };
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -81,6 +82,9 @@ impl<T: StreamSwitcher + ?Sized> StreamSwitcher for Logged<T> {
     }
     async fn audio_level(&self, src: AudioSourceId) -> Result<f32> {
         self.inner.audio_level(src).await
+    }
+    async fn audio_input(&self, src: AudioSourceId) -> Result<AudioInput> {
+        self.inner.audio_input(src).await
     }
     async fn set_audio_level(&self, src: AudioSourceId, db: f32) -> Result<()> {
         done(
@@ -169,6 +173,9 @@ impl<T: Broadcasts + ?Sized> Broadcasts for Logged<T> {
     }
     async fn life_cycle(&self, id: &str) -> Result<String> {
         self.inner.life_cycle(id).await
+    }
+    async fn live_details(&self, id: &str) -> Result<LiveDetails> {
+        self.inner.live_details(id).await
     }
     async fn transition(&self, id: &str, to: Phase) -> Result<()> {
         done(self.device, format!("transition({id}, {to:?})"), self.inner.transition(id, to).await)

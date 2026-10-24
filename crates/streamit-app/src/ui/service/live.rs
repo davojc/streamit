@@ -1,68 +1,22 @@
-//! Screen 3: live, the video list, and the closing hold.
+//! Screen 3: live, with the videos (one may be playing), and the closing hold.
 use super::*;
 
 impl StreamItApp {
-    pub(super) fn live_screen(&mut self, ui: &mut Ui, snap: &Snapshot, c: &Config) {
-        self.columns(
-            ui,
-            480.0,
-            |app, ui| {
-                ui.columns(2, |cols| {
-                    on_air_panel(&mut cols[0], "Online · on air", true, |ui| {
-                        big_value(ui, "Cameras", 40.0);
-                        ui.label(
-                            RichText::new("Program and preview are yours on the Stream ATEM")
-                                .size(15.0)
-                                .color(theme::MUTED),
-                        );
-                        ui.add_space(10.0);
-                        mics(ui, snap);
-                    });
-                    on_air_panel(&mut cols[1], "Hall screens", false, |ui| {
-                        big_value(ui, "As usual", 40.0);
-                        ui.label(
-                            RichText::new("Lyrics and slides from the Screens ATEM").size(15.0).color(theme::MUTED),
-                        );
-                        ui.add_space(10.0);
-                        theme::lbl(ui, "YouTube");
-                        let (tone, text) = youtube_status(snap);
-                        status_line(ui, tone, &text);
-                    });
-                });
-                theme::panel().inner_margin(22).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    theme::lbl(ui, "Next step");
-                    ui.horizontal_wrapped(|ui| {
-                        let text_w = (ui.available_width() - 220.0).max(260.0);
-                        ui.allocate_ui_with_layout(vec2(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
-                            ui.label(RichText::new("End service when it finishes").font(theme::heading_font(30.0)));
-                            ui.label(
-                                RichText::new(format!(
-                                    "Closing still for {} s, then YouTube ends and the Web Presenter stops. \
-                                     Nothing to trim.",
-                                    c.timings.closing_hold.as_secs()
-                                ))
-                                .size(15.0)
-                                .color(theme::SOFT),
-                            );
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let busy = snap.job.is_some();
-                            if theme::sized_button(ui, "End service", Kind::DangerOutline, 60.0, 19.0, !busy).clicked()
-                            {
-                                app.end_service(snap);
-                            }
-                        });
-                    });
-                });
-                activity(ui, snap);
-            },
-            |app, ui| app.videos_panel(ui, snap, None),
-        );
+    /// Live, and any video playing (a rehearsal before live too): the videos and the
+    /// activity. End service is the fourth step in the steps bar.
+    pub(super) fn live_screen(&mut self, ui: &mut Ui, snap: &Snapshot) {
+        let playing = snap.playing.map(|i| {
+            let left = snap
+                .video
+                .filter(|v| v.index == i)
+                .map(|v| format!("{} left", view::fmt_mmss(v.duration.saturating_sub(v.position))));
+            (i, left)
+        });
+        self.columns(ui, 420.0, |app, ui| app.videos_panel(ui, snap, playing), |_, ui| activity(ui, snap));
     }
 
-    /// The service's videos with a Play button each. While one plays (`playing`), it is
-    /// lit and the others wait.
+    /// The service's videos with a Play button each. While one plays (`playing`, with the
+    /// time left), it is lit with Stop and its progress, and the others wait.
     pub(super) fn videos_panel(&mut self, ui: &mut Ui, snap: &Snapshot, playing: Option<(usize, Option<String>)>) {
         theme::panel().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -97,7 +51,7 @@ impl StreamItApp {
                         ui.spacing_mut().item_spacing.x = 14.0;
                         let num = if this { theme::BLUE_SOFT } else { theme::DIM };
                         ui.label(RichText::new(format!("{:<2}", i + 1)).font(theme::mono(15.0)).color(num));
-                        let text_w = (ui.available_width() - 230.0).max(120.0);
+                        let text_w = (ui.available_width() - 260.0).max(120.0);
                         ui.allocate_ui_with_layout(vec2(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
                             ui.spacing_mut().item_spacing.y = 6.0;
                             ui.add(egui::Label::new(RichText::new(&cue.name).font(theme::body_bold(17.0))).truncate());
@@ -105,21 +59,18 @@ impl StreamItApp {
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 if this {
                                     theme::chip(ui, "Playing", theme::BLUE_SOFT, theme::BLUE);
-                                } else {
-                                    theme::chip(
-                                        ui,
-                                        view::dest_short(cue.destination),
-                                        theme::SOFT,
-                                        theme::BUTTON_BORDER,
-                                    );
-                                    theme::chip(ui, &view::fmt_db(cue.gain_db), theme::SOFT, theme::BUTTON_BORDER);
                                 }
+                                theme::chip(ui, view::dest_short(cue.destination), theme::SOFT, theme::BUTTON_BORDER);
+                                theme::chip(ui, &view::fmt_db(cue.gain_db), theme::SOFT, theme::BUTTON_BORDER);
                             });
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if this {
+                                if theme::button(ui, "Stop", Kind::DangerOutline).clicked() {
+                                    self.send(Command::StopVideo);
+                                }
                                 let left = playing.as_ref().and_then(|(_, r)| r.clone()).unwrap_or_default();
-                                ui.label(RichText::new(left).font(theme::mono(15.0)).color(theme::BLUE_SOFT));
+                                ui.label(RichText::new(left).font(theme::mono(17.0)).color(theme::BLUE_SOFT));
                                 return;
                             }
                             match state {
@@ -150,6 +101,15 @@ impl StreamItApp {
                             }
                         });
                     });
+                    if this {
+                        let frac = snap
+                            .video
+                            .filter(|v| v.index == i && !v.duration.is_zero())
+                            .map(|v| v.position.as_secs_f32() / v.duration.as_secs_f32())
+                            .unwrap_or(0.0);
+                        ui.add_space(4.0);
+                        theme::progress(ui, frac, theme::BLUE);
+                    }
                 });
             }
             if playing.is_none() {
@@ -195,15 +155,5 @@ impl StreamItApp {
             },
             |_, ui| activity(ui, snap),
         );
-    }
-}
-
-/// YouTube's line on the Live screen.
-fn youtube_status(snap: &Snapshot) -> (Tone, String) {
-    let public = !snap.offers.contains(&Offer::GoPublic);
-    match (view::device_state(snap, DeviceKind::YouTube), public) {
-        ((_, None), true) => (Tone::Green, "Public · stream healthy".into()),
-        ((tone, Some(why)), true) => (tone, format!("Public · {why}")),
-        (_, false) => (Tone::Amber, "Not public — retry going public above".into()),
     }
 }
