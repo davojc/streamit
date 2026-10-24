@@ -178,36 +178,57 @@ impl StreamItApp {
             ui.add_space(6.0);
             let restarting = self.restart_job.running || *self.switching.borrow();
             let w = (ui.available_width() - 8.0) / 2.0;
-            egui::Grid::new("faults").num_columns(2).spacing(vec2(8.0, 8.0)).show(ui, |ui| {
-                for (i, f) in view::FAULTS.iter().enumerate() {
+            let mut buttons: Vec<(String, Kind, bool)> = view::FAULTS
+                .iter()
+                .map(|f| {
                     let active = v.faults.contains(f);
-                    let (text, kind) = if active {
-                        (format!("{} · active", view::fault_label(*f)), Kind::Warn)
-                    } else {
-                        (view::fault_label(*f).to_string(), Kind::Plain)
-                    };
-                    let r =
-                        ui.add_sized([w, 44.0], |ui: &mut Ui| theme::sized_button(ui, &text, kind, 44.0, 15.0, true));
-                    if r.clicked() {
-                        info!(fault = ?f, on = !active, "simulation: fault");
-                        sim.toggle_fault(*f);
+                    match active {
+                        true => (format!("{} · active", view::fault_label(*f)), Kind::Warn, true),
+                        false => (view::fault_label(*f).to_string(), Kind::Plain, true),
                     }
-                    if i % 2 == 1 {
-                        ui.end_row();
+                })
+                .collect();
+            buttons.push(("Crash & restart app".into(), Kind::DangerOutline, !restarting));
+            for (row, pair) in buttons.chunks(2).enumerate() {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    for (col, (text, kind, enabled)) in pair.iter().enumerate() {
+                        if fault_button(ui, w, text, *kind, *enabled).clicked() {
+                            match view::FAULTS.get(row * 2 + col) {
+                                Some(f) => {
+                                    info!(fault = ?f, on = !v.faults.contains(f), "simulation: fault");
+                                    sim.toggle_fault(*f);
+                                }
+                                None => {
+                                    info!("simulation: crash & restart app");
+                                    let sessions = self.sessions.clone();
+                                    self.restart_job
+                                        .start(&self.rt, &self.ctx, async move { sessions.restart_engine().await });
+                                }
+                            }
+                        }
                     }
-                }
-                let r = ui.add_sized([w, 44.0], |ui: &mut Ui| {
-                    theme::sized_button(ui, "Crash & restart app", Kind::DangerOutline, 44.0, 15.0, !restarting)
                 });
-                if r.clicked() {
-                    info!("simulation: crash & restart app");
-                    let sessions = self.sessions.clone();
-                    self.restart_job.start(&self.rt, &self.ctx, async move { sessions.restart_engine().await });
-                }
-                ui.end_row();
-            });
+            }
         });
     }
+}
+
+/// A fault button `w` wide; a long label (or one marked active) wraps onto two lines.
+fn fault_button(ui: &mut Ui, w: f32, text: &str, kind: Kind, enabled: bool) -> egui::Response {
+    let (fill, border, color) = match kind {
+        Kind::Warn => (theme::AMBER_DARK, theme::AMBER, theme::AMBER_TEXT),
+        Kind::DangerOutline => (theme::BUTTON, theme::RED_BORDER, theme::RED_SOFT),
+        _ => (theme::BUTTON, theme::BUTTON_BORDER, theme::TEXT),
+    };
+    let label =
+        RichText::new(text.to_uppercase()).font(theme::heading_font(14.0)).color(color).extra_letter_spacing(0.6);
+    let b = egui::Button::new(label).fill(fill).stroke(Stroke::new(1.0, border)).corner_radius(8).wrap();
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = vec2(8.0, 2.0);
+        ui.add_enabled_ui(enabled, |ui| ui.add_sized([w, 44.0], b)).inner
+    })
+    .inner
 }
 
 fn speed_panel(ui: &mut Ui, sim: &SimControl, v: &SimView) {
