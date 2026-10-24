@@ -324,23 +324,39 @@ pub enum CueSync {
     Idle,
     /// An edit is waiting to be sent, or sent and not yet in the engine's list.
     Applying,
-    /// The engine did not take our last edit (a video started): fall back to its list.
+    /// The engine refused our edit because a video is playing: fall back to its list.
     Reverted,
+    /// Not reflected after the settle time and nothing is playing: send it once more.
+    Resend,
+    /// Not reflected even after a resend: fall back to the engine's list, neutral notice.
+    GaveUp,
     /// The lists differ with nothing of ours pending: take the engine's silently.
     Resync,
 }
 
 /// `dirty`: an edit waits for the debounce. `sent_age`: how long ago the last SetCues was
-/// sent. `differs`: the window's list is not the engine's.
-pub fn cue_sync(dirty: bool, sent_age: Option<Duration>, differs: bool, settle: Duration) -> CueSync {
+/// sent. `differs`: the window's list is not the engine's. `playing`: a video plays now or
+/// did when the edit was sent. `resent`: the edit has already been sent a second time.
+pub fn cue_sync(
+    dirty: bool,
+    sent_age: Option<Duration>,
+    differs: bool,
+    settle: Duration,
+    playing: bool,
+    resent: bool,
+) -> CueSync {
     match (dirty, sent_age) {
         (true, _) => CueSync::Applying,
         (false, _) if !differs => CueSync::Idle,
         (false, Some(a)) if a < settle => CueSync::Applying,
-        (false, Some(_)) => CueSync::Reverted,
+        (false, Some(_)) if playing => CueSync::Reverted,
+        (false, Some(_)) if !resent => CueSync::Resend,
+        (false, Some(_)) => CueSync::GaveUp,
         (false, None) => CueSync::Resync,
     }
 }
+
+pub const CUES_NOT_APPLIED_NOTICE: &str = "Your change to the video list wasn't applied. Please make it again.";
 
 pub const CUES_REVERTED_NOTICE: &str =
     "Your change to the video list wasn't applied because a video started. Make it again when the video ends.";
@@ -429,12 +445,19 @@ mod tests {
     fn cue_sync_decisions() {
         let settle = Duration::from_secs(1);
         let s = |ms| Some(Duration::from_millis(ms));
-        assert_eq!(cue_sync(true, None, true, settle), CueSync::Applying);
-        assert_eq!(cue_sync(false, s(300), true, settle), CueSync::Applying);
-        assert_eq!(cue_sync(false, s(300), false, settle), CueSync::Idle);
-        assert_eq!(cue_sync(false, s(1500), true, settle), CueSync::Reverted);
-        assert_eq!(cue_sync(false, None, true, settle), CueSync::Resync);
-        assert_eq!(cue_sync(false, None, false, settle), CueSync::Idle);
+        assert_eq!(cue_sync(true, None, true, settle, false, false), CueSync::Applying);
+        assert_eq!(cue_sync(false, s(300), true, settle, false, false), CueSync::Applying);
+        assert_eq!(cue_sync(false, s(300), false, settle, false, false), CueSync::Idle);
+        // A video is (or was at refusal) playing: the revert is honest.
+        assert_eq!(cue_sync(false, s(1500), true, settle, true, false), CueSync::Reverted);
+        assert_eq!(cue_sync(false, s(1500), true, settle, true, true), CueSync::Reverted);
+        // Nothing playing: resend once, then give up with the neutral notice.
+        assert_eq!(cue_sync(false, s(1500), true, settle, false, false), CueSync::Resend);
+        assert_eq!(cue_sync(false, s(1500), true, settle, false, true), CueSync::GaveUp);
+        // Reflected after all: nothing to do, however slow.
+        assert_eq!(cue_sync(false, s(1500), false, settle, false, true), CueSync::Idle);
+        assert_eq!(cue_sync(false, None, true, settle, false, false), CueSync::Resync);
+        assert_eq!(cue_sync(false, None, false, settle, false, false), CueSync::Idle);
     }
 
     #[test]

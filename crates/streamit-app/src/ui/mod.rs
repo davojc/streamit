@@ -191,6 +191,10 @@ pub struct StreamItApp {
     cues_sent_at: Option<Instant>,
     /// An edit is pending or not yet in the engine's list.
     cues_applying: bool,
+    /// A video was playing when the last SetCues was sent.
+    cues_sent_playing: bool,
+    /// The last SetCues has been sent a second time.
+    cues_resent: bool,
     /// The list could not be written to the settings file (yet).
     cues_unsaved: bool,
     cues_save_tried_at: Option<Instant>,
@@ -253,6 +257,8 @@ impl StreamItApp {
             cues_dirty_at: None,
             cues_sent_at: None,
             cues_applying: false,
+            cues_sent_playing: false,
+            cues_resent: false,
             cues_unsaved: false,
             cues_save_tried_at: None,
             discovered: Vec::new(),
@@ -400,17 +406,43 @@ impl StreamItApp {
         {
             self.cues_dirty_at = None;
             self.cues_sent_at = Some(Instant::now());
+            self.cues_sent_playing = snap.playing.is_some();
+            self.cues_resent = false;
             self.send(Command::SetCues(self.cues.clone()));
         }
-        // The engine ignores SetCues while a video plays: fall back to its list.
+        // The engine ignores SetCues while a video plays: fall back to its list. If
+        // nothing is playing, the edit is sent once more before it is given up.
         let sent_age = self.cues_sent_at.map(|t| t.elapsed());
-        let sync = view::cue_sync(self.cues_dirty_at.is_some(), sent_age, self.cues != engine, CUE_SETTLE);
-        self.cues_applying = sync == CueSync::Applying;
+        let playing = snap.playing.is_some() || self.cues_sent_playing;
+        let sync = view::cue_sync(
+            self.cues_dirty_at.is_some(),
+            sent_age,
+            self.cues != engine,
+            CUE_SETTLE,
+            playing,
+            self.cues_resent,
+        );
+        self.cues_applying = matches!(sync, CueSync::Applying | CueSync::Resend);
         match sync {
-            CueSync::Reverted => {
-                self.notice = Some(view::CUES_REVERTED_NOTICE.into());
+            CueSync::Reverted | CueSync::GaveUp => {
+                // A newer notice stays: it is more recent than this edit.
+                if self.notice.is_none() {
+                    self.notice = Some(
+                        if sync == CueSync::Reverted {
+                            view::CUES_REVERTED_NOTICE
+                        } else {
+                            view::CUES_NOT_APPLIED_NOTICE
+                        }
+                        .into(),
+                    );
+                }
                 self.cues = engine.clone();
                 self.cues_sent_at = None;
+            }
+            CueSync::Resend => {
+                self.cues_resent = true;
+                self.cues_sent_at = Some(Instant::now());
+                self.send(Command::SetCues(self.cues.clone()));
             }
             CueSync::Resync => self.cues = engine.clone(),
             _ => {}
