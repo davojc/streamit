@@ -359,6 +359,21 @@ impl StreamItApp {
             field(&mut c[2], "Router", |ui| opt_text(ui, &mut d.videohub.address, "not set"));
             field(&mut c[3], "Stream encoder", |ui| opt_text(ui, &mut d.web_presenter.address, "not set"));
         });
+        ui.add_space(14.0);
+        theme::lbl(ui, "MultiView");
+        sub(
+            ui,
+            "The MultiView 4 is not on the network. Say which router output feeds each of its views, \
+             and the MultiView tab shows and changes them. Applies when you Save.",
+        );
+        ui.columns(4, |c| {
+            let d = &mut self.draft;
+            for (v, name) in streamit_core::multiview::VIEWS.iter().enumerate() {
+                field(&mut c[v], &format!("{name} (MV in {})", v + 1), |ui| {
+                    router_number(ui, &mut d.multiview.outputs[v], "Output ")
+                });
+            }
+        });
         // While simulating, the note at the top of Settings says this (and more).
         if !simulating {
             ui.add_space(14.0);
@@ -842,6 +857,7 @@ impl StreamItApp {
         let saved = self.config.read().unwrap_or_else(|e| e.into_inner()).clone();
         let mut d = self.draft.clone();
         d.cues = saved.cues.clone();
+        d.multiview.presets = saved.multiview.presets.clone();
         d != saved || self.live_inputs_text != join_inputs(&saved.stream_atem.live_inputs)
     }
 
@@ -875,6 +891,7 @@ impl StreamItApp {
             let mut shared = self.config.write().unwrap_or_else(|e| e.into_inner());
             let mut c = self.draft.clone();
             c.cues = shared.cues.clone();
+            c.multiview.presets = shared.multiview.presets.clone();
             *shared = c.clone();
             c
         };

@@ -729,16 +729,17 @@ mod tests {
     // ---- MultiView
 
     fn mv_snap() -> Snapshot {
-        let mut s = Snapshot::default();
-        s.multiview = MultiView {
-            views: [Some(1), Some(2), Some(3), None],
-            labels: vec!["Cam 1".into(), "Cam 2".into(), "Choir".into()],
-            presets: vec![
-                Preset { slot: 1, name: "Service".into(), inputs: [1, 2, 3, 4] },
-                Preset { slot: 3, name: "Cameras".into(), inputs: [5, 6, 7, 8] },
-            ],
-        };
-        s
+        Snapshot {
+            multiview: MultiView {
+                views: [Some(1), Some(2), Some(3), None],
+                labels: vec!["Cam 1".into(), "Cam 2".into(), "Choir".into()],
+                presets: vec![
+                    Preset { slot: 1, name: "Service".into(), inputs: [1, 2, 3, 4] },
+                    Preset { slot: 3, name: "Cameras".into(), inputs: [5, 6, 7, 8] },
+                ],
+            },
+            ..Snapshot::default()
+        }
     }
 
     #[test]

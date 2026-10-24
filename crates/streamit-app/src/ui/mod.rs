@@ -2,6 +2,7 @@
 //! banner, and the tabs: Service (`service/`), Videos (`videos.rs`), Settings
 //! (`settings.rs`) and, in simulation only, Simulation (`simulation.rs`). Every press
 //! becomes the same `Command` the Stream Deck would send.
+mod multiview;
 mod service;
 mod settings;
 mod simulation;
@@ -86,6 +87,7 @@ impl<T: Send + 'static> Pending<T> {
 enum Tab {
     Service,
     Videos,
+    MultiView,
     Settings,
     /// Only offered in simulation mode.
     Simulation,
@@ -206,6 +208,7 @@ pub struct StreamItApp {
     selected: usize,
     lengths: videos::Lengths,
     updates: updates::Updates,
+    mv: multiview::MvUi,
 }
 
 impl StreamItApp {
@@ -280,6 +283,7 @@ impl StreamItApp {
             selected: 0,
             lengths: videos::Lengths::default(),
             updates: updates::Updates::default(),
+            mv: multiview::MvUi::default(),
         };
         app.load_broadcasts();
         app.load_channel();
@@ -497,6 +501,26 @@ impl StreamItApp {
         }
     }
 
+    /// Writes the MultiView presets to the shared settings and the file at once (like the
+    /// cue list, Save does not cover them), and gives them to the engine for the deck.
+    fn save_presets(&mut self, presets: Vec<streamit_core::multiview::Preset>) {
+        let c = {
+            let mut shared = self.config.write().unwrap_or_else(|e| e.into_inner());
+            shared.multiview.presets = presets.clone();
+            shared.clone()
+        };
+        self.draft.multiview.presets = presets.clone();
+        self.send(Command::SetPresets(presets));
+        if !self.file.writable {
+            self.notice = Some("Not saved: the settings file could not be backed up (see the log).".into());
+            return;
+        }
+        if let Err(e) = c.save(&self.file.path) {
+            warn!("saving the MultiView presets: {e:#}");
+            self.notice = Some(format!("Could not save the presets: {e:#}"));
+        }
+    }
+
     /// Writes the countdown video choice to the shared settings and the file, leaving the
     /// Settings tab's unsaved edits alone.
     fn save_countdown(&mut self, file: PathBuf) {
@@ -669,6 +693,7 @@ impl eframe::App for StreamItApp {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
                     Tab::Service => self.service_tab(ui, &snap, running.as_ref().unwrap_or(&config), &config, viewport),
                     Tab::Videos => self.videos_tab(ui, &snap, &config, running.as_ref()),
+                    Tab::MultiView => self.multiview_tab(ui, &snap, config.multiview.outputs),
                     Tab::Settings => self.settings_tab(ui, &snap),
                     Tab::Simulation => self.simulation_tab(ui, &snap),
                 });
@@ -700,11 +725,17 @@ impl StreamItApp {
                     &[
                         (Tab::Settings, "Settings"),
                         (Tab::Simulation, "Simulation"),
+                        (Tab::MultiView, "MultiView"),
                         (Tab::Videos, "Videos"),
                         (Tab::Service, "Service"),
                     ]
                 } else {
-                    &[(Tab::Settings, "Settings"), (Tab::Videos, "Videos"), (Tab::Service, "Service")]
+                    &[
+                        (Tab::Settings, "Settings"),
+                        (Tab::MultiView, "MultiView"),
+                        (Tab::Videos, "Videos"),
+                        (Tab::Service, "Service"),
+                    ]
                 };
                 for &(tab, name) in tabs {
                     if theme::tab(ui, name, self.tab == tab, tab == Tab::Simulation).clicked() {

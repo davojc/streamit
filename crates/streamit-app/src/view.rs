@@ -698,7 +698,7 @@ mod tests {
         let rows = cue_rows(&cues, &lengths);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].number, 1);
-        assert_eq!(rows[0].deck_key, 17);
+        assert_eq!(rows[0].deck_key, 9, "row 2 of the Videos page");
         assert_eq!(rows[0].name, "Notices");
         assert_eq!(rows[0].file_name, "Notices 26-10.mp4");
         assert_eq!(rows[0].length_text, "2:30");
