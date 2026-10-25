@@ -687,6 +687,14 @@ pub(super) fn label_to_send(typed: &str, current: &str, escaped: bool) -> Option
     (!escaped && typed != current.trim()).then(|| typed.to_string())
 }
 
+/// Room for the × that clears a label.
+const CLEAR_W: f32 = 24.0;
+
+/// What a cleared label becomes: its number, "#5".
+fn cleared_label(n: u16) -> String {
+    format!("#{n}")
+}
+
 impl StreamItApp {
     /// Rename the VideoHub's inputs and outputs. A name goes to the VideoHub when its field
     /// loses focus (Enter or a click elsewhere); Escape puts it back.
@@ -698,7 +706,7 @@ impl StreamItApp {
                 RichText::new(
                     "The names the VideoHub shows on its front panel and in Videohub Setup. Change one and press \
                      Enter (or click away): it goes to the VideoHub straight away, and StreamIt uses the new name \
-                     everywhere. Escape puts it back.",
+                     everywhere. Escape puts it back. × clears a name to its number (#5).",
                 )
                 .color(theme::SOFT),
             );
@@ -755,7 +763,17 @@ impl StreamItApp {
         );
         let fed = if kind == LabelKind::Output { routing.fed_by(n) } else { Vec::new() };
         let badges_w = fed.len() as f32 * 27.0;
-        let field = Rect::from_min_max(row.min + vec2(30.0, 0.0), row.max - vec2(badges_w, 0.0));
+        let field = Rect::from_min_max(row.min + vec2(30.0, 0.0), row.max - vec2(badges_w + CLEAR_W, 0.0));
+        let cleared = cleared_label(n);
+        let clear = Rect::from_min_size(egui::pos2(field.right() + 3.0, row.center().y - 10.0), vec2(20.0, 20.0));
+        let clear_r =
+            ui.put(clear, egui::Button::new(RichText::new("×").size(14.0).color(theme::MUTED)).frame(false).small());
+        if current != cleared && clear_r.on_hover_text(format!("Clear the label: it becomes {cleared}")).clicked() {
+            info!(?kind, n, "VideoHub: clearing a label from the window");
+            self.routes_ui.drafts.remove(&key);
+            self.send(Command::SetLabel { kind, n, text: cleared });
+            return;
+        }
         let r = ui.put(
             field,
             egui::TextEdit::singleline(&mut text)
@@ -769,7 +787,7 @@ impl StreamItApp {
         );
         for (k, (t, i)) in fed.into_iter().enumerate() {
             let b = Rect::from_min_size(
-                egui::pos2(field.right() + 3.0 + k as f32 * 27.0, row.center().y - 8.0),
+                egui::pos2(field.right() + CLEAR_W + 3.0 + k as f32 * 27.0, row.center().y - 8.0),
                 vec2(24.0, 16.0),
             );
             ui.painter().rect_filled(b, 4.0, colour(t, i));
@@ -886,6 +904,12 @@ fn slot_box(ui: &mut Ui, fill: Color32, border: Color32, add: impl FnOnce(&mut U
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cleared_label_is_its_number() {
+        assert_eq!(cleared_label(5), "#5");
+        assert_eq!(cleared_label(40), "#40");
+    }
 
     #[test]
     fn inputs_split_down_both_sides() {
