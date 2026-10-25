@@ -296,6 +296,49 @@ pub fn step_strip(ui: &mut Ui, steps: [StepState; 4], button: Option<usize>) -> 
     clicked
 }
 
+/// The thin equipment bar under the header, coloured by the worst device. Says whether
+/// its "Settings › Equipment" link (shown only when something is wrong) was pressed.
+pub fn equipment_bar(ui: &mut Ui, text: &str, tone: Tone) -> bool {
+    let (fill, line, color) = match tone {
+        Tone::Red => (Color32::from_rgb(0x2E, 0x14, 0x16), Color32::from_rgb(0x5A, 0x23, 0x26), RED_SOFT),
+        Tone::Amber => (Color32::from_rgb(0x2A, 0x21, 0x12), Color32::from_rgb(0x4A, 0x3A, 0x1C), AMBER_SOFT),
+        Tone::Green | Tone::Grey => (
+            Color32::from_rgb(0x12, 0x1A, 0x15),
+            Color32::from_rgb(0x1F, 0x2E, 0x24),
+            Color32::from_rgb(0x8F, 0xBF, 0x9F),
+        ),
+    };
+    let mut clicked = false;
+    Frame::new().fill(fill).inner_margin(Margin::symmetric(28, 5)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let (rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+            ui.painter().circle_filled(rect.center(), 4.0, tone_color(tone));
+            let link = matches!(tone, Tone::Red | Tone::Amber);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if link {
+                    let r = ui
+                        .add(
+                            egui::Label::new(RichText::new("Settings › Equipment").size(13.0).color(color).underline())
+                                .sense(Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    clicked = r.clicked();
+                    ui.add_space(12.0);
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(RichText::new(text).size(13.0).color(color)).truncate());
+                });
+            });
+        });
+    });
+    let r = ui.min_rect();
+    ui.painter().hline(r.x_range(), r.top(), Stroke::new(1.0, line));
+    ui.painter().hline(r.x_range(), r.bottom(), Stroke::new(1.0, line));
+    clicked
+}
+
 /// The striped amber banner shown on every screen in simulation. Returns true when its
 /// "Settings › Equipment" link is pressed.
 pub fn sim_banner(ui: &mut Ui) -> bool {

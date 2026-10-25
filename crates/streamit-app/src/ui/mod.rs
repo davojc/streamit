@@ -14,7 +14,7 @@ mod videos;
 use crate::discovery::{BmdKind, DiscoveredDevice};
 use crate::session::{Front, Mode, Sessions, SwitchRefused};
 use crate::theme;
-use crate::view::{self, CueSync, ServiceScreen};
+use crate::view::{self, CueSync};
 use eframe::egui::{self, Color32, Margin, RichText, Ui};
 use settings::{RESTART_NOTE, Section, device_settings, join_inputs};
 use std::future::Future;
@@ -772,6 +772,18 @@ impl eframe::App for StreamItApp {
         egui::Panel::top("header")
             .frame(egui::Frame::new().fill(theme::HEADER).inner_margin(Margin::symmetric(28, 16)))
             .show(ui, |ui| self.header(ui, &snap, &config));
+        // The equipment summary, on every tab: the worst device first.
+        let h = view::header(&snap, &config);
+        let equipment = egui::Panel::top("equipment")
+            .frame(egui::Frame::new())
+            .show_separator_line(false)
+            .show(ui, |ui| theme::equipment_bar(ui, &h.equipment, h.equipment_tone))
+            .inner;
+        if equipment {
+            self.tab = Tab::Settings;
+            self.section = Section::Equipment;
+            self.scroll_to = Some(Section::Equipment);
+        }
         if let Some(n) = self.notice.clone() {
             egui::Panel::top("notice")
                 .frame(egui::Frame::new().fill(theme::AMBER_DARK).inner_margin(Margin::symmetric(28, 8)))
@@ -825,8 +837,6 @@ impl StreamItApp {
         let h = view::header(snap, config);
         let switching = *self.switching.borrow();
         let simulating = *self.mode.borrow() == Mode::Simulation;
-        // The first screen lists every device, so its header leaves the summary out.
-        let summary = !(self.tab == Tab::Service && view::service_screen(snap) == ServiceScreen::BeforeService);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 24.0;
             let mut name = egui::text::LayoutJob::default();
@@ -884,17 +894,6 @@ impl StreamItApp {
                         self.section = Section::Updates;
                         self.scroll_to = Some(Section::Updates);
                     }
-                }
-                // The equipment summary gives way first, so the broadcast name keeps its room.
-                let summary_w = (ui.available_width() - 240.0).min(360.0);
-                if summary && summary_w > 80.0 {
-                    ui.add_space(18.0);
-                    let layout = egui::Layout::right_to_left(egui::Align::Center);
-                    ui.allocate_ui_with_layout(egui::vec2(summary_w, 20.0), layout, |ui| {
-                        ui.add(egui::Label::new(RichText::new(&h.equipment).size(14.0).color(theme::MUTED)).truncate());
-                    });
-                    theme::dot(ui, theme::tone_color(h.equipment_tone));
-                    ui.add_space(6.0);
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.vertical(|ui| {
