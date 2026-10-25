@@ -1030,6 +1030,7 @@ mod tests {
             destination: Destination::HallAndOnline,
             gain_db: 0.0,
             return_input: None,
+            scene: None,
         };
         let play_task = {
             let (d, c) = (d.clone(), c.clone());

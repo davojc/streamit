@@ -16,6 +16,7 @@ fn cue(name: &str) -> Cue {
         destination: Destination::HallAndOnline,
         gain_db: 0.0,
         return_input: None,
+        scene: None,
     }
 }
 

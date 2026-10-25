@@ -6,6 +6,7 @@ use streamit_core::golive::{Readiness, Stage};
 use streamit_core::recovery::Offer;
 use streamit_core::rollin::CueState;
 use streamit_core::routing::{PRESET_SLOTS, Target, TargetState, VIEW_KEYS, locked};
+use streamit_core::scenes::MAX_SCENES;
 
 pub const KEYS: u8 = 32;
 pub const COLS: u8 = 8;
@@ -45,6 +46,8 @@ pub enum Page {
     Routing,
     /// One routing target: its presets and what each destination shows.
     Target(Target),
+    /// The scenes, one key each.
+    Scenes,
 }
 
 /// What a key press does: an engine command, a move to another page, or a preset to
@@ -85,6 +88,8 @@ const VIDEOS_STATUS: [(DeviceKind, &str); 4] = [
     (DeviceKind::Ndi, "NDI"),
 ];
 const ROUTING_STATUS: [(DeviceKind, &str); 1] = [(DeviceKind::VideoHub, "VIDEO\nHUB")];
+const SCENES_STATUS: [(DeviceKind, &str); 2] =
+    [(DeviceKind::ScreensAtem, "SCREENS\nATEM"), (DeviceKind::Lighting, "LIGHTING")];
 /// A target page: HOME, then ROUTING (back) at key 1, then these from key 2.
 const MULTIVIEW_STATUS: [(DeviceKind, &str); 1] = [(DeviceKind::VideoHub, "VIDEO\nHUB")];
 const STREAM_ROUTING_STATUS: [(DeviceKind, &str); 2] =
@@ -101,6 +106,7 @@ pub const HOME_KEY: u8 = 0;
 const GO_STREAM: u8 = 17;
 const GO_ROUTING: u8 = 19;
 const GO_VIDEOS: u8 = 21;
+const GO_SCENES: u8 = 23;
 
 // Routing: the three targets, in the same places.
 const GO_MULTIVIEW: u8 = 17;
@@ -138,6 +144,17 @@ const SCREENS_INPUT_BG: Rgb = Rgb(14, 102, 120);
 pub const VIEW_COLOURS: [Rgb; 4] = [Rgb(76, 154, 255), Rgb(245, 165, 36), Rgb(61, 214, 140), Rgb(232, 121, 201)];
 const NAV: Rgb = Rgb(59, 42, 107);
 const HOME_BG: Rgb = Rgb(43, 43, 43);
+
+// Scenes: rows 1 and 2, twelve keys (all of row 1, the first four of row 2).
+const FIRST_SCENE: u8 = 8;
+/// A scene's key, and the scene on now.
+const SCENE_BG: Rgb = Rgb(96, 70, 12);
+
+/// Scene index for a key on the Scenes page.
+fn scene_slot(key: u8) -> Option<usize> {
+    let i = key.checked_sub(FIRST_SCENE)? as usize;
+    (i < MAX_SCENES).then_some(i)
+}
 
 /// Cue index for a key on the Videos page (rows 1 and 2, columns 0-6).
 fn cue_slot(key: u8) -> Option<usize> {
@@ -200,9 +217,11 @@ pub fn press_for(page: Page, key: u8, snap: &Snapshot) -> Option<Press> {
                 GO_STREAM => Some(Press::Go(Page::Stream)),
                 GO_ROUTING => Some(Press::Go(Page::Routing)),
                 GO_VIDEOS => Some(Press::Go(Page::Videos)),
+                GO_SCENES => Some(Press::Go(Page::Scenes)),
                 _ => None,
             };
         }
+        Page::Scenes => scene_slot(key).and_then(|i| snap.scenes.get(i)).map(|s| Command::GoScene(s.id)),
         Page::Routing => {
             return match key {
                 GO_MULTIVIEW => Some(Press::Go(Page::Target(Target::MultiView))),
@@ -353,6 +372,7 @@ pub fn appearance_with(
         Page::Stream => &STREAM_STATUS,
         Page::Videos => &VIDEOS_STATUS,
         Page::Routing => &ROUTING_STATUS,
+        Page::Scenes => &SCENES_STATUS,
         Page::Target(Target::MultiView) => &MULTIVIEW_STATUS,
         Page::Target(Target::StreamAtem) => &STREAM_ROUTING_STATUS,
         Page::Target(Target::ScreensAtem) => &SCREENS_ROUTING_STATUS,
@@ -371,7 +391,15 @@ pub fn appearance_with(
         Page::Videos => videos_look(key, snap, blink_phase),
         Page::Routing => routing_look(key),
         Page::Target(t) => target_look(t, key, snap, blink_phase, armed),
+        Page::Scenes => scenes_look(key, snap),
     }
+}
+
+/// A scene's key: its name, lit amber while it is the scene on now.
+fn scenes_look(key: u8, snap: &Snapshot) -> KeyLook {
+    let Some(scene) = scene_slot(key).and_then(|i| snap.scenes.get(i)) else { return blank() };
+    let text = wrap_cue_name(&scene.key_text(), CUE_LINE_WIDTH);
+    if snap.active_scene == Some(scene.id) { look(text, AMBER, BLACK) } else { look(text, SCENE_BG, WHITE) }
 }
 
 fn blank() -> KeyLook {
@@ -398,6 +426,7 @@ fn home_look(key: u8, snap: &Snapshot) -> KeyLook {
         // A playing video shows here too, so it is not forgotten on another page.
         GO_VIDEOS if snap.playing.is_some() => look("VIDEOS\nPLAYING", RED, WHITE),
         GO_VIDEOS => look("VIDEOS", NAV, WHITE),
+        GO_SCENES => look("SCENES", NAV, WHITE),
         _ => blank(),
     }
 }
@@ -562,6 +591,7 @@ mod tests {
             destination: Destination::HallAndOnline,
             gain_db: 0.0,
             return_input: None,
+            scene: None,
         }
     }
 
@@ -584,7 +614,9 @@ mod tests {
         assert_eq!(press_for(Page::Home, 17, &s), Some(Press::Go(Page::Stream)));
         assert_eq!(press_for(Page::Home, 19, &s), Some(Press::Go(Page::Routing)));
         assert_eq!(press_for(Page::Home, 21, &s), Some(Press::Go(Page::Videos)));
-        for page in [Page::Stream, Page::Videos, Page::Routing, Page::Target(Target::StreamAtem)] {
+        assert_eq!(press_for(Page::Home, 23, &s), Some(Press::Go(Page::Scenes)));
+        assert_eq!(appearance(Page::Home, 23, &s, true).text, "SCENES");
+        for page in [Page::Stream, Page::Videos, Page::Routing, Page::Target(Target::StreamAtem), Page::Scenes] {
             assert_eq!(press_for(page, HOME_KEY, &s), Some(Press::Go(Page::Home)), "{page:?}");
             assert_eq!(appearance(page, HOME_KEY, &s, true).text, "HOME");
         }
@@ -595,9 +627,30 @@ mod tests {
     #[test]
     fn home_does_nothing_else() {
         let s = Snapshot { offers: vec![Offer::GoLive, Offer::Recover], ..snap_with_cues(14) };
-        for k in (0..KEYS).filter(|k| ![17, 19, 21].contains(k)) {
+        for k in (0..KEYS).filter(|k| ![17, 19, 21, 23].contains(k)) {
             assert_eq!(press_for(Page::Home, k, &s), None, "key {k}");
         }
+    }
+
+    #[test]
+    fn the_scenes_page_goes_to_a_scene_and_lights_the_one_on_now() {
+        use streamit_core::scenes::Scene;
+        let scenes =
+            (1..=13).map(|id| Scene { id, name: format!("Scene {id}"), key: String::new(), screens: None, cue: None });
+        let mut s = Snapshot { scenes: scenes.collect(), ..Snapshot::default() };
+        s.scenes[1].key = "PREACH".into();
+        assert_eq!(press_for(Page::Scenes, 8, &s), Some(Press::Command(Command::GoScene(1))));
+        assert_eq!(press_for(Page::Scenes, 19, &s), Some(Press::Command(Command::GoScene(12))));
+        assert_eq!(press_for(Page::Scenes, 20, &s), None, "twelve at most");
+        assert_eq!(appearance(Page::Scenes, 9, &s, true).text, "PREACH");
+        assert_eq!(appearance(Page::Scenes, 9, &s, true).bg, SCENE_BG);
+        s.active_scene = Some(2);
+        assert_eq!(appearance(Page::Scenes, 9, &s, true).bg, AMBER);
+        assert_eq!(appearance(Page::Scenes, 1, &s, true).text, "SCREENS\nATEM");
+        assert_eq!(appearance(Page::Scenes, 2, &s, true).text, "LIGHTING");
+        s.scenes.truncate(1);
+        assert_eq!(appearance(Page::Scenes, 9, &s, true), blank());
+        assert_eq!(press_for(Page::Scenes, 9, &s), None);
     }
 
     #[test]

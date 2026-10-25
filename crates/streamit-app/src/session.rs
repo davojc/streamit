@@ -922,6 +922,7 @@ mod tests {
             destination: streamit_core::rollin::Destination::AudioOnly,
             gain_db: 0.0,
             return_input: None,
+            scene: None,
         }];
         let (s, front, ..) = start_cfg("job", Arc::new(Spy::default()), sim.clone(), c).await;
         front.tx.send(Command::PlayCue(0)).await.unwrap();
@@ -1259,6 +1260,7 @@ mod tests {
                 destination: streamit_core::rollin::Destination::OnlineOnly,
                 gain_db: 0.0,
                 return_input: None,
+                scene: None,
             }],
             ..Config::default()
         };
@@ -1320,6 +1322,7 @@ mod tests {
                 destination: streamit_core::rollin::Destination::HallAndOnline,
                 gain_db: 0.0,
                 return_input: None,
+                scene: None,
             }],
             ..Config::default()
         };

@@ -792,6 +792,7 @@ mod tests {
             destination: Destination::HallAndOnline,
             gain_db: gain,
             return_input: None,
+            scene: None,
         }
     }
 

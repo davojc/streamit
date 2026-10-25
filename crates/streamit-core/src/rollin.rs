@@ -47,7 +47,7 @@ impl Destination {
         matches!(self, Destination::HallAndOnline | Destination::OnlineOnly)
     }
     /// Puts the video on the hall screens.
-    fn screens_picture(self) -> bool {
+    pub fn screens_picture(self) -> bool {
         matches!(self, Destination::HallAndOnline | Destination::HallOnly)
     }
 }
@@ -63,6 +63,10 @@ pub struct Cue {
     /// Stream ATEM input to go back to after the video; `None` means "whatever is on Preview".
     #[serde(default)]
     pub return_input: Option<u16>,
+    /// The scene (its id) to go to while the video plays; StreamIt goes back to the scene
+    /// before it when the video ends.
+    #[serde(default)]
+    pub scene: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -528,7 +532,14 @@ mod tests {
     }
 
     fn cue(destination: Destination) -> Cue {
-        Cue { path: PathBuf::from("hymn.mp4"), name: "Hymn".into(), destination, gain_db: -2.0, return_input: None }
+        Cue {
+            path: PathBuf::from("hymn.mp4"),
+            name: "Hymn".into(),
+            destination,
+            gain_db: -2.0,
+            return_input: None,
+            scene: None,
+        }
     }
 
     /// Fakes as they stand in a service: Cam 8 routed to input 8, mics live at -3 dB.

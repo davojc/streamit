@@ -449,6 +449,32 @@ impl StreamItApp {
                         },
                     );
                 });
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    theme::lbl(ui, "Scene while it plays");
+                    let none = "None: leave the scene as it is";
+                    let name = |id: u32| {
+                        streamit_core::scenes::find(&config.scenes, id)
+                            .map_or("(a removed scene)".into(), |s| s.name.clone())
+                    };
+                    let text = cue.scene.map_or_else(|| none.to_string(), name);
+                    egui::ComboBox::from_id_salt("video-scene")
+                        .selected_text(text)
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            changed |= ui.selectable_value(&mut cue.scene, None, none).changed();
+                            for s in &config.scenes {
+                                changed |= ui.selectable_value(&mut cue.scene, Some(s.id), &s.name).changed();
+                            }
+                        });
+                    let help = if config.scenes.is_empty() {
+                        "Make scenes on the Scenes tab."
+                    } else {
+                        "When the video ends (or is stopped), StreamIt goes back to the scene before it. \
+                         If it plays in the hall, the screens show the video; only the scene's lighting cue fires."
+                    };
+                    ui.label(RichText::new(help).size(14.0).color(theme::SOFT));
+                });
             });
         });
         if changed {

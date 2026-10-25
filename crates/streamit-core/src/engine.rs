@@ -27,6 +27,7 @@ use crate::golive::{self, CountdownOutcome, CountdownReport, Readiness, Stage, S
 use crate::recovery::{self, Assessment, Offer};
 use crate::rollin::{self, Cue, CueList, CueState, RollinOutcome, RollinReport};
 use crate::routing::{Preset, RoutingRead, RoutingState, Target, TargetState, locked};
+use crate::scenes::{self, MAX_SCENES, Scene};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,6 +117,10 @@ pub enum Command {
     },
     /// Post a reply to the live chat as the channel.
     SendChat(String),
+    /// Go to the scene with this id: its hall screens input and its lighting cue.
+    GoScene(u32),
+    /// Replace the scenes (after an edit on the Scenes tab).
+    SetScenes(Vec<Scene>),
 }
 
 /// One shown audio input: its name and what the switcher says (`None`: no answer).
@@ -189,6 +194,9 @@ pub struct Snapshot {
     pub chat: Vec<ChatMessage>,
     /// Why the chat could not be read last time, until a read works.
     pub chat_error: Option<String>,
+    pub scenes: Vec<Scene>,
+    /// The scene gone to last (its id).
+    pub active_scene: Option<u32>,
 }
 
 /// How far the playing roll-in is.
@@ -235,6 +243,8 @@ impl Default for Snapshot {
             live: None,
             chat: Vec::new(),
             chat_error: None,
+            scenes: Vec::new(),
+            active_scene: None,
         }
     }
 }
@@ -393,6 +403,15 @@ pub struct Engine {
     simulation: bool,
     /// Since when YouTube has not been receiving the stream, while live.
     not_receiving_since: Option<tokio::time::Instant>,
+    /// The playing video went to its own scene; when it ends, go back to the one before.
+    video_scene: Option<VideoScene>,
+}
+
+/// A video's scene, and the scene that was on before it.
+#[derive(Debug, Clone, Copy)]
+struct VideoScene {
+    scene: u32,
+    before: Option<u32>,
 }
 
 impl Engine {
@@ -415,8 +434,13 @@ impl Engine {
         let (tx, rx) = mpsc::channel(32);
         let (aux, aux_rx) = mpsc::unbounded_channel();
         let cues = CueList::from_cues(read(&c).cues);
-        let first =
-            Snapshot { cues: cue_rows(&cues), simulation, routing: routing_from(&read(&c)), ..Snapshot::default() };
+        let first = Snapshot {
+            cues: cue_rows(&cues),
+            simulation,
+            routing: routing_from(&read(&c)),
+            scenes: read(&c).scenes.into_iter().take(MAX_SCENES).collect(),
+            ..Snapshot::default()
+        };
         let (stx, srx) = watch::channel(first);
         let engine = Engine {
             d,
@@ -437,6 +461,7 @@ impl Engine {
             aux,
             simulation,
             not_receiving_since: None,
+            video_scene: None,
         };
         tokio::spawn(engine.run(rx, aux_rx).in_current_span());
         EngineHandle { tx, rx: srx }
@@ -821,6 +846,24 @@ impl Engine {
                     .in_current_span(),
                 );
             }
+            Command::GoScene(id) => {
+                let id = *id;
+                if scenes::find(&self.snap.borrow().scenes, id).is_none() {
+                    return self.ignore(&cmd, "there is no such scene");
+                }
+                let hall = self.hall_busy();
+                self.go_scene(id, hall);
+            }
+            Command::SetScenes(list) => {
+                let list: Vec<Scene> = list.iter().take(MAX_SCENES).cloned().collect();
+                info!(count = list.len(), "scenes replaced");
+                self.set(|s| {
+                    if s.active_scene.is_some_and(|id| scenes::find(&list, id).is_none()) {
+                        s.active_scene = None;
+                    }
+                    s.scenes = list;
+                });
+            }
             Command::LiveDetailsRead(live) => {
                 let live = live.clone();
                 self.set(|s| s.live = live);
@@ -1049,6 +1092,7 @@ impl Engine {
 
     fn start_video(&mut self, index: usize) {
         let Some(cue) = self.cues.get(index).cloned() else { return };
+        let (video_scene, in_hall) = (cue.scene, cue.destination.screens_picture());
         self.cues.state[index] = CueState::Playing;
         let rows = cue_rows(&self.cues);
         self.set(|s| {
@@ -1081,6 +1125,63 @@ impl Engine {
             .in_current_span(),
         );
         self.begin(Job::Video { index, stop, unmute }, handle);
+        // The video's scene: in the hall the screens stay on the video, so only its
+        // lighting cue fires.
+        if let Some(id) = video_scene.filter(|&id| scenes::find(&self.snap.borrow().scenes, id).is_some()) {
+            let before = self.snap.borrow().active_scene;
+            self.video_scene = Some(VideoScene { scene: id, before });
+            self.go_scene(id, in_hall);
+        }
+    }
+
+    /// A countdown or a video is on the hall screens, so a scene must not cut them away.
+    fn hall_busy(&self) -> bool {
+        match &self.running {
+            Some(Running { job: Job::Countdown { .. }, .. }) => true,
+            Some(Running { job: Job::Video { index, .. }, .. }) => {
+                self.cues.get(*index).is_some_and(|c| c.destination.screens_picture())
+            }
+            _ => false,
+        }
+    }
+
+    /// Puts the scene's input on the hall screens (unless `keep_hall`) and fires its
+    /// lighting cue. Each part that fails warns; the other still runs.
+    fn go_scene(&mut self, id: u32, keep_hall: bool) {
+        let Some(scene) = scenes::find(&self.snap.borrow().scenes, id).cloned() else { return };
+        let screens = scene.screens.filter(|_| !keep_hall);
+        let cue = scene.cue.clone().filter(|c| !c.cue.trim().is_empty());
+        let mut line = format!("Scene · {}", scene.name);
+        if keep_hall && scene.screens.is_some() {
+            line.push_str(" · the hall stays on the video");
+        }
+        info!(scene = %scene.name, ?screens, cue = ?scene.cue, "going to a scene");
+        self.set(|s| {
+            s.active_scene = Some(id);
+            log(s, line);
+        });
+        let (d, snap) = (self.d.clone(), self.snap.clone());
+        tokio::spawn(
+            async move {
+                if let Some(input) = screens
+                    && let Err(e) = d.screens.set_program(input).await
+                {
+                    set_warning(
+                        &snap,
+                        format!("Scene {}: could not put input {input} on the hall screens: {e}", scene.name),
+                    );
+                }
+                if let Some(c) = &cue
+                    && let Err(e) = d.lights.fire_cue(c.list, &c.cue).await
+                {
+                    set_warning(
+                        &snap,
+                        format!("Scene {}: could not fire lighting cue {}/{}: {e}", scene.name, c.list, c.cue),
+                    );
+                }
+            }
+            .in_current_span(),
+        );
     }
 
     /// Start service now (the GO LIVE key, or a pre-empted countdown): the T-0 cut and,
@@ -1363,6 +1464,13 @@ impl Engine {
                 add(&mut s.offers, Offer::Recover);
             }
         });
+        // Back to the scene before the video, unless someone picked another meanwhile.
+        if let Some(v) = self.video_scene.take()
+            && self.snap.borrow().active_scene == Some(v.scene)
+            && let Some(before) = v.before
+        {
+            self.go_scene(before, false);
+        }
     }
 
     // ---- always-accepted side tasks ----
@@ -1731,6 +1839,7 @@ mod tests {
             destination,
             gain_db: 0.0,
             return_input: None,
+            scene: None,
         }
     }
 
@@ -3419,6 +3528,88 @@ mod tests {
         h.yt.fail_next("send_chat");
         send(&e, Command::SendChat("Again".into())).await;
         until(&mut e, "a warning", |s| s.last_warning.as_deref().is_some_and(|w| w.contains("could not send"))).await;
+    }
+
+    // ---- scenes
+
+    fn scene(id: u32, name: &str, screens: Option<u16>, cue: Option<(u32, &str)>) -> Scene {
+        Scene {
+            id,
+            name: name.into(),
+            key: String::new(),
+            screens,
+            cue: cue.map(|(list, c)| crate::scenes::LightCue { list, cue: c.into() }),
+        }
+    }
+
+    fn with_scenes(c: Arc<RwLock<Config>>) -> Arc<RwLock<Config>> {
+        c.write().unwrap().scenes = vec![
+            scene(1, "Worship", Some(1), Some((1, "2"))),
+            scene(2, "Preach", Some(3), Some((1, "4"))),
+            scene(3, "Video", Some(5), Some((1, "9"))),
+        ];
+        c
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_scene_cuts_the_hall_screens_and_fires_its_cue() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, with_scenes(cfg(vec![])));
+        assert_eq!(snap(&e).scenes.len(), 3, "the scenes come from the config");
+        send(&e, Command::GoScene(2)).await;
+        until_call(&log, Call::ScreensSetProgram(3)).await;
+        until_call(&log, Call::LightsFireCue(1, "4".into())).await;
+        let s = until(&mut e, "active", |s| s.active_scene == Some(2)).await;
+        assert!(has(&s, "Scene · Preach"), "{:?}", texts(&s));
+        send(&e, Command::GoScene(99)).await;
+        send(&e, Command::SetScenes(vec![scene(1, "Worship", None, None)])).await;
+        let s = until(&mut e, "the new list", |s| s.scenes.len() == 1).await;
+        assert_eq!(s.active_scene, None, "the active scene was removed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hall_video_keeps_the_screens_but_its_scene_fires_and_goes_back_after() {
+        let (d, log, h) = rig();
+        let mut video = cue("Mission", Destination::HallAndOnline);
+        video.scene = Some(3);
+        let mut e = Engine::spawn(d, with_scenes(cfg(vec![video])));
+        send(&e, Command::GoScene(1)).await;
+        until(&mut e, "worship", |s| s.active_scene == Some(1)).await;
+        until_call(&log, Call::LightsFireCue(1, "2".into())).await;
+        send(&e, Command::PlayCue(0)).await;
+        until_call(&log, Call::LightsFireCue(1, "9".into())).await;
+        let s = until(&mut e, "the video's scene", |s| s.active_scene == Some(3)).await;
+        assert!(has(&s, "Scene · Video · the hall stays on the video"), "{:?}", texts(&s));
+        assert!(!log.calls().contains(&Call::ScreensSetProgram(5)), "the hall stays on the video");
+        until_call(&log, Call::PlayerPlay).await;
+        let before = log.calls().len();
+        h.player.emit(PlayerEvent::Ended);
+        until(&mut e, "played", |s| s.cues[0].1 == CueState::Played).await;
+        let s = until(&mut e, "back to worship", |s| s.active_scene == Some(1)).await;
+        assert_eq!(s.activity[0].text, "Scene · Worship", "{:?}", texts(&s));
+        sleep(MS(200)).await;
+        assert!(log.calls()[before..].contains(&Call::LightsFireCue(1, "2".into())), "worship's cue again");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_scene_picked_during_the_video_is_kept_after_it() {
+        let (d, log, h) = rig();
+        let mut video = cue("Notices", Destination::OnlineOnly);
+        video.scene = Some(3);
+        let mut e = Engine::spawn(d, with_scenes(cfg(vec![video])));
+        send(&e, Command::GoScene(1)).await;
+        until(&mut e, "worship", |s| s.active_scene == Some(1)).await;
+        send(&e, Command::PlayCue(0)).await;
+        // Online only: the video's scene may change the hall screens.
+        until_call(&log, Call::ScreensSetProgram(5)).await;
+        until_call(&log, Call::PlayerPlay).await;
+        send(&e, Command::GoScene(2)).await;
+        until(&mut e, "preach", |s| s.active_scene == Some(2)).await;
+        until_call(&log, Call::ScreensSetProgram(3)).await;
+        h.player.emit(PlayerEvent::Ended);
+        until(&mut e, "played", |s| s.cues[0].1 == CueState::Played).await;
+        sleep(MS(200)).await;
+        assert_eq!(snap(&e).active_scene, Some(2), "the scene picked during the video stays");
     }
 
     // ---- stream health

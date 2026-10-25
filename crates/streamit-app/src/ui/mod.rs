@@ -4,6 +4,7 @@
 //! becomes the same `Command` the Stream Deck would send.
 mod profiles;
 mod routing;
+mod scenes;
 mod service;
 mod settings;
 mod simulation;
@@ -89,6 +90,7 @@ impl<T: Send + 'static> Pending<T> {
 enum Tab {
     Service,
     Videos,
+    Scenes,
     Routing,
     Settings,
     /// Only offered in simulation mode.
@@ -173,6 +175,13 @@ pub struct StreamItApp {
     confirm_end: bool,
     /// The reply typed in the live chat panel.
     chat_reply: String,
+    /// The scene selected on the Scenes tab, its settings as being typed, and the scene
+    /// whose Remove is waiting for its second click.
+    scene_sel: Option<u32>,
+    scene_draft: Option<streamit_core::scenes::Scene>,
+    scene_remove: Option<u32>,
+    /// GO now pressed with unsaved changes: the scene goes once they are saved.
+    pending_go: Option<u32>,
     /// The config the devices were built from.
     startup: Config,
     draft: Config,
@@ -271,6 +280,10 @@ impl StreamItApp {
             confirm_start_now: false,
             confirm_end: false,
             chat_reply: String::new(),
+            scene_sel: None,
+            scene_draft: None,
+            scene_remove: None,
+            pending_go: None,
             live_inputs_text: join_inputs(&draft.stream_atem.live_inputs),
             cues: startup.cues.clone(),
             engine_cues: startup.cues.clone(),
@@ -534,6 +547,26 @@ impl StreamItApp {
         self.send(Command::SetPresets(target, presets));
     }
 
+    /// The scenes, in the shared settings, the draft and the file at once (the Scenes tab
+    /// saves as it goes), and to the engine.
+    fn save_scenes(&mut self, list: Vec<streamit_core::scenes::Scene>) {
+        let c = {
+            let mut shared = self.config.write().unwrap_or_else(|e| e.into_inner());
+            shared.scenes = list.clone();
+            shared.clone()
+        };
+        self.draft.scenes = list.clone();
+        self.send(Command::SetScenes(list));
+        if !self.file.writable {
+            self.notice = Some("Not saved: the settings file could not be backed up (see the log).".into());
+            return;
+        }
+        if let Err(e) = c.save(&self.file.path) {
+            warn!("saving the scenes: {e:#}");
+            self.notice = Some(format!("Could not save the scenes: {e:#}"));
+        }
+    }
+
     /// Changes a routing target's config in the shared settings, the draft and the file at
     /// once: the Routing tab saves as it goes (Save in Settings does not cover it).
     fn save_routing(&mut self, target: Target, change: impl Fn(&mut streamit_core::routing::RoutingConfig)) {
@@ -778,6 +811,7 @@ impl eframe::App for StreamItApp {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
                     Tab::Service => self.service_tab(ui, &snap, running.as_ref().unwrap_or(&config), &config, viewport),
                     Tab::Videos => self.videos_tab(ui, &snap, &config, running.as_ref()),
+                    Tab::Scenes => self.scenes_tab(ui, &snap, running.as_ref().unwrap_or(&config)),
                     Tab::Routing => self.routing_tab(ui, &snap),
                     Tab::Settings => self.settings_tab(ui, &snap),
                     Tab::Simulation => self.simulation_tab(ui, &snap),
@@ -825,6 +859,7 @@ impl StreamItApp {
                         (Tab::Settings, "Settings"),
                         (Tab::Simulation, "Simulation"),
                         (Tab::Routing, "Routing"),
+                        (Tab::Scenes, "Scenes"),
                         (Tab::Videos, "Videos"),
                         (Tab::Service, "Service"),
                     ]
@@ -832,6 +867,7 @@ impl StreamItApp {
                     &[
                         (Tab::Settings, "Settings"),
                         (Tab::Routing, "Routing"),
+                        (Tab::Scenes, "Scenes"),
                         (Tab::Videos, "Videos"),
                         (Tab::Service, "Service"),
                     ]
@@ -881,6 +917,7 @@ fn new_cue(path: &Path) -> Cue {
         destination: Destination::HallAndOnline,
         gain_db: 0.0,
         return_input: None,
+        scene: None,
     }
 }
 

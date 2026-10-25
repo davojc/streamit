@@ -8,6 +8,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::rollin::Cue;
+use crate::scenes::Scene;
 
 /// Serialize a `Duration` as whole milliseconds.
 mod millis {
@@ -222,6 +223,9 @@ pub struct Config {
     /// The roll-in cue list, saved so it survives a restart.
     #[serde(default)]
     pub cues: Vec<Cue>,
+    /// The scenes, in order. Saved in place, like the Routing presets.
+    #[serde(default)]
+    pub scenes: Vec<Scene>,
 }
 
 impl Config {
@@ -410,6 +414,7 @@ mod tests {
                 destination: Destination::HallAndOnline,
                 gain_db: -2.5,
                 return_input: Some(2),
+                scene: None,
             },
             Cue {
                 path: PathBuf::from("hymn.mp4"),
@@ -417,6 +422,7 @@ mod tests {
                 destination: Destination::AudioOnly,
                 gain_db: 0.0,
                 return_input: None,
+                scene: None,
             },
         ];
         c.save(&path).unwrap();

@@ -45,7 +45,7 @@ impl StreamItApp {
         match screen {
             ServiceScreen::BeforeService => self.before_service(ui, snap, c, tall),
             ServiceScreen::Countdown => self.countdown_screen(ui, snap, c, saved, tall),
-            ServiceScreen::Live | ServiceScreen::VideoPlaying => self.live_screen(ui, snap),
+            ServiceScreen::Live | ServiceScreen::VideoPlaying => self.live_screen(ui, snap, c),
             ServiceScreen::Ending => self.ending_screen(ui, snap),
         }
     }

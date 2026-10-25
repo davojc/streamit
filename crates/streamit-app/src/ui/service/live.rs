@@ -8,7 +8,7 @@ impl StreamItApp {
     /// Live, and any video playing (a rehearsal before live too): the videos and the
     /// activity, with the live chat down the side. End service is the fourth step in the
     /// steps bar.
-    pub(super) fn live_screen(&mut self, ui: &mut Ui, snap: &Snapshot) {
+    pub(super) fn live_screen(&mut self, ui: &mut Ui, snap: &Snapshot, c: &Config) {
         let playing = snap.playing.map(|i| {
             let left = snap
                 .video
@@ -20,11 +20,62 @@ impl StreamItApp {
             ui,
             400.0,
             |app, ui| {
+                if !snap.scenes.is_empty() {
+                    app.scenes_row(ui, snap, c);
+                }
                 app.videos_panel(ui, snap, playing);
                 activity(ui, snap);
             },
             |app, ui| app.chat_panel(ui, snap),
         );
+    }
+
+    /// The scenes, one press each; the one on now is lit.
+    fn scenes_row(&mut self, ui: &mut Ui, snap: &Snapshot, c: &Config) {
+        theme::panel().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                theme::lbl(ui, "Scenes");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let note = "Sets the hall screens and fires the lighting cue";
+                    ui.label(RichText::new(note).size(14.0).color(theme::MUTED));
+                });
+            });
+            ui.add_space(4.0);
+            let per_row = 6usize;
+            let gap = 10.0;
+            let w = ((ui.available_width() - gap * (per_row as f32 - 1.0)) / per_row as f32).max(110.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(gap, gap);
+                for s in &snap.scenes {
+                    let on = snap.active_scene == Some(s.id);
+                    let (screens, lights) = super::super::scenes::scene_summary(snap, c, s);
+                    let mut job = egui::text::LayoutJob::default();
+                    let name_color = if on { theme::AMBER_TEXT } else { theme::TEXT };
+                    job.append(&s.name, 0.0, egui::TextFormat::simple(theme::heading_font(19.0), name_color));
+                    for line in [screens, lights] {
+                        job.append("\n", 0.0, egui::TextFormat::simple(egui::FontId::proportional(6.0), theme::MUTED));
+                        job.append(
+                            &line,
+                            0.0,
+                            egui::TextFormat::simple(egui::FontId::proportional(12.0), theme::MUTED),
+                        );
+                    }
+                    job.wrap.max_width = w - 20.0;
+                    job.wrap.max_rows = 4;
+                    let (fill, stroke) =
+                        if on { (theme::AMBER_DARK, theme::AMBER) } else { (theme::INSET, theme::BUTTON_BORDER) };
+                    let b = egui::Button::new(job)
+                        .fill(fill)
+                        .stroke(egui::Stroke::new(1.0, stroke))
+                        .corner_radius(8)
+                        .min_size(vec2(w, 78.0));
+                    if ui.add_sized(vec2(w, 78.0), b).clicked() {
+                        self.send(Command::GoScene(s.id));
+                    }
+                }
+            });
+        });
     }
 
     /// The broadcast's live chat, newest at the bottom, and a reply box that posts as the
