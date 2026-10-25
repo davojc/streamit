@@ -64,6 +64,10 @@ pub enum Command {
     EndService,
     EndBroadcast,
     PlayCue(usize),
+    /// Test play a video: in the hall and on Stream ATEM input 8, not on the stream.
+    /// Refused while a sequence runs and from the countdown until the service ends.
+    TestVideo(Cue),
+    /// Stops the playing video, or the test play.
     StopVideo,
     UnmuteMics,
     Recover,
@@ -172,6 +176,8 @@ pub struct Snapshot {
     pub job: Option<&'static str>,
     /// The roll-in playing now, once it has started; updated every 100 ms.
     pub video: Option<VideoProgress>,
+    /// The test play running now.
+    pub test: Option<TestPlay>,
     /// The countdown video's length while the countdown runs (`stage` has what remains).
     pub countdown_total: Option<Duration>,
     /// When the service went live; cleared when it has ended.
@@ -212,6 +218,14 @@ pub struct VideoProgress {
     pub duration: Duration,
 }
 
+/// A test play: which video, and how far it is (both zero until it starts playing).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestPlay {
+    pub cue: Cue,
+    pub position: Duration,
+    pub duration: Duration,
+}
+
 /// One line of the activity list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Activity {
@@ -235,6 +249,7 @@ impl Default for Snapshot {
             flash_key: None,
             job: None,
             video: None,
+            test: None,
             countdown_total: None,
             on_air_since: None,
             activity: Vec::new(),
@@ -286,6 +301,9 @@ enum Job {
         stop: CancellationToken,
         unmute: Arc<Notify>,
     },
+    Test {
+        stop: CancellationToken,
+    },
     /// Start service now by hand: T-0, going public alongside it unless already public.
     GoLive(GoLiveStart),
     Recover,
@@ -298,6 +316,7 @@ impl Job {
             Job::Countdown { .. } => "the countdown",
             Job::End { .. } => "End Service",
             Job::Video { .. } => "a video",
+            Job::Test { .. } => "a test play",
             Job::GoLive(_) => "Go Live",
             Job::Recover => "Recover",
         }
@@ -332,6 +351,10 @@ enum Done {
     Ended(EndOutcome),
     Video {
         index: usize,
+        outcome: RollinOutcome,
+    },
+    Tested {
+        name: String,
         outcome: RollinOutcome,
     },
     /// `public` is the go-public's result (`None` if none ran).
@@ -549,7 +572,7 @@ impl Engine {
     /// The player is meant to be on the DeckLink: a video or the countdown is running, so
     /// an assessment must not read the DeckLink on air as a crash.
     fn player_active(&self) -> bool {
-        matches!(self.running, Some(Running { job: Job::Video { .. } | Job::Countdown { .. }, .. }))
+        matches!(self.running, Some(Running { job: Job::Video { .. } | Job::Countdown { .. } | Job::Test { .. }, .. }))
     }
 
     fn ignore(&self, cmd: &Command, why: &str) {
@@ -633,8 +656,19 @@ impl Engine {
                 }
                 self.start_video(i);
             }
+            Command::TestVideo(cue) => {
+                if let Some(why) = self.busy() {
+                    set_warning(&self.snap, format!("Test play waits: {why}"));
+                    return self.ignore(&cmd, &why);
+                }
+                if matches!(self.stage(), Stage::Countdown { .. } | Stage::Live | Stage::Ending { .. }) {
+                    set_warning(&self.snap, "Test play is off from the countdown until the service ends".into());
+                    return self.ignore(&cmd, "the service is under way");
+                }
+                self.start_test(cue.clone());
+            }
             Command::StopVideo => match &self.running {
-                Some(Running { job: Job::Video { stop, .. }, .. }) => stop.cancel(),
+                Some(Running { job: Job::Video { stop, .. } | Job::Test { stop }, .. }) => stop.cancel(),
                 _ => self.ignore(&cmd, "no video is playing"),
             },
             // `mics_ducked` clears only when the roll-in reports a successful fade up.
@@ -1157,10 +1191,53 @@ impl Engine {
         }
     }
 
-    /// A countdown or a video is on the hall screens, so a scene must not cut them away.
+    fn start_test(&mut self, cue: Cue) {
+        self.set(|s| {
+            s.test = Some(TestPlay { cue: cue.clone(), position: Duration::ZERO, duration: Duration::ZERO });
+            log(s, format!("Test play · {} · started", cue.name));
+        });
+        let stop = CancellationToken::new();
+        let (d, c, snap, st) = (self.d.clone(), self.config(), self.snap.clone(), stop.clone());
+        let handle = tokio::spawn(
+            async move {
+                let report = |position, duration| {
+                    snap.send_modify(|s| {
+                        if let Some(t) = &mut s.test {
+                            t.position = position;
+                            t.duration = duration;
+                        }
+                    })
+                };
+                let outcome = rollin::test_play(&d, &c, &cue, st, report).await;
+                Done::Tested { name: cue.name, outcome }
+            }
+            .in_current_span(),
+        );
+        self.begin(Job::Test { stop }, handle);
+    }
+
+    fn finish_test(&mut self, name: &str, outcome: RollinOutcome) {
+        self.set(|s| {
+            s.test = None;
+            match outcome {
+                RollinOutcome::Finished => log(s, format!("Test play · {name} · ended")),
+                RollinOutcome::Stopped => log(s, format!("Test play · {name} · stopped")),
+                RollinOutcome::Refused(why) => warn_in(s, format!("Test play of {name} refused: {why}")),
+                RollinOutcome::Failed { recover_needed, reason } => {
+                    warn_in(s, format!("Test play of {name}: {reason}"));
+                    if recover_needed {
+                        add(&mut s.offers, Offer::Recover);
+                    }
+                }
+            }
+        });
+    }
+
+    /// A countdown, a video or a test play is on the hall screens, so a scene must not
+    /// cut them away.
     fn hall_busy(&self) -> bool {
         match &self.running {
-            Some(Running { job: Job::Countdown { .. }, .. }) => true,
+            Some(Running { job: Job::Countdown { .. } | Job::Test { .. }, .. }) => true,
             Some(Running { job: Job::Video { index, .. }, .. }) => {
                 self.cues.get(*index).is_some_and(|c| c.destination.screens_picture())
             }
@@ -1299,6 +1376,7 @@ impl Engine {
             Ok(Done::Countdown { result, public, before }) => self.finish_countdown(result, public, before),
             Ok(Done::Ended(out)) => self.finish_end(out),
             Ok(Done::Video { index, outcome }) => self.finish_video(index, outcome),
+            Ok(Done::Tested { name, outcome }) => self.finish_test(&name, outcome),
             Ok(Done::WentLive { result, public, start }) => self.finish_golive(result, public, start),
             Ok(Done::Recovered { ok, assessment }) => {
                 if ok {
@@ -1315,6 +1393,10 @@ impl Engine {
                 match job {
                     Job::Video { index, .. } => {
                         self.finish_video(index, RollinOutcome::Failed { recover_needed: true, reason })
+                    }
+                    Job::Test { .. } => {
+                        let name = self.snap.borrow().test.as_ref().map(|t| t.cue.name.clone()).unwrap_or_default();
+                        self.finish_test(&name, RollinOutcome::Failed { recover_needed: true, reason })
                     }
                     // Handled like a countdown error: back to Prepared, Go Live / Go Public offered.
                     Job::Countdown { .. } => self.finish_countdown(Err(DeviceError::Other(reason)), false, Stage::Idle),
@@ -1844,7 +1926,7 @@ fn remove(offers: &mut Vec<Offer>, o: Offer) {
 mod tests {
     use super::*;
     use crate::config::AudioSourceId;
-    use crate::devices::{Phase, PlayerEvent};
+    use crate::devices::{Phase, PlayerEvent, Router, Switcher};
     use crate::fakes::{Call, CallLog, FakeHandles, fake_devices};
     use crate::golive::Readiness;
     use crate::rollin::Destination;
@@ -2102,6 +2184,39 @@ mod tests {
         let s = until(&mut e, "Prepared(Warning)", |s| matches!(s.stage, Stage::Prepared(Readiness::Warning(_)))).await;
         let m = &marks(&s, StepGroup::Prepare)[3];
         assert!(matches!(m, StepMark::Failed(_)), "{m:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_play_runs_reports_and_stops() {
+        let (d, log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::TestVideo(cue("Hymn", Destination::OnlineOnly))).await;
+        let s = until(&mut e, "test playing", |s| s.test.as_ref().is_some_and(|t| t.duration > Duration::ZERO)).await;
+        assert_eq!(s.job, Some("a test play"));
+        assert_eq!(s.playing, None, "a test play is not a video in the service");
+        // Another video waits for it.
+        send(&e, Command::PlayCue(0)).await;
+        send(&e, Command::StopVideo).await;
+        let s = until(&mut e, "test stopped", |s| s.test.is_none() && s.job.is_none()).await;
+        assert!(s.activity.iter().any(|a| a.text == "Test play · Hymn · stopped"), "{:?}", s.activity);
+        assert!(!log.calls().iter().any(|c| matches!(c, Call::StreamSetPreview(_) | Call::StreamAuto)));
+        assert_eq!(h.screens.program().await.unwrap(), 1);
+        assert_eq!(h.hub.route_of(OUT).await.unwrap(), CAM8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_play_refused_once_the_service_is_under_way() {
+        let (d, log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        h.player.emit(PlayerEvent::Ended);
+        until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        let loads = log.calls().iter().filter(|c| matches!(c, Call::PlayerLoad(..))).count();
+        send(&e, Command::TestVideo(cue("Hymn", Destination::HallOnly))).await;
+        let s = until(&mut e, "warned", |s| s.last_warning.as_deref().is_some_and(|w| w.contains("Test play"))).await;
+        assert!(s.test.is_none());
+        assert_eq!(log.calls().iter().filter(|c| matches!(c, Call::PlayerLoad(..))).count(), loads);
     }
 
     #[tokio::test(start_paused = true)]

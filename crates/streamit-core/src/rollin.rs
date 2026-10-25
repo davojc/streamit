@@ -506,6 +506,119 @@ pub async fn play_reporting(
     }
 }
 
+/// Test play: plays `cue` on the hall screens and routes it to Stream ATEM input 8
+/// without putting input 8 on program, so it can be checked on the multiview and input
+/// 8's audio meter. The stream's picture, its audio and the mics are not touched.
+/// Refused while input 8 is on Stream program. Afterwards the hall goes back to what it
+/// showed and input 8 to its route before, as a video in the service does.
+/// `report` gets the position and the length as it plays, every `COUNTER_TICK`.
+pub async fn test_play(
+    d: &Devices,
+    c: &Config,
+    cue: &Cue,
+    stop: CancellationToken,
+    report: impl Fn(Duration, Duration),
+) -> RollinOutcome {
+    let sa = &c.stream_atem;
+    let hub = &c.videohub;
+    if hub.input8_output == 0 || hub.decklink_input == 0 {
+        return RollinOutcome::Refused("VideoHub not configured".into());
+    }
+    let mut events = d.player.events();
+    let duration = match d.player.load(&cue.path, cue.gain_db).await {
+        Ok(duration) => duration,
+        Err(e) => {
+            return RollinOutcome::Failed {
+                recover_needed: false,
+                reason: format!("Could not load {}: {e}", cue.name),
+            };
+        }
+    };
+    match d.stream.program().await {
+        Ok(p) if p == sa.decklink_input => return refuse(d, "Input 8 is on the stream").await,
+        Ok(_) => {}
+        Err(e) => return refuse(d, &format!("Could not read the Stream ATEM program: {e}")).await,
+    }
+    let prev = match d.hub.route_of(hub.input8_output).await {
+        Ok(p) => p,
+        Err(e) => return refuse(d, &format!("Could not read the VideoHub route for input 8: {e}")).await,
+    };
+    let mut problems = Vec::new();
+    if let Err(e) = d.hub.route(hub.input8_output, hub.decklink_input).await {
+        note(&mut problems, format!("Could not route the DeckLink to input 8: {e}"));
+    }
+    sleep(hub.settle).await;
+
+    let end = if stop.is_cancelled() {
+        End::NotPlayed
+    } else {
+        let screens = cut(&*d.screens, c.screens_atem.decklink_input).await;
+        let screens_cut = screens.is_ok();
+        if let Err(e) = screens {
+            note(&mut problems, format!("Could not switch the hall screens to the video: {e}"));
+        }
+        let end = if let Err(e) = d.player.play().await {
+            note(&mut problems, format!("Could not play {}: {e}", cue.name));
+            End::NotPlayed
+        } else {
+            report(Duration::ZERO, duration);
+            let mut tick = interval(COUNTER_TICK);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => break End::Stopped,
+                    ev = events.recv() => match ev {
+                        Ok(PlayerEvent::Ended) => break End::Ended,
+                        Ok(PlayerEvent::Error(e)) => break End::VideoFailed(e),
+                        Err(RecvError::Lagged(_)) => {}
+                        Err(RecvError::Closed) => break End::VideoFailed("the player went away".into()),
+                    },
+                    _ = tick.tick() => {
+                        report(d.player.position().unwrap_or_default().min(duration), duration);
+                    }
+                }
+            }
+        };
+        // As for a video: let the cut land, then one Auto goes back to what was on before.
+        if let Err(e) = d.screens.wait_transition_done(TRANSITION_TIMEOUT).await {
+            note(&mut problems, format!("The hall screens transition to the video did not finish: {e}"));
+        }
+        let on_video = match d.screens.program().await {
+            Ok(p) => p == c.screens_atem.decklink_input,
+            Err(e) => {
+                note(&mut problems, format!("Could not read the hall screens program: {e}"));
+                screens_cut
+            }
+        };
+        if on_video && let Err(e) = d.screens.auto().await {
+            note(&mut problems, format!("Could not switch the hall screens off the video: {e}"));
+        }
+        end
+    };
+    if !matches!(end, End::Ended)
+        && let Err(e) = d.player.stop().await
+    {
+        note(&mut problems, format!("Could not stop the video: {e}"));
+    }
+    restore_route(d, c, prev, &mut problems).await;
+
+    let reason = problems.join("; ");
+    match end {
+        End::VideoFailed(e) => RollinOutcome::Failed {
+            recover_needed: !problems.is_empty(),
+            reason: if problems.is_empty() {
+                format!("The video failed: {e}")
+            } else {
+                format!("The video failed: {e}; {reason}")
+            },
+        },
+        _ if !problems.is_empty() => RollinOutcome::Failed { recover_needed: true, reason },
+        End::Ended => RollinOutcome::Finished,
+        End::Stopped | End::NotPlayed => RollinOutcome::Stopped,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,6 +766,74 @@ mod tests {
         assert_eq!(calls.last(), Some(&Call::HubRoute { output: OUT, input: CAM8 }));
         assert!(!calls.contains(&Call::PlayerStop));
         assert_eq!(h.stream.program().await.unwrap(), 1);
+        assert_eq!(h.screens.program().await.unwrap(), 1);
+        assert_eq!(h.hub.route_of(OUT).await.unwrap(), CAM8);
+    }
+
+    async fn test_to_end(d: &Devices, c: &Config, log: &CallLog, h: &FakeHandles) -> RollinOutcome {
+        let (d2, c2) = (d.clone(), c.clone());
+        let task = tokio::spawn(async move {
+            test_play(&d2, &c2, &cue(Destination::OnlineOnly), CancellationToken::new(), |_, _| {}).await
+        });
+        until(log, Call::PlayerPlay).await;
+        h.player.emit(PlayerEvent::Ended);
+        task.await.unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_play_shows_in_the_hall_and_on_input_8_but_not_on_the_stream() {
+        let (d, log, h) = rig();
+        let r = test_to_end(&d, &cfg(), &log, &h).await;
+        assert_eq!(r, RollinOutcome::Finished);
+        let calls = log.calls();
+        assert!(!calls.iter().any(is_stream), "the stream picture and audio are left alone: {calls:?}");
+        assert_in_order(
+            &calls,
+            &[
+                Call::PlayerLoad(PathBuf::from("hymn.mp4"), -2.0),
+                Call::HubRoute { output: OUT, input: DK },
+                Call::ScreensSetPreview(8),
+                Call::ScreensAuto,
+                Call::PlayerPlay,
+                Call::ScreensAuto,
+                Call::HubRoute { output: OUT, input: CAM8 },
+            ],
+        );
+        assert_eq!(h.screens.program().await.unwrap(), 1);
+        assert_eq!(h.hub.route_of(OUT).await.unwrap(), CAM8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_play_refused_while_input_8_is_on_the_stream() {
+        let (d, log, h) = rig();
+        h.stream.set_program_state(8);
+        let r = test_play(&d, &cfg(), &cue(Destination::HallOnly), CancellationToken::new(), |_, _| {}).await;
+        assert_eq!(r, RollinOutcome::Refused("Input 8 is on the stream".into()));
+        let calls = log.calls();
+        assert!(!calls.iter().any(|c| is_screens(c) || matches!(c, Call::HubRoute { .. })), "{calls:?}");
+        assert!(calls.contains(&Call::PlayerStop));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_play_refused_without_the_router_numbers() {
+        let (d, log, _h) = rig();
+        let r =
+            test_play(&d, &Config::default(), &cue(Destination::HallOnly), CancellationToken::new(), |_, _| {}).await;
+        assert_eq!(r, RollinOutcome::Refused("VideoHub not configured".into()));
+        assert!(log.calls().is_empty(), "{:?}", log.calls());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_play_stopped_puts_the_hall_and_input_8_back() {
+        let (d, log, h) = rig();
+        let stop = CancellationToken::new();
+        let (d2, c2, s2) = (d.clone(), cfg(), stop.clone());
+        let task = tokio::spawn(async move { test_play(&d2, &c2, &cue(Destination::HallOnly), s2, |_, _| {}).await });
+        until(&log, Call::PlayerPlay).await;
+        stop.cancel();
+        assert_eq!(task.await.unwrap(), RollinOutcome::Stopped);
+        let tail = after_play(&log.calls());
+        assert_in_order(&tail, &[Call::ScreensAuto, Call::PlayerStop, Call::HubRoute { output: OUT, input: CAM8 }]);
         assert_eq!(h.screens.program().await.unwrap(), 1);
         assert_eq!(h.hub.route_of(OUT).await.unwrap(), CAM8);
     }

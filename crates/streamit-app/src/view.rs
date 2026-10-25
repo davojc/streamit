@@ -868,10 +868,63 @@ fn now_detail(id: StepId, s: &Snapshot) -> Option<String> {
     }
 }
 
+/// Why a test play cannot start now, or `None` when it can. `c` is the config the
+/// engine runs with (the simulation's own, with its router numbers filled in).
+pub fn test_block(s: &Snapshot, c: &Config) -> Option<String> {
+    if matches!(s.stage, Stage::Countdown { .. } | Stage::Live | Stage::Ending { .. }) {
+        return Some("Test play is off from the countdown until the service ends".into());
+    }
+    if let Some(job) = s.job {
+        return Some(format!("Waits until {job} ends"));
+    }
+    if c.videohub.input8_output == 0 || c.videohub.decklink_input == 0 {
+        return Some(
+            "Set “Router output to input 8” and “DeckLink on router input” in Settings › Inputs & routing".into(),
+        );
+    }
+    if test_on_stream(s, c) {
+        return Some(format!("Stream ATEM input {} is on the stream", c.stream_atem.decklink_input));
+    }
+    None
+}
+
+/// The Stream ATEM has its DeckLink input on program, so a test would be seen online.
+pub fn test_on_stream(s: &Snapshot, c: &Config) -> bool {
+    s.routing.target(Target::StreamAtem).program == Some(c.stream_atem.decklink_input)
+}
+
+/// The test play's time left ("1:42"), once it is playing.
+pub fn test_left(s: &Snapshot) -> Option<String> {
+    s.test.as_ref().filter(|t| t.duration > Duration::ZERO).map(|t| fmt_mmss(t.duration.saturating_sub(t.position)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use streamit_core::devices::{BroadcastSummary, LiveDetails};
+
+    #[test]
+    fn test_play_says_why_it_cannot_start() {
+        let mut c = Config::default();
+        let mut s = Snapshot::default();
+        assert!(test_block(&s, &c).unwrap().contains("Settings"), "router numbers unset");
+        c.videohub.input8_output = 11;
+        c.videohub.decklink_input = 39;
+        assert_eq!(test_block(&s, &c), None);
+        s.routing.target_mut(Target::StreamAtem).program = Some(8);
+        assert_eq!(test_block(&s, &c).as_deref(), Some("Stream ATEM input 8 is on the stream"));
+        s.job = Some("a test play");
+        assert_eq!(test_block(&s, &c).as_deref(), Some("Waits until a test play ends"));
+        s.stage = Stage::Live;
+        assert!(test_block(&s, &c).unwrap().starts_with("Test play is off"));
+        assert_eq!(test_left(&s), None);
+        s.test = Some(streamit_core::engine::TestPlay {
+            cue: cue_at("Hymn", "hymn.mp4", 0.0),
+            position: Duration::from_millis(126_200),
+            duration: Duration::from_secs(228),
+        });
+        assert_eq!(test_left(&s).as_deref(), Some("1:42"));
+    }
 
     fn cue_at(name: &str, path: &str, gain: f32) -> streamit_core::rollin::Cue {
         streamit_core::rollin::Cue {

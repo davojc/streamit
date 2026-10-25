@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use streamit_core::config::Config;
-use streamit_core::engine::Snapshot;
+use streamit_core::engine::{Command, Snapshot};
 use streamit_core::rollin::{Destination, MAX_CUES};
 use tokio::runtime::Handle;
 
@@ -54,6 +54,15 @@ enum Action {
     Up(usize),
     Down(usize),
     Remove(usize),
+    Test(usize),
+    StopTest,
+}
+
+/// A row's Test button: this row is under test (with its time left), or why it cannot
+/// start one (`None`: it can).
+enum TestButton {
+    Testing(Option<String>),
+    Test(Option<String>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -125,14 +134,20 @@ impl StreamItApp {
             self.selected = self.selected.min(self.cues.len() - 1);
         }
         let locked = snap.playing.is_some();
+        let engine = running.unwrap_or(config);
         self.columns(
             ui,
             ASIDE_W,
             |app, ui| {
                 app.countdown_panel(ui, &countdown, note, &lengths);
-                app.list_panel(ui, snap, locked, &lengths);
+                app.list_panel(ui, snap, engine, locked, &lengths);
             },
-            |app, ui| app.selected_panel(ui, config, locked),
+            |app, ui| {
+                if snap.test.is_some() {
+                    app.test_panel(ui, snap, engine);
+                }
+                app.selected_panel(ui, config, locked)
+            },
         );
     }
 
@@ -187,7 +202,14 @@ impl StreamItApp {
         });
     }
 
-    fn list_panel(&mut self, ui: &mut Ui, snap: &Snapshot, locked: bool, lengths: &HashMap<PathBuf, ClipLength>) {
+    fn list_panel(
+        &mut self,
+        ui: &mut Ui,
+        snap: &Snapshot,
+        engine: &Config,
+        locked: bool,
+        lengths: &HashMap<PathBuf, ClipLength>,
+    ) {
         let mut action: Option<Action> = None;
         let mut select: Option<usize> = None;
         theme::panel().inner_margin(20).show(ui, |ui| {
@@ -241,9 +263,15 @@ impl StreamItApp {
             }
             let rows = view::cue_rows(&self.cues, lengths);
             let n = rows.len();
+            let block = view::test_block(snap, engine);
             for (i, row) in rows.iter().enumerate() {
                 let state = snap.cues.get(i).filter(|(c, _)| *c == self.cues[i]).map(|(_, s)| s);
-                self.video_row(ui, row, i == self.selected, i + 1 < n, locked, state, &mut action, &mut select);
+                let test = if snap.test.as_ref().is_some_and(|t| t.cue == self.cues[i]) {
+                    TestButton::Testing(view::test_left(snap))
+                } else {
+                    TestButton::Test(block.clone())
+                };
+                self.video_row(ui, row, i == self.selected, i + 1 < n, locked, state, test, &mut action, &mut select);
             }
         });
         if let Some(i) = select {
@@ -266,6 +294,8 @@ impl StreamItApp {
                 self.selected = view::selection_after_remove(self.selected, i, self.cues.len());
                 changed = true;
             }
+            Some(Action::Test(i)) if i < self.cues.len() => self.send(Command::TestVideo(self.cues[i].clone())),
+            Some(Action::StopTest) => self.send(Command::StopVideo),
             _ => {}
         }
         if changed {
@@ -282,6 +312,7 @@ impl StreamItApp {
         has_next: bool,
         locked: bool,
         state: Option<&streamit_core::rollin::CueState>,
+        test: TestButton,
         action: &mut Option<Action>,
         select: &mut Option<usize>,
     ) {
@@ -318,6 +349,26 @@ impl StreamItApp {
             if icon_button(ui, Icon::Cross, !locked, &format!("Remove {}", row.name)).clicked() {
                 *action = Some(Action::Remove(i));
             }
+            match &test {
+                TestButton::Testing(left) => {
+                    if theme::sized_button(ui, "Stop", Kind::WarnOutline, 40.0, 15.0, true).clicked() {
+                        *action = Some(Action::StopTest);
+                    }
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let text = left.as_ref().map_or("Testing".into(), |l| format!("Testing · {l} left"));
+                    chip(ui, &text, theme::AMBER_SOFT, theme::AMBER_BORDER);
+                }
+                TestButton::Test(block) => {
+                    let r = theme::sized_button(ui, "Test", Kind::Plain, 40.0, 15.0, block.is_none());
+                    let r = match block {
+                        Some(why) => r.on_disabled_hover_text(why.as_str()),
+                        None => r.on_hover_text("Play it in the hall and on Stream ATEM input 8, not on the stream"),
+                    };
+                    if r.clicked() {
+                        *action = Some(Action::Test(i));
+                    }
+                }
+            }
             ui.spacing_mut().item_spacing.x = 6.0;
             chip(ui, &row.level_text, theme::SOFT, theme::BUTTON_BORDER);
             let (c, b) = if selected { (theme::BLUE_SOFT, theme::BLUE) } else { (theme::SOFT, theme::BUTTON_BORDER) };
@@ -340,6 +391,117 @@ impl StreamItApp {
                 });
             });
         });
+    }
+
+    /// The test play running now: how far it is, where to watch it, and Stop.
+    fn test_panel(&mut self, ui: &mut Ui, snap: &Snapshot, c: &Config) {
+        let Some(t) = &snap.test else { return };
+        let mut stop = false;
+        theme::panel().fill(theme::AMBER_STRIPE).stroke(Stroke::new(1.0, theme::AMBER_BORDER)).inner_margin(22).show(
+            ui,
+            |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 10.0;
+                ui.label(
+                    RichText::new("TEST PLAY · HALL, NOT ONLINE")
+                        .font(theme::label_font(13.0))
+                        .color(theme::AMBER_SOFT)
+                        .extra_letter_spacing(1.5),
+                );
+                ui.add(egui::Label::new(RichText::new(&t.cue.name).font(theme::heading_font(30.0))).wrap());
+                if let Some(left) = view::test_left(snap) {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(left).font(theme::mono_bold(40.0)).color(theme::AMBER));
+                        ui.label(
+                            RichText::new(format!("left of {}", view::fmt_mmss(t.duration)))
+                                .size(15.0)
+                                .color(theme::AMBER_SOFT),
+                        );
+                    });
+                    let frac = (t.position.as_secs_f32() / t.duration.as_secs_f32()).clamp(0.0, 1.0);
+                    theme::progress(ui, frac, theme::AMBER);
+                } else {
+                    ui.label(RichText::new("Loading…").size(15.0).color(theme::AMBER_SOFT));
+                }
+                ui.add_space(4.0);
+                theme::lbl(ui, "Where to watch it");
+                let place = |ui: &mut Ui, name: &str, what: String, after: &str| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        ui.label(RichText::new(name).font(theme::heading_font(22.0)));
+                        ui.add(egui::Label::new(RichText::new(what).size(14.0).color(theme::SOFT)).wrap());
+                        ui.add(egui::Label::new(RichText::new(after).size(14.0).color(theme::MUTED)).wrap());
+                    });
+                };
+                place(
+                    ui,
+                    "Hall screens",
+                    format!(
+                        "Screens ATEM cut to input {}, as for a Hall video in the service.",
+                        c.screens_atem.decklink_input
+                    ),
+                    "The hall goes back to what it showed when the test stops.",
+                );
+                place(
+                    ui,
+                    &format!("Stream ATEM input {}", c.stream_atem.decklink_input),
+                    format!(
+                        "Routed to the DeckLink but not put on program. See it in input {0}’s window on the \
+                         multiview and its sound on input {0}’s audio meter.",
+                        c.stream_atem.decklink_input
+                    ),
+                    "Its router route goes back when the test stops.",
+                );
+                ui.separator();
+                let (tone, text) = if view::test_on_stream(snap, c) {
+                    (theme::RED, "Input 8 is on the stream: take it off program".to_string())
+                } else {
+                    (theme::GREEN, "Not on the stream: input 8 is not on program".to_string())
+                };
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                    ui.painter().circle_filled(r.center(), 5.0, tone);
+                    ui.label(RichText::new(text).size(15.0));
+                });
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                    ui.painter().circle_filled(r.center(), 5.0, theme::GREEN);
+                    ui.label(
+                        RichText::new(format!("Playing at the video’s level, {}", view::fmt_db(t.cue.gain_db)))
+                            .size(15.0),
+                    );
+                });
+                ui.add_space(4.0);
+                let w = ui.available_width();
+                ui.scope(|ui| {
+                    ui.spacing_mut().button_padding.x = 0.0;
+                    let r = ui.add_sized(
+                        vec2(w, 52.0),
+                        egui::Button::new(
+                            RichText::new("STOP TEST")
+                                .font(theme::heading_font(20.0))
+                                .color(theme::AMBER_SOFT)
+                                .extra_letter_spacing(1.0),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::new(2.0, theme::AMBER))
+                        .corner_radius(8),
+                    );
+                    stop = r.clicked();
+                });
+                ui.label(
+                    RichText::new(
+                        "Test play is off from the countdown until the service ends. \
+                         It shows in the hall, so test before people arrive.",
+                    )
+                    .size(14.0)
+                    .color(theme::MUTED),
+                );
+            },
+        );
+        if stop {
+            self.send(Command::StopVideo);
+        }
     }
 
     fn selected_panel(&mut self, ui: &mut Ui, config: &Config, locked: bool) {
