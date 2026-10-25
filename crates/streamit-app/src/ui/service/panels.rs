@@ -78,7 +78,14 @@ fn status_panel(ui: &mut Ui, label: &str, note: &str, tone: Tone, add: impl FnOn
 /// Is YouTube receiving the stream, is the broadcast public, how many are watching.
 fn youtube_panel(ui: &mut Ui, snap: &Snapshot) -> Ask {
     let p = view::youtube_panel(snap);
-    status_panel(ui, "YouTube", "checked every 12 s", p.tone, |ui| {
+    // The pretend YouTube costs no quota.
+    let note = if snap.simulation {
+        "checked every 12 s".to_string()
+    } else {
+        let units = streamit_youtube::quota::meter().today().units;
+        format!("checked every 12 s · {} units today", view::thousands(units))
+    };
+    status_panel(ui, "YouTube", &note, p.tone, |ui| {
         ui.horizontal(|ui| {
             theme::dot(ui, theme::tone_color(p.tone));
             let color = if p.tone == Tone::Red { theme::RED_SOFT } else { theme::TEXT };

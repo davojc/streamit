@@ -4412,6 +4412,7 @@ version = "0.1.10"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "keyring",
  "oauth2",
  "reqwest",
@@ -4419,6 +4420,7 @@ dependencies = [
  "serde_json",
  "streamit-core",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "url",
  "webbrowser",

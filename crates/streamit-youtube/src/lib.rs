@@ -1,6 +1,7 @@
 //! YouTube Data API v3 client implementing `Broadcasts`, plus OAuth sign-in.
 mod auth;
 pub mod probe;
+pub mod quota;
 
 pub use auth::{Auth, KeyringStore, MemoryStore, TokenStore};
 
@@ -62,6 +63,8 @@ impl YouTubeClient {
             let mut url = self.base.join(path).map_err(|e| DeviceError::Other(e.to_string()))?;
             url.query_pairs_mut().extend_pairs(query);
             let mut req = self.http.request(method.clone(), url).bearer_auth(token);
+            // Every request sent costs quota, a refused or failed one too.
+            quota::meter().add(quota::cost(&method, path));
             if let Some(b) = body {
                 req = req.json(b);
             }

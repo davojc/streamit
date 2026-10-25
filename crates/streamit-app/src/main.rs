@@ -86,6 +86,8 @@ fn run_app() -> anyhow::Result<()> {
     let path = config_path();
     let Loaded { config, notice: load_error, writable } = load_config(&path);
     info!(path = %path.display(), writable, "config loaded");
+    // The YouTube quota count survives a restart: it is kept next to the config.
+    streamit_youtube::quota::meter().keep_in(&path.with_file_name("youtube-quota.toml"));
     let shared = Arc::new(RwLock::new(config.clone()));
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("streamit-rt").build()?;

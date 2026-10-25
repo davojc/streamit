@@ -945,6 +945,20 @@ impl StreamItApp {
             }
             ui.label(&self.streams_status);
         });
+        ui.add_space(10.0);
+        theme::lbl(ui, "API quota");
+        let used = streamit_youtube::quota::meter().today();
+        let reset = streamit_youtube::quota::until_reset(chrono::Utc::now());
+        ui.horizontal(|ui| {
+            theme::dot(ui, theme::tone_color(view::quota_tone(used.units)));
+            ui.label(RichText::new(view::quota_text(used.units, used.calls, reset)).color(theme::SOFT));
+        });
+        sub(
+            ui,
+            "Counted by StreamIt on this computer, for its own calls to the real YouTube. Each call costs 1 unit; \
+             reading the live chat costs 5 and sending a message 20. Other apps on the same Google project use \
+             the same quota; the Google Cloud console shows the whole project.",
+        );
     }
 
     // ---- Playout & NDI counter

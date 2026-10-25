@@ -557,6 +557,45 @@ pub fn next_cue(s: &Snapshot) -> Option<usize> {
 }
 
 /// `HH:MM:SS`, whole seconds, for the on-air timer.
+/// "1,234" for 1234.
+pub fn thousands(n: u32) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The YouTube quota line for Settings: units used today out of the daily quota, the
+/// number of calls, and when it resets.
+pub fn quota_text(units: u32, calls: u32, until_reset: Duration) -> String {
+    let mins = until_reset.as_secs() / 60;
+    format!(
+        "{} of {} units used today · {} calls · resets at midnight Pacific time, in {} h {:02} min",
+        thousands(units),
+        thousands(streamit_youtube::quota::DAILY_LIMIT),
+        thousands(calls),
+        mins / 60,
+        mins % 60
+    )
+}
+
+/// How full the quota is: amber from 80 %, red once it is used up.
+pub fn quota_tone(units: u32) -> Tone {
+    let limit = streamit_youtube::quota::DAILY_LIMIT;
+    if units >= limit {
+        Tone::Red
+    } else if units * 5 >= limit * 4 {
+        Tone::Amber
+    } else {
+        Tone::Green
+    }
+}
+
 pub fn fmt_hhmmss(d: Duration) -> String {
     let s = d.as_secs();
     format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
@@ -1313,6 +1352,21 @@ mod tests {
     fn ignored_keys_use_the_operator_words() {
         assert_eq!(flash_key_text(FlashKey::GoLive), "Start service now is not available right now");
         assert_eq!(flash_key_text(FlashKey::Recover), "Recover is not available right now");
+    }
+
+    #[test]
+    fn quota_reads_plainly() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1234), "1,234");
+        assert_eq!(thousands(10_000), "10,000");
+        assert_eq!(
+            quota_text(1234, 856, Duration::from_secs(5 * 3600 + 7 * 60 + 30)),
+            "1,234 of 10,000 units used today · 856 calls · resets at midnight Pacific time, in 5 h 07 min"
+        );
+        assert_eq!(quota_tone(7_999), Tone::Green);
+        assert_eq!(quota_tone(8_000), Tone::Amber);
+        assert_eq!(quota_tone(10_000), Tone::Red);
     }
 
     #[test]
