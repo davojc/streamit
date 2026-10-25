@@ -27,6 +27,7 @@ use streamit_core::engine::{Command, Snapshot};
 use streamit_core::golive::Stage;
 use streamit_core::rollin::{Cue, Destination, MAX_CUES};
 use streamit_core::routing::Target;
+use streamit_deck::layout::Page as DeckPage;
 use streamit_sim::SimControl;
 use streamit_youtube::StreamSummary;
 use tokio::runtime::Handle;
@@ -234,6 +235,10 @@ pub struct StreamItApp {
     lengths: videos::Lengths,
     updates: updates::Updates,
     routes_ui: routing::RtUi,
+    /// The page the Stream Deck shows, shared with it: it follows the tab, and a page
+    /// picked on the deck opens here.
+    deck_page: Arc<tokio::sync::watch::Sender<DeckPage>>,
+    deck_seen: tokio::sync::watch::Receiver<DeckPage>,
 }
 
 impl StreamItApp {
@@ -243,6 +248,7 @@ impl StreamItApp {
         rt: Handle,
         sessions: Arc<Sessions>,
         s: Front,
+        deck_page: Arc<tokio::sync::watch::Sender<DeckPage>>,
         config: Arc<RwLock<Config>>,
         file: ConfigFile,
         startup: Config,
@@ -321,12 +327,41 @@ impl StreamItApp {
             lengths: videos::Lengths::default(),
             updates: updates::Updates::default(),
             routes_ui: routing::RtUi::default(),
+            deck_seen: deck_page.subscribe(),
+            deck_page,
         };
         app.load_broadcasts();
         app.load_channel();
         app.scan();
         app.check_for_update();
         app
+    }
+
+    /// The window and the Stream Deck show the same page: a page picked on the deck opens
+    /// here, and a tab picked here moves the deck. Settings and Simulation leave the deck
+    /// on Service.
+    fn sync_deck(&mut self) {
+        if self.deck_seen.has_changed().unwrap_or(false) {
+            match *self.deck_seen.borrow_and_update() {
+                DeckPage::Service => self.tab = Tab::Service,
+                DeckPage::Videos => self.tab = Tab::Videos,
+                DeckPage::Scenes => self.tab = Tab::Scenes,
+                DeckPage::Routing(t) => {
+                    self.tab = Tab::Routing;
+                    self.routes_ui.show_target(t);
+                }
+            }
+        }
+        let want = match self.tab {
+            Tab::Videos => DeckPage::Videos,
+            Tab::Scenes => DeckPage::Scenes,
+            Tab::Routing => DeckPage::Routing(self.routes_ui.target()),
+            Tab::Service | Tab::Settings | Tab::Simulation => DeckPage::Service,
+        };
+        if *self.deck_page.borrow() != want {
+            self.deck_page.send_replace(want);
+            self.deck_seen.borrow_and_update();
+        }
     }
 
     fn send(&self, c: Command) {
@@ -743,6 +778,7 @@ fn window_title(mode: Mode) -> &'static str {
 impl eframe::App for StreamItApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.follow_youtube();
+        self.sync_deck();
         self.poll_jobs();
         let snap = self.snap.borrow().clone();
         self.take_added_files(&snap);

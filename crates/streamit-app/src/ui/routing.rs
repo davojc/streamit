@@ -83,6 +83,19 @@ pub(super) struct RtUi {
     recall: Option<Recall>,
 }
 
+impl RtUi {
+    /// The routing target shown (kept while the VideoHub or Config sub-tab is open).
+    pub(super) fn target(&self) -> Target {
+        self.target
+    }
+
+    /// Show `t`, as when its sub-tab is clicked.
+    pub(super) fn show_target(&mut self, t: Target) {
+        self.target = t;
+        self.extra = None;
+    }
+}
+
 impl Default for RtUi {
     fn default() -> Self {
         Self {

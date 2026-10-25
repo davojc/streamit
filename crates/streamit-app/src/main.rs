@@ -91,12 +91,15 @@ fn run_app() -> anyhow::Result<()> {
     let shared = Arc::new(RwLock::new(config.clone()));
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("streamit-rt").build()?;
+    // The page the window and the Stream Deck both show.
+    let deck_page = Arc::new(tokio::sync::watch::channel(streamit_deck::layout::Page::default()).0);
+    let window_deck_page = deck_page.clone();
     // Always real mode first: the normal read-only startup.
     let (sessions, front) = rt.block_on(async {
         let (sessions, front) =
             Sessions::start(Arc::new(RealFactory), Arc::new(SimFactory), shared.clone(), Paths::beside(&path)).await;
         // The deck holds the front, so it keeps working across a mode switch.
-        DeckSurface::run(EngineHandle { tx: front.tx.clone(), rx: front.rx.clone() });
+        DeckSurface::run(EngineHandle { tx: front.tx.clone(), rx: front.rx.clone() }, deck_page);
         (Arc::new(sessions), front)
     });
 
@@ -119,6 +122,7 @@ fn run_app() -> anyhow::Result<()> {
                 handle,
                 window_sessions,
                 front,
+                window_deck_page,
                 shared,
                 file,
                 config,

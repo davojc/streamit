@@ -79,7 +79,7 @@ impl StreamItApp {
                         if theme::big_button(ui, "Start service now", Kind::DangerOutline, !busy).clicked() {
                             self.send(Command::GoLive);
                         }
-                        deck_hint(ui, "COUNTDOWN", "Stream page, row 2, key 2");
+                        deck_hint(ui, "START COUNTDOWN", "Service page, row 2, key 2");
                     }
                     // S6: Recover before Prepare, which would put the still on air.
                     view::NextStep::Recover => {
@@ -98,7 +98,7 @@ impl StreamItApp {
                         if theme::big_button(ui, "Prepare", Kind::Primary, prepare.enabled).clicked() {
                             self.send(Command::Prepare);
                         }
-                        deck_hint(ui, "PREPARE", "Stream page, row 2, key 1");
+                        deck_hint(ui, "PREPARE", "Service page, row 2, key 1");
                     }
                 }
             });
