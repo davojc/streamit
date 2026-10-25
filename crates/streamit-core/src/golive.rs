@@ -4,7 +4,7 @@
 //! failure to load or play the countdown video (or the video itself failing) ends it
 //! with `Err`; every other device error is a warning and the sequence carries on.
 use crate::audio::{LiveLevels, Target, down_threshold, fade};
-use crate::config::Config;
+use crate::config::{AudioSourceId, Config};
 use crate::devices::{
     BroadcastCheck, BroadcastSummary, DeviceError, Devices, Health, Phase, PlayerEvent, Result, Switcher,
 };
@@ -357,8 +357,23 @@ pub async fn countdown(
     if let Err(e) = r {
         warn(format!("Could not switch the hall to the countdown: {e}"));
     }
+    // Input 8's route before the countdown took it, while the stream shows the countdown.
+    let mut stream_route = None;
+    if c.playout.countdown_to_stream {
+        step(StepId::StreamCountdown, StepMark::Now(None));
+        match stream_to_countdown(d, c).await {
+            Ok(prev) => {
+                stream_route = Some(prev);
+                step(StepId::StreamCountdown, StepMark::done());
+            }
+            Err(e) => {
+                step(StepId::StreamCountdown, StepMark::Failed(e.clone()));
+                warn(format!("The countdown plays to the hall only: {e}"));
+            }
+        }
+    }
     if let Err(e) = d.player.play().await {
-        return video_failed(d, c, &progress, &warn, &report, None, duration, e.to_string()).await;
+        return video_failed(d, c, &progress, &warn, &report, None, stream_route, duration, e.to_string()).await;
     }
     step(StepId::CountdownVideo, StepMark::Now(None));
     report(CountdownReport::Started(duration));
@@ -379,6 +394,9 @@ pub async fn countdown(
                 if let Some(t) = pub_task.take() {
                     t.abort();
                 }
+                if let Some(prev) = stream_route {
+                    stream_off_countdown(d, c, prev, &warn).await;
+                }
                 if let Err(e) = d.player.stop().await {
                     warn(format!("Could not stop the countdown video: {e}"));
                 }
@@ -396,12 +414,14 @@ pub async fn countdown(
                     break;
                 }
                 Ok(PlayerEvent::Error(e)) => {
-                    return video_failed(d, c, &progress, &warn, &report, pub_task.take(), remaining, e).await;
+                    let t = pub_task.take();
+                    return video_failed(d, c, &progress, &warn, &report, t, stream_route, remaining, e).await;
                 }
                 Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => {
                     let e = "the player went away".to_string();
-                    return video_failed(d, c, &progress, &warn, &report, pub_task.take(), remaining, e).await;
+                    let t = pub_task.take();
+                    return video_failed(d, c, &progress, &warn, &report, t, stream_route, remaining, e).await;
                 }
             },
             res = async {
@@ -479,6 +499,17 @@ pub async fn countdown(
         }
         None => settle_go_public(in_flight, &warn, &report).await.unwrap_or(public),
     };
+    // T-0 cut the stream off input 8: its sound off, its route back.
+    if let Some(prev) = stream_route {
+        let mut problems = Vec::new();
+        if let Err(e) = d.stream.set_audio_on(countdown_audio(c), false).await {
+            problems.push(format!("Could not turn off input 8 audio: {e}"));
+        }
+        crate::rollin::restore_route(d, c, prev, &mut problems).await;
+        for p in problems {
+            warn(p);
+        }
+    }
     let mics_failed = out.t0.as_ref().err().is_some_and(|e| e.mics_failed);
     if let Err(e) = out.t0
         && !e.on_air
@@ -486,6 +517,82 @@ pub async fn countdown(
         return Err(DeviceError::Other(e.to_string()));
     }
     Ok(CountdownOutcome::Live { public, mics_failed })
+}
+
+/// Input 8's sound, which carries the countdown video's when it goes to the stream.
+fn countdown_audio(c: &Config) -> AudioSourceId {
+    AudioSourceId { input: c.stream_atem.decklink_input, source: crate::rollin::STEREO_SOURCE }
+}
+
+/// The countdown online too: route input 8 to the DeckLink while it is off program, as
+/// for a video, then its sound on and the stream cut to it. The opening still stays on
+/// preview, so one Auto returns to it. `Ok` holds input 8's route before; on `Err`
+/// nothing is left changed (as far as it could be put back).
+async fn stream_to_countdown(d: &Devices, c: &Config) -> std::result::Result<u16, String> {
+    let (sa, hub) = (&c.stream_atem, &c.videohub);
+    if hub.input8_output == 0 || hub.decklink_input == 0 {
+        return Err("VideoHub not configured".into());
+    }
+    match d.stream.program().await {
+        Ok(p) if p == sa.decklink_input => return Err("Input 8 is on air".into()),
+        Ok(_) => {}
+        Err(e) => return Err(format!("Could not read the Stream ATEM program: {e}")),
+    }
+    let prev = d
+        .hub
+        .route_of(hub.input8_output)
+        .await
+        .map_err(|e| format!("Could not read the VideoHub route for input 8: {e}"))?;
+    let mut problems = Vec::new();
+    if let Err(e) = d.hub.route(hub.input8_output, hub.decklink_input).await {
+        problems.push(format!("Could not route the DeckLink to input 8: {e}"));
+        crate::rollin::restore_route(d, c, prev, &mut problems).await;
+        return Err(problems.join("; "));
+    }
+    sleep(hub.settle).await;
+    let in8 = countdown_audio(c);
+    let audio = async {
+        d.stream.set_audio_on(in8, true).await?;
+        d.stream.set_audio_level(in8, 0.0).await
+    };
+    if let Err(e) = audio.await {
+        problems.push(format!("Could not turn on input 8 audio: {e}"));
+    } else if let Err(e) = cut(&*d.stream, sa.decklink_input).await {
+        problems.push(format!("Could not switch the stream to the countdown: {e}"));
+    } else {
+        return Ok(prev);
+    }
+    if let Err(e) = d.stream.set_audio_on(in8, false).await {
+        problems.push(format!("Could not turn off input 8 audio: {e}"));
+    }
+    crate::rollin::restore_route(d, c, prev, &mut problems).await;
+    Err(problems.join("; "))
+}
+
+/// Stop or failure while the stream shows the countdown: its sound off first, the
+/// stream back to the opening still (one Auto), then input 8's route back to `prev`.
+async fn stream_off_countdown(d: &Devices, c: &Config, prev: u16, warn: &impl Fn(String)) {
+    let mut problems = Vec::new();
+    if let Err(e) = d.stream.set_audio_on(countdown_audio(c), false).await {
+        problems.push(format!("Could not turn off input 8 audio: {e}"));
+    }
+    if let Err(e) = d.stream.wait_transition_done(crate::rollin::TRANSITION_TIMEOUT).await {
+        problems.push(format!("The stream transition to the countdown did not finish: {e}"));
+    }
+    if d.stream.program().await.is_ok_and(|p| p == c.stream_atem.decklink_input) {
+        match d.stream.auto().await {
+            Ok(()) => {
+                if let Err(e) = d.stream.wait_transition_done(crate::rollin::TRANSITION_TIMEOUT).await {
+                    problems.push(format!("The stream transition off the countdown did not finish: {e}"));
+                }
+            }
+            Err(e) => problems.push(format!("Could not switch the stream off the countdown: {e}")),
+        }
+    }
+    crate::rollin::restore_route(d, c, prev, &mut problems).await;
+    for p in problems {
+        warn(p);
+    }
 }
 
 /// Waits at most `GO_PUBLIC_WAIT` for an in-flight `go_public`; on timeout it is
@@ -531,6 +638,7 @@ async fn video_failed(
     warn: &impl Fn(String),
     report: &impl Fn(CountdownReport),
     pub_task: Option<GoPublicTask>,
+    stream_route: Option<u16>,
     remaining: Duration,
     err: String,
 ) -> Result<CountdownOutcome> {
@@ -538,6 +646,9 @@ async fn video_failed(
     warn(format!(
         "The countdown video failed ({err}). The hall screens are back on their normal input; press Go Live manually."
     ));
+    if let Some(prev) = stream_route {
+        stream_off_countdown(d, c, prev, warn).await;
+    }
     if let Err(e) = cut(&*d.screens, c.screens_atem.t0_input).await {
         warn(format!("Could not return the hall screens: {e}"));
     }
@@ -728,8 +839,8 @@ mod tests {
     use super::*;
     use crate::audio::FLOOR_DB;
     use crate::config::AudioSourceId;
-    use crate::devices::{Health, Phase, PlayerEvent};
-    use crate::fakes::{Call, CallLog, fake_devices};
+    use crate::devices::{Health, Phase, PlayerEvent, Router};
+    use crate::fakes::{Call, CallLog, FakeHandles, fake_devices};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use tokio::task::JoinHandle;
@@ -949,6 +1060,99 @@ mod tests {
         assert_eq!(r, Readiness::Ready);
         assert!(start.elapsed() < Duration::from_secs(10));
         assert_eq!(yt_calls(&log.calls()), vec![Call::YtTransition(Phase::Testing)]);
+    }
+
+    const OUT: u16 = 20;
+    const DK: u16 = 30;
+    const CAM8: u16 = 5;
+    const STILL: u16 = 3010;
+    const IN8: AudioSourceId = AudioSourceId { input: 8, source: -65280 };
+
+    /// The countdown set to go online too, Cam 8 routed to input 8, the opening still on air.
+    fn online_countdown() -> (Devices, CallLog, FakeHandles, Config) {
+        let (d, log, h) = fake_devices();
+        let mut c = Config::default();
+        c.playout.countdown_to_stream = true;
+        c.videohub.input8_output = OUT;
+        c.videohub.decklink_input = DK;
+        h.hub.set_route(OUT, CAM8);
+        h.stream.set_program_state(STILL);
+        h.player.set_duration(Duration::from_secs(60));
+        h.player.set_position(Some(Duration::ZERO));
+        (d, log, h, c)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn countdown_to_stream_puts_it_online_then_puts_input_8_back_at_t0() {
+        let (d, log, h, c) = online_countdown();
+        let run = spawn_countdown(&d, &c, Readiness::Ready, LiveLevels::default());
+        sleep(Duration::from_secs(3)).await;
+        assert_in_order(
+            &log.calls(),
+            &[
+                Call::ScreensSetPreview(8),
+                Call::ScreensAuto,
+                Call::HubRoute { output: OUT, input: DK },
+                Call::StreamSetAudioOn(IN8, true),
+                Call::StreamSetAudioLevel(IN8, 0.0),
+                Call::StreamSetPreview(8),
+                Call::StreamAuto,
+                Call::PlayerPlay,
+            ],
+        );
+        assert_eq!(h.stream.program().await.unwrap(), 8);
+        h.player.emit(PlayerEvent::Ended);
+        assert!(matches!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { .. }));
+        let calls = log.calls();
+        let tail = &calls[pos(&calls, &Call::PlayerPlay)..];
+        assert_in_order(
+            tail,
+            &[Call::StreamAuto, Call::StreamSetAudioOn(IN8, false), Call::HubRoute { output: OUT, input: CAM8 }],
+        );
+        assert_ne!(h.stream.program().await.unwrap(), 8, "T-0 cut to a camera");
+        assert_eq!(h.hub.route_of(OUT).await.unwrap(), CAM8);
+        // Only the early end (before the go-public offset) is warned about.
+        let warns = run.warns.lock().unwrap();
+        assert!(warns.iter().all(|w| w.contains("before the broadcast went public")), "{warns:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn countdown_to_stream_stopped_goes_back_to_the_still() {
+        let (d, log, h, c) = online_countdown();
+        let run = spawn_countdown(&d, &c, Readiness::Ready, LiveLevels::default());
+        sleep(Duration::from_secs(3)).await;
+        run.cancel.cancel();
+        assert_eq!(run.task.await.unwrap().unwrap(), CountdownOutcome::Stopped);
+        let calls = log.calls();
+        let tail = &calls[pos(&calls, &Call::PlayerPlay)..];
+        assert_in_order(
+            tail,
+            &[
+                Call::StreamSetAudioOn(IN8, false),
+                Call::StreamAuto,
+                Call::HubRoute { output: OUT, input: CAM8 },
+                Call::PlayerStop,
+            ],
+        );
+        assert_eq!(h.stream.program().await.unwrap(), STILL);
+        assert_eq!(h.hub.route_of(OUT).await.unwrap(), CAM8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn countdown_to_stream_without_the_router_plays_to_the_hall_only() {
+        let (d, log, h, mut c) = online_countdown();
+        c.videohub = Default::default();
+        let run = spawn_countdown(&d, &c, Readiness::Ready, LiveLevels::default());
+        sleep(Duration::from_secs(3)).await;
+        assert_eq!(h.stream.program().await.unwrap(), STILL);
+        assert!(!log.calls().iter().any(|c| matches!(c, Call::HubRoute { .. } | Call::StreamSetAudioOn(..))));
+        h.player.emit(PlayerEvent::Ended);
+        assert!(matches!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { .. }));
+        let warns = run.warns.lock().unwrap();
+        assert!(
+            warns.iter().any(|w| w == "The countdown plays to the hall only: VideoHub not configured"),
+            "{warns:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

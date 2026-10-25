@@ -977,6 +977,18 @@ impl StreamItApp {
                 }
             });
         });
+        ui.checkbox(
+            &mut c.playout.countdown_to_stream,
+            "The countdown video goes online too (Stream ATEM input 8, with its sound)",
+        );
+        ui.label(
+            RichText::new(
+                "Off: online sees the opening still, in silence, until the service starts. On: the countdown is \
+                 routed to input 8 by the VideoHub, as a video is.",
+            )
+            .size(14.0)
+            .color(theme::MUTED),
+        );
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             theme::lbl(ui, "Counter numbers");

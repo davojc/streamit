@@ -65,13 +65,26 @@ impl StreamItApp {
                     theme::progress(ui, v.progress, theme::AMBER);
                     ui.columns(2, |cols| {
                         let privacy = if v.public { "Public" } else { "Private" };
-                        preview(
-                            &mut cols[0],
-                            "Online sees",
-                            "Stream starting soon…",
-                            true,
-                            &format!("{privacy} · stream audio silent · ready on preview"),
-                        );
+                        if c.playout.countdown_to_stream {
+                            preview(
+                                &mut cols[0],
+                                "Online sees",
+                                "▶  Countdown video",
+                                false,
+                                &format!(
+                                    "{privacy} · input {} with its sound · ready on preview",
+                                    c.stream_atem.decklink_input
+                                ),
+                            );
+                        } else {
+                            preview(
+                                &mut cols[0],
+                                "Online sees",
+                                "Stream starting soon…",
+                                true,
+                                &format!("{privacy} · stream audio silent · ready on preview"),
+                            );
+                        }
                         preview(
                             &mut cols[1],
                             "Hall sees",
@@ -109,11 +122,16 @@ impl StreamItApp {
                 theme::panel().show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     theme::lbl(ui, "What happens if you stop");
+                    let back = if c.playout.countdown_to_stream {
+                        "The countdown video stops, the hall goes back to what it showed and the stream to the \
+                         opening still."
+                    } else {
+                        "The countdown video stops and the hall goes back to what it showed."
+                    };
                     ui.label(
-                        RichText::new(
-                            "The countdown video stops and the hall goes back to what it showed. YouTube stays \
-                             as it is. Start service then goes live straight away.",
-                        )
+                        RichText::new(format!(
+                            "{back} YouTube stays as it is. Start service then goes live straight away."
+                        ))
                         .size(15.0)
                         .color(theme::SOFT),
                     );

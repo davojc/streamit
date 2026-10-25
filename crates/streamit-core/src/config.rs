@@ -156,11 +156,19 @@ pub struct PlayoutConfig {
     pub decklink_device: u32,
     pub video_mode: String,
     pub countdown_file: PathBuf,
+    /// The countdown video also goes online: routed to Stream ATEM input 8 and put on
+    /// program with its sound. Off: online sees the opening still until T-0.
+    pub countdown_to_stream: bool,
 }
 
 impl Default for PlayoutConfig {
     fn default() -> Self {
-        Self { decklink_device: 0, video_mode: "1080p2997".into(), countdown_file: PathBuf::from("countdown.mp4") }
+        Self {
+            decklink_device: 0,
+            video_mode: "1080p2997".into(),
+            countdown_file: PathBuf::from("countdown.mp4"),
+            countdown_to_stream: false,
+        }
     }
 }
 

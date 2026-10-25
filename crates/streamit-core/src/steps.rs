@@ -19,6 +19,8 @@ pub enum StepId {
     YouTubeReceiving,
     YouTubeTesting,
     HallCountdown,
+    /// Only when the countdown goes to the stream too.
+    StreamCountdown,
     CountdownVideo,
     YouTubePublic,
     ClosingStill,
@@ -37,7 +39,8 @@ impl StepId {
         StepId::YouTubeReceiving,
         StepId::YouTubeTesting,
     ];
-    pub const COUNTDOWN: [StepId; 3] = [StepId::HallCountdown, StepId::CountdownVideo, StepId::YouTubePublic];
+    pub const COUNTDOWN: [StepId; 4] =
+        [StepId::HallCountdown, StepId::StreamCountdown, StepId::CountdownVideo, StepId::YouTubePublic];
     pub const END: [StepId; 5] =
         [StepId::ClosingStill, StepId::EndAudioDown, StepId::ClosingHold, StepId::YouTubeEnded, StepId::EncoderStopped];
 
@@ -47,7 +50,7 @@ impl StepId {
             LevelsRead | OpeningStill | PrepareAudioDown | EncoderStarted | YouTubeReceiving | YouTubeTesting => {
                 StepGroup::Prepare
             }
-            HallCountdown | CountdownVideo | YouTubePublic => StepGroup::Countdown,
+            HallCountdown | StreamCountdown | CountdownVideo | YouTubePublic => StepGroup::Countdown,
             ClosingStill | EndAudioDown | ClosingHold | YouTubeEnded | EncoderStopped => StepGroup::End,
         }
     }
@@ -62,6 +65,7 @@ impl StepId {
             YouTubeReceiving => "YouTube receiving",
             YouTubeTesting => "YouTube test started",
             HallCountdown => "Hall screens to the countdown",
+            StreamCountdown => "Stream to the countdown",
             CountdownVideo => "Countdown video playing",
             YouTubePublic => "YouTube public",
             ClosingStill => "Closing still on air",
@@ -160,6 +164,6 @@ mod tests {
         assert_eq!(of_group(&s, StepGroup::Countdown)[0].mark, StepMark::Failed("x".into()));
         reset(&mut s, StepGroup::Prepare);
         assert_eq!(of_group(&s, StepGroup::Prepare), fresh(StepGroup::Prepare));
-        assert_eq!(s.len(), 14);
+        assert_eq!(s.len(), 15);
     }
 }

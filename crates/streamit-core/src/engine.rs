@@ -2156,13 +2156,18 @@ mod tests {
         send(&e, Command::Countdown).await;
         let s = until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
         assert!(
-            matches!(marks(&s, StepGroup::Countdown)[1], StepMark::Now(_)),
+            matches!(marks(&s, StepGroup::Countdown)[2], StepMark::Now(_)),
             "{:?}",
             marks(&s, StepGroup::Countdown)
         );
         h.player.emit(PlayerEvent::Ended);
         let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
-        assert!(all_done(&s, StepGroup::Countdown), "{:?}", marks(&s, StepGroup::Countdown));
+        // Hall only: the stream step is never reached (the screens leave it out).
+        let m = marks(&s, StepGroup::Countdown);
+        assert!(
+            m.iter().enumerate().all(|(i, m)| matches!((i, m), (1, StepMark::Todo) | (_, StepMark::Done(_)))),
+            "{m:?}"
+        );
         send(&e, Command::EndService).await;
         let s = until(&mut e, "Ending", |s| matches!(s.stage, Stage::Ending { .. })).await;
         assert!(matches!(marks(&s, StepGroup::End)[2], StepMark::Now(_)), "{:?}", marks(&s, StepGroup::End));

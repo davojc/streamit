@@ -209,7 +209,7 @@ async fn refuse(d: &Devices, why: &str) -> RollinOutcome {
 
 /// Put input 8's VideoHub route back to `prev`, but only once Stream program is
 /// known not to be input 8. A skipped restore is a problem.
-async fn restore_route(d: &Devices, c: &Config, prev: u16, problems: &mut Vec<String>) {
+pub(crate) async fn restore_route(d: &Devices, c: &Config, prev: u16, problems: &mut Vec<String>) {
     let out = c.videohub.input8_output;
     match d.stream.program().await {
         Ok(p) if p != c.stream_atem.decklink_input => {

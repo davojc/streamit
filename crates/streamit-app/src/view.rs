@@ -223,8 +223,12 @@ pub fn next_step_text(s: &Snapshot, c: &Config) -> (&'static str, String) {
         NextStep::Countdown => (
             "Start the countdown",
             format!(
-                "Plays the countdown video on the hall screens; the stream stays on the opening still. \
-                 YouTube goes public at {} and the stream cuts to the camera at 0:00.",
+                "{} YouTube goes public at {} and the stream cuts to the camera at 0:00.",
+                if c.playout.countdown_to_stream {
+                    "Plays the countdown video on the hall screens and online, with its sound."
+                } else {
+                    "Plays the countdown video on the hall screens; the stream stays on the opening still."
+                },
                 fmt_mmss(c.timings.go_public_offset)
             ),
         ),
@@ -816,6 +820,8 @@ pub fn step_heading(g: StepGroup) -> &'static str {
 pub fn step_rows(s: &Snapshot, c: &Config, g: StepGroup) -> Vec<StepRow> {
     steps::of_group(&s.steps, g)
         .into_iter()
+        // The stream step only when the countdown goes online too.
+        .filter(|st| st.id != StepId::StreamCountdown || c.playout.countdown_to_stream)
         .map(|st| {
             let (tone, detail, time) = match st.mark {
                 StepMark::Todo => (Tone::Grey, todo_detail(st.id, c), None),
@@ -854,6 +860,7 @@ fn todo_detail(id: StepId, c: &Config) -> Option<String> {
         StepId::YouTubeReceiving => "Waits up to 60 s".into(),
         StepId::YouTubeTesting => "Still private".into(),
         StepId::HallCountdown => format!("Screens ATEM input {}", c.screens_atem.decklink_input),
+        StepId::StreamCountdown => format!("Stream ATEM input {}, with its sound", c.stream_atem.decklink_input),
         StepId::YouTubePublic => format!("At {} left", fmt_mmss(c.timings.go_public_offset)),
         StepId::ClosingHold => format!("{}, can be skipped", fmt_mmss(c.timings.closing_hold)),
         _ => return None,
@@ -1210,6 +1217,20 @@ mod tests {
         assert!(!text.contains("hall screens and the stream"), "{text}");
         assert!(text.contains("hall screens") && text.contains("opening still"), "{text}");
         assert!(text.contains("0:10") && text.contains("0:00"), "{text}");
+        let mut online = Config::default();
+        online.playout.countdown_to_stream = true;
+        let (_, text) = next_step_text(&prepared, &online);
+        assert!(text.contains("hall screens and online") && !text.contains("opening still"), "{text}");
+    }
+
+    #[test]
+    fn the_stream_step_shows_only_when_the_countdown_goes_online() {
+        let s = Snapshot::default();
+        let mut c = Config::default();
+        let labels = |c: &Config| step_rows(&s, c, StepGroup::Countdown).iter().map(|r| r.label).collect::<Vec<_>>();
+        assert!(!labels(&c).contains(&"Stream to the countdown"));
+        c.playout.countdown_to_stream = true;
+        assert_eq!(labels(&c)[1], "Stream to the countdown");
     }
 
     /// M4: Start service now from Idle needs a second click, with the reason.

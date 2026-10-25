@@ -125,6 +125,11 @@ impl StreamItApp {
     /// one it plays).
     pub(super) fn videos_tab(&mut self, ui: &mut Ui, snap: &Snapshot, config: &Config, running: Option<&Config>) {
         let countdown = running.unwrap_or(config).playout.countdown_file.clone();
+        let online = if running.unwrap_or(config).playout.countdown_to_stream {
+            "plays to the hall and online before the service."
+        } else {
+            "plays to the hall before the service. Online sees the “starting soon” still."
+        };
         let note = view::sim_next_time_note(&countdown, &config.playout.countdown_file);
         let lengths = {
             let paths = self.cues.iter().map(|c| c.path.as_path()).chain([countdown.as_path()]);
@@ -139,7 +144,7 @@ impl StreamItApp {
             ui,
             ASIDE_W,
             |app, ui| {
-                app.countdown_panel(ui, &countdown, note, &lengths);
+                app.countdown_panel(ui, &countdown, online, note, &lengths);
                 app.list_panel(ui, snap, engine, locked, &lengths);
             },
             |app, ui| {
@@ -151,11 +156,13 @@ impl StreamItApp {
         );
     }
 
-    /// `note`: the saved countdown video differs from the one the simulation plays.
+    /// `online`: where it plays. `note`: the saved countdown video differs from the one
+    /// the simulation plays.
     fn countdown_panel(
         &mut self,
         ui: &mut Ui,
         file: &Path,
+        online: &str,
         note: Option<&str>,
         lengths: &HashMap<PathBuf, ClipLength>,
     ) {
@@ -172,12 +179,9 @@ impl StreamItApp {
                         egui::Label::new(RichText::new(view::file_name(file)).font(theme::body_bold(19.0))).truncate(),
                     );
                     ui.label(
-                        RichText::new(format!(
-                            "{length} · plays to the hall before the service. Online sees the “starting soon” still. \
-                             When it ends, the service goes live."
-                        ))
-                        .size(15.0)
-                        .color(theme::SOFT),
+                        RichText::new(format!("{length} · {online} When it ends, the service goes live."))
+                            .size(15.0)
+                            .color(theme::SOFT),
                     );
                     if let Some(n) = note {
                         ui.label(
