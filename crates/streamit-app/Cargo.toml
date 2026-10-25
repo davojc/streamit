@@ -28,6 +28,7 @@ url = "2"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 eframe = "0.37.0"
 mdns-sd = "0.21.6"
+if-addrs = "0.15"
 rfd = "0.17.2"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }

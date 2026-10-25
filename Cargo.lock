@@ -4271,6 +4271,7 @@ dependencies = [
  "chrono",
  "eframe",
  "hex",
+ "if-addrs",
  "mdns-sd",
  "reqwest",
  "rfd",

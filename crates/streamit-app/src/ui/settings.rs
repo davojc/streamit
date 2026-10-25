@@ -61,14 +61,16 @@ pub(super) enum Role {
     StreamAtem,
     ScreensAtem,
     VideoHub,
+    MultiView,
     WebPresenter,
 }
 
 /// Each role and the job name the mockup gives it.
-const ROLES: [(Role, &str); 4] = [
+const ROLES: [(Role, &str); 5] = [
     (Role::StreamAtem, "Stream switcher"),
     (Role::ScreensAtem, "Screens switcher"),
     (Role::VideoHub, "Router"),
+    (Role::MultiView, "MultiView"),
     (Role::WebPresenter, "Stream encoder"),
 ];
 const NOT_USED: &str = "Not used";
@@ -78,6 +80,7 @@ fn role_address(c: &mut Config, r: Role) -> &mut Option<String> {
         Role::StreamAtem => &mut c.stream_atem.address,
         Role::ScreensAtem => &mut c.screens_atem.address,
         Role::VideoHub => &mut c.videohub.address,
+        Role::MultiView => &mut c.multiview_device.address,
         Role::WebPresenter => &mut c.web_presenter.address,
     }
 }
@@ -87,6 +90,7 @@ fn role_kind(r: Role) -> DeviceKind {
         Role::StreamAtem => DeviceKind::StreamAtem,
         Role::ScreensAtem => DeviceKind::ScreensAtem,
         Role::VideoHub => DeviceKind::VideoHub,
+        Role::MultiView => DeviceKind::MultiView,
         Role::WebPresenter => DeviceKind::WebPresenter,
     }
 }
@@ -98,6 +102,7 @@ fn roles_for(kind: Option<BmdKind>) -> Vec<(Role, &'static str)> {
         .filter(|(r, _)| match kind {
             Some(BmdKind::Atem) => matches!(r, Role::StreamAtem | Role::ScreensAtem),
             Some(BmdKind::VideoHub) => *r == Role::VideoHub,
+            Some(BmdKind::MultiView) => *r == Role::MultiView,
             Some(BmdKind::WebPresenter) => *r == Role::WebPresenter,
             None => true,
         })
@@ -112,6 +117,7 @@ pub(super) fn device_settings(c: &Config) -> impl PartialEq + use<> {
             c.screens_atem.address.clone(),
             c.videohub.address.clone(),
             c.web_presenter.address.clone(),
+            c.multiview_device.address.clone(),
         ),
         c.youtube.clone(),
         // The countdown file is read when the countdown starts, so it is not listed.
@@ -411,12 +417,13 @@ impl StreamItApp {
         self.device_table(ui, snap, simulating);
         ui.add_space(12.0);
         theme::lbl(ui, "Addresses");
-        ui.columns(4, |c| {
+        ui.columns(5, |c| {
             let d = &mut self.draft;
             field(&mut c[0], "Stream switcher", |ui| opt_text(ui, &mut d.stream_atem.address, "not set"));
             field(&mut c[1], "Screens switcher", |ui| opt_text(ui, &mut d.screens_atem.address, "not set"));
             field(&mut c[2], "Router", |ui| opt_text(ui, &mut d.videohub.address, "not set"));
-            field(&mut c[3], "Stream encoder", |ui| opt_text(ui, &mut d.web_presenter.address, "not set"));
+            field(&mut c[3], "MultiView", |ui| opt_text(ui, &mut d.multiview_device.address, "not used"));
+            field(&mut c[4], "Stream encoder", |ui| opt_text(ui, &mut d.web_presenter.address, "not set"));
         });
         ui.add_space(14.0);
         self.lighting_card(ui, snap, simulating);
@@ -515,7 +522,7 @@ impl StreamItApp {
                 .selected_text(self.add_kind.map(BmdKind::label).unwrap_or("any kind"))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.add_kind, None, "any kind");
-                    for k in [BmdKind::Atem, BmdKind::VideoHub, BmdKind::WebPresenter] {
+                    for k in [BmdKind::Atem, BmdKind::VideoHub, BmdKind::MultiView, BmdKind::WebPresenter] {
                         ui.selectable_value(&mut self.add_kind, Some(k), k.label());
                     }
                 });
@@ -1116,7 +1123,7 @@ impl StreamItApp {
 
     pub(super) fn scan(&mut self) {
         self.scan_job.start(&self.rt, &self.ctx, async move {
-            tokio::task::spawn_blocking(|| discovery::browse(SCAN_FOR)).await.unwrap_or_default()
+            tokio::task::spawn_blocking(|| discovery::search(SCAN_FOR)).await.unwrap_or_default()
         });
     }
 }
@@ -1179,7 +1186,9 @@ mod tests {
     #[test]
     fn job_names_follow_the_mockup() {
         let names: Vec<&str> = ROLES.iter().map(|(_, n)| *n).collect();
-        assert_eq!(names, ["Stream switcher", "Screens switcher", "Router", "Stream encoder"]);
+        assert_eq!(names, ["Stream switcher", "Screens switcher", "Router", "MultiView", "Stream encoder"]);
         assert_eq!(roles_for(Some(BmdKind::VideoHub)), vec![(Role::VideoHub, "Router")]);
+        assert_eq!(roles_for(Some(BmdKind::MultiView)), vec![(Role::MultiView, "MultiView")]);
+        assert!(roles_for(None).contains(&(Role::MultiView, "MultiView")), "a device of unknown kind can be one");
     }
 }

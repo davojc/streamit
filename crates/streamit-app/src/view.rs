@@ -71,7 +71,7 @@ pub struct CountdownView {
 
 /// Every device, in the order the screens list them. The lighting console shows only once
 /// one is set up (see `shown_kinds`).
-pub const ALL_KINDS: [DeviceKind; 9] = [
+pub const ALL_KINDS: [DeviceKind; 10] = [
     DeviceKind::StreamAtem,
     DeviceKind::ScreensAtem,
     DeviceKind::VideoHub,
@@ -81,12 +81,16 @@ pub const ALL_KINDS: [DeviceKind; 9] = [
     DeviceKind::Ndi,
     DeviceKind::StreamDeck,
     DeviceKind::Lighting,
+    DeviceKind::MultiView,
 ];
 
-/// The devices to list: all of them, but the lighting console only when it is set up (its
-/// health is then reported).
+/// The devices to list: all of them, but the lighting console and the MultiView only when
+/// they are set up (their health is then reported).
 pub fn shown_kinds(s: &Snapshot) -> Vec<DeviceKind> {
-    ALL_KINDS.into_iter().filter(|k| *k != DeviceKind::Lighting || s.device_status.contains_key(k)).collect()
+    ALL_KINDS
+        .into_iter()
+        .filter(|k| !matches!(k, DeviceKind::Lighting | DeviceKind::MultiView) || s.device_status.contains_key(k))
+        .collect()
 }
 
 pub fn kind_name(k: DeviceKind) -> &'static str {
@@ -100,6 +104,7 @@ pub fn kind_name(k: DeviceKind) -> &'static str {
         DeviceKind::Ndi => "NDI counter",
         DeviceKind::StreamDeck => "Stream Deck",
         DeviceKind::Lighting => "Lighting",
+        DeviceKind::MultiView => "MultiView",
     }
 }
 

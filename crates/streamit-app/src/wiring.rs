@@ -439,6 +439,24 @@ pub struct Probes {
     counter: Arc<Late<dyn Counter>>,
     /// A lighting console is set up, so its health is polled.
     lighting: bool,
+    /// A MultiView 4 is set up: its address (or why it is not one), checked by a connect.
+    multiview: Option<Result<SocketAddr, String>>,
+}
+
+/// The MultiView 4's Videohub Ethernet protocol port.
+pub const MULTIVIEW_PORT: u16 = 9990;
+
+/// The MultiView answers if it takes a TCP connection on its control port.
+async fn multiview_health(addr: &Result<SocketAddr, String>) -> DeviceHealth {
+    let addr = match addr {
+        Ok(a) => *a,
+        Err(e) => return DeviceHealth::Down(e.clone()),
+    };
+    match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(_)) => DeviceHealth::Ok,
+        Ok(Err(e)) => DeviceHealth::Down(format!("no answer on port {}: {e}", addr.port())),
+        Err(_) => DeviceHealth::Down(format!("no answer on port {}", addr.port())),
+    }
 }
 
 pub struct Wired {
@@ -528,7 +546,8 @@ pub async fn build(c: &Config) -> Wired {
         counter: counter.clone() as Arc<dyn Counter>,
         lights,
     });
-    let probes = Probes { devices: devices.clone(), player, counter, lighting: c.lighting.is_set() };
+    let multiview = c.multiview_device.is_set().then(|| socket_addr(&c.multiview_device.address, MULTIVIEW_PORT));
+    let probes = Probes { devices: devices.clone(), player, counter, lighting: c.lighting.is_set(), multiview };
     // Stand-ins never come up, so only wait for the devices that were really built.
     let real: Vec<DeviceKind> = NETWORK.iter().copied().filter(|k| !stand_ins.contains(k)).collect();
     probes.wait_ready(&real, c.videohub.input8_output, STARTUP_WAIT).await;
@@ -598,13 +617,14 @@ impl Probes {
         let (player, counter) = (Late::new(""), Late::new(""));
         player.install(devices.player.clone());
         counter.install(devices.counter.clone());
-        // The pretend console is always there.
-        Probes { devices, player, counter, lighting: true }
+        // The pretend console is always there. Simulation never touches the network, so
+        // a real MultiView is not checked.
+        Probes { devices, player, counter, lighting: true, multiview: None }
     }
 
     #[cfg(test)]
     fn new(devices: Devices, player: Arc<Late<dyn Player>>, counter: Arc<Late<dyn Counter>>) -> Probes {
-        Probes { devices, player, counter, lighting: false }
+        Probes { devices, player, counter, lighting: false, multiview: None }
     }
 
     /// One read for one device: program() for the ATEMs, route_of(input-8 output, or 1)
@@ -626,6 +646,10 @@ impl Probes {
             DeviceKind::Ndi => self.counter.health(),
             DeviceKind::StreamDeck => DeviceHealth::Ok, // reported by the deck itself
             DeviceKind::Lighting => probe(d.lights.status()).await,
+            DeviceKind::MultiView => match &self.multiview {
+                Some(a) => multiview_health(a).await,
+                None => DeviceHealth::Down("no MultiView set up".into()),
+            },
         }
     }
 
@@ -697,6 +721,9 @@ impl Probes {
         ];
         if self.lighting {
             out.push((DeviceKind::Lighting, self.check(DeviceKind::Lighting, hub_output).await));
+        }
+        if self.multiview.is_some() {
+            out.push((DeviceKind::MultiView, self.check(DeviceKind::MultiView, hub_output).await));
         }
         out
     }

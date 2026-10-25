@@ -148,6 +148,8 @@ pub enum DeviceKind {
     StreamDeck,
     /// The lighting console (ETC Eos), when one is set up.
     Lighting,
+    /// The MultiView 4, when one is set up.
+    MultiView,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

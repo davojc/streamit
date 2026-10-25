@@ -198,6 +198,21 @@ pub enum OscFraming {
 }
 
 /// The lighting console (ETC Eos family, OSC over TCP port 3032). Optional.
+/// The MultiView 4 itself (Videohub Ethernet protocol, TCP port 9990). Optional: StreamIt
+/// only checks that it answers. What feeds its views is the VideoHub's job (`multiview`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MultiViewDevice {
+    pub address: Option<String>,
+}
+
+impl MultiViewDevice {
+    /// A MultiView is set up.
+    pub fn is_set(&self) -> bool {
+        self.address.as_deref().is_some_and(|a| !a.trim().is_empty())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LightingConfig {
@@ -224,6 +239,8 @@ pub struct Config {
     pub playout: PlayoutConfig,
     pub ndi: NdiConfig,
     pub lighting: LightingConfig,
+    /// The MultiView 4 box, when one is given the MultiView job in Settings › Equipment.
+    pub multiview_device: MultiViewDevice,
     /// Routing: what feeds the MultiView 4's views and the ATEMs' inputs, and the presets.
     pub multiview: RoutingConfig,
     pub stream_routing: RoutingConfig,
