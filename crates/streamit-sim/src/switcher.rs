@@ -3,7 +3,7 @@ use crate::{Fault, Mix, PendingRoute, SimHandle, SimWorld, SwitcherState};
 use async_trait::async_trait;
 use std::time::Duration;
 use streamit_core::config::AudioSourceId;
-use streamit_core::devices::{DeviceError, LabelKind, Result, Router, StreamSwitcher, Switcher};
+use streamit_core::devices::{AudioInput, AudioMix, DeviceError, LabelKind, Result, Router, StreamSwitcher, Switcher};
 use streamit_core::engine::DeviceKind;
 use tokio::time::Instant;
 
@@ -127,6 +127,22 @@ impl StreamSwitcher for SimSwitcher {
         self.with(|w| {
             if src.input == w.decklink_input {
                 w.input8_audio_on = on;
+            }
+        })
+    }
+
+    /// The stream audio sources are on at their faders (off when faded right down), the
+    /// video input follows its switch, and every other input follows video at 0 dB.
+    async fn audio_input(&self, src: AudioSourceId) -> Result<AudioInput> {
+        self.with(|w| {
+            if let Some(&db) = w.fairlight.get(&src) {
+                let mix = if db <= -100.0 { AudioMix::Off } else { AudioMix::On };
+                AudioInput { mix, fader_db: db }
+            } else if src.input == w.decklink_input {
+                let mix = if w.input8_audio_on { AudioMix::On } else { AudioMix::FollowVideo };
+                AudioInput { mix, fader_db: 0.0 }
+            } else {
+                AudioInput { mix: AudioMix::FollowVideo, fader_db: 0.0 }
             }
         })
     }

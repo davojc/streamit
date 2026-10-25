@@ -84,7 +84,7 @@ Simulation runs the real StreamIt against pretend equipment and a pretend YouTub
   - An ATEM mix takes 1 s. Until it finishes, the ATEM still reports the old source.
   - A VideoHub route takes effect after 1 s.
   - The Web Presenter goes from Connecting to Streaming after 3 s.
-  - YouTube health becomes Good 5 s after streaming starts; then the viewer count grows and a pretend viewer writes in the live chat every 15 s. Going testing, live or complete takes 2 to 3 s.
+  - YouTube health becomes Good 5 s after streaming starts; then the viewer count grows and a pretend viewer writes in the live chat every 15 s. The pretend Stream ATEM reports its audio inputs for the Stream audio panel: the stream audio sources on at their faders, the video input following video (or on), the rest following video. Going testing, live or complete takes 2 to 3 s.
   - A video plays for the real length of its mp4 or mov file, or 30 s if the length cannot be read.
   - The NDI counter is not sent anywhere. Its value shows on the Simulation tab.
   - Router numbers you have not set (output feeding ATEM input 8, DeckLink router input, fallback normal input) are filled in as 11, 39 and 13 for the simulation only. They are not saved.

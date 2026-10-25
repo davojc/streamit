@@ -913,6 +913,27 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn the_pretend_stream_atem_reports_its_audio_inputs() {
+        use streamit_core::devices::AudioMix;
+        let c = SimControl::new(&cfg(), Speed::X1);
+        let d = c.devices();
+        let mic = cfg().stream_atem.mic_sources[0];
+        let at = |input| streamit_core::config::AudioSourceId { input, source: -65280 };
+        let read = |src| {
+            let d = d.clone();
+            async move { d.stream.audio_input(src).await.unwrap() }
+        };
+        assert_eq!((read(mic).await.mix, read(mic).await.fader_db), (AudioMix::On, -3.0));
+        d.stream.set_audio_level(mic, -100.0).await.unwrap();
+        assert_eq!(read(mic).await.mix, AudioMix::Off, "faded right down");
+        let video = at(cfg().stream_atem.decklink_input);
+        assert_eq!(read(video).await.mix, AudioMix::FollowVideo);
+        d.stream.set_audio_on(video, true).await.unwrap();
+        assert_eq!(read(video).await.mix, AudioMix::On);
+        assert_eq!(read(at(2)).await.mix, AudioMix::FollowVideo, "a camera follows video");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn the_pretend_chat_fills_once_streaming_and_takes_replies() {
         let c = SimControl::new(&cfg(), Speed::X1);
         let d = c.devices();

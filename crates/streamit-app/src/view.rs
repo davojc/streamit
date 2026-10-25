@@ -747,6 +747,17 @@ pub fn chat_url(broadcast_id: &str) -> String {
     format!("https://www.youtube.com/live_chat?is_popout=1&v={broadcast_id}")
 }
 
+/// A fader position: "−∞" at the floor, "0 dB" at unity, otherwise signed whole dB.
+pub fn fader_text(db: f32) -> String {
+    if db <= -100.0 {
+        "−∞".into()
+    } else if db.abs() < 0.5 {
+        "0 dB".into()
+    } else {
+        format!("{db:+.0} dB")
+    }
+}
+
 /// The YouTube Studio page for running a live broadcast.
 pub fn studio_url(broadcast_id: &str) -> String {
     format!("https://studio.youtube.com/video/{broadcast_id}/livestreaming")
@@ -1312,6 +1323,9 @@ mod tests {
         assert_eq!(audio_tag(at(AudioMix::FollowVideo)).0, "AFV");
         assert_eq!(audio_tag(at(AudioMix::Off)).0, "OFF");
         assert_eq!(audio_tag(None).0, "—");
+        assert_eq!(fader_text(-100.0), "−∞");
+        assert_eq!(fader_text(0.2), "0 dB");
+        assert_eq!(fader_text(-3.0), "-3 dB");
         assert_eq!(studio_url("abc"), "https://studio.youtube.com/video/abc/livestreaming");
         assert_eq!(chat_url("abc"), "https://www.youtube.com/live_chat?is_popout=1&v=abc");
         assert_eq!(chat_time("not a time"), "");

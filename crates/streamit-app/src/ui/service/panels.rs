@@ -164,9 +164,9 @@ fn audio_panel(ui: &mut Ui, snap: &Snapshot) -> Ask {
                         theme::chip(ui, tag, theme::MUTED, theme::BUTTON_BORDER);
                     }
                     if let Some(i) = a.input.filter(|i| i.mix != AudioMix::Off) {
-                        let db =
-                            if i.fader_db <= -100.0 { "−∞".to_string() } else { format!("{:+.0} dB", i.fader_db) };
-                        ui.label(RichText::new(db).font(theme::mono(12.0)).color(theme::MUTED));
+                        ui.label(
+                            RichText::new(view::fader_text(i.fader_db)).font(theme::mono(12.0)).color(theme::MUTED),
+                        );
                     }
                 });
             });
