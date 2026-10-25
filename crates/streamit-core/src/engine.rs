@@ -28,6 +28,7 @@ use crate::recovery::{self, Assessment, Offer};
 use crate::rollin::{self, Cue, CueList, CueState, RollinOutcome, RollinReport};
 use crate::routing::{Preset, RoutingRead, RoutingState, Target, TargetState, locked};
 use crate::scenes::{self, MAX_SCENES, Scene};
+use crate::steps::{self, Step, StepGroup, StepId, StepMark};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -197,6 +198,9 @@ pub struct Snapshot {
     pub scenes: Vec<Scene>,
     /// The scene gone to last (its id).
     pub active_scene: Option<u32>,
+    /// How far the steps of Prepare, the countdown and End Service have got this service.
+    /// Prepare starts them all again; the countdown and End Service their own.
+    pub steps: Vec<Step>,
 }
 
 /// How far the playing roll-in is.
@@ -245,6 +249,7 @@ impl Default for Snapshot {
             chat_error: None,
             scenes: Vec::new(),
             active_scene: None,
+            steps: Vec::new(),
         }
     }
 }
@@ -1005,10 +1010,15 @@ impl Engine {
         let (d, c, snap, levels, bid) =
             (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone(), self.bid());
         let file = self.levels_file.clone();
+        // A new service: every step starts again.
+        self.set(|s| {
+            s.steps.clear();
+            steps::reset(&mut s.steps, StepGroup::Prepare);
+        });
         let handle = tokio::spawn(
             async move {
                 let mut l = lock(&levels).clone();
-                let (p, w, n) = (snap.clone(), snap.clone(), snap);
+                let (p, w, n, st) = (snap.clone(), snap.clone(), snap.clone(), snap);
                 let r = golive::prepare(
                     &d,
                     &c,
@@ -1017,6 +1027,7 @@ impl Engine {
                     move |r| p.send_modify(|s| set_prepared(s, r)),
                     move |m| set_warning(&w, m),
                     move |m| n.send_modify(|s| log(s, m)),
+                    move |id, m| set_step(&st, id, m),
                 )
                 .await;
                 store_levels(&levels, l, file.as_deref());
@@ -1036,6 +1047,7 @@ impl Engine {
         self.set(|s| {
             remove(&mut s.offers, Offer::GoLive);
             remove(&mut s.offers, Offer::GoPublic);
+            steps::reset(&mut s.steps, StepGroup::Countdown);
         });
         let cancel = CancellationToken::new();
         let (d, c, snap, levels, bid, tok) =
@@ -1066,6 +1078,7 @@ impl Engine {
                                 log(s, format!("Countdown started ({})", mss(total)));
                             }
                             CountdownReport::Note(m) => log(s, m),
+                            CountdownReport::Step(id, m) => steps::mark(&mut s.steps, id, m),
                         })
                     },
                 )
@@ -1080,9 +1093,19 @@ impl Engine {
     fn start_end(&mut self) {
         let skip = Arc::new(Notify::new());
         let (d, c, snap, bid, s2) = (self.d.clone(), self.config(), self.snap.clone(), self.bid(), skip.clone());
+        self.set(|s| steps::reset(&mut s.steps, StepGroup::End));
         let handle = tokio::spawn(
             async move {
-                let out = end_service(&d, &c, &bid, s2, move |st| snap.send_modify(|s| set_stage(s, st))).await;
+                let st = snap.clone();
+                let out = end_service(
+                    &d,
+                    &c,
+                    &bid,
+                    s2,
+                    move |stage| snap.send_modify(|s| set_stage(s, stage)),
+                    move |id, m| set_step(&st, id, m),
+                )
+                .await;
                 Done::Ended(out)
             }
             .in_current_span(),
@@ -1688,6 +1711,10 @@ fn log(s: &mut Snapshot, text: String) {
     s.activity.truncate(ACTIVITY_MAX);
 }
 
+fn set_step(snap: &Shared, id: StepId, m: StepMark) {
+    snap.send_modify(|s| steps::mark(&mut s.steps, id, m));
+}
+
 /// Show `msg` as the warning and record it in the activity list.
 fn warn_in(s: &mut Snapshot, msg: String) {
     log(s, msg.clone());
@@ -2025,6 +2052,56 @@ mod tests {
         for (i, w) in want.iter().enumerate() {
             assert!(it.any(w), "stage #{i} missing or out of order in {seen:?}");
         }
+    }
+
+    fn marks(s: &Snapshot, g: StepGroup) -> Vec<StepMark> {
+        steps::of_group(&s.steps, g).into_iter().map(|x| x.mark).collect()
+    }
+
+    fn all_done(s: &Snapshot, g: StepGroup) -> bool {
+        marks(s, g).iter().all(|m| matches!(m, StepMark::Done(_)))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn steps_go_done_through_a_whole_service() {
+        let (d, _log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        assert!(snap(&e).steps.is_empty());
+        send(&e, Command::Prepare).await;
+        let s = until(&mut e, "Prepared(Ready)", |s| s.stage == Stage::Prepared(Readiness::Ready)).await;
+        assert!(all_done(&s, StepGroup::Prepare), "{:?}", marks(&s, StepGroup::Prepare));
+        assert!(marks(&s, StepGroup::Countdown).iter().all(|m| *m == StepMark::Todo));
+        send(&e, Command::Countdown).await;
+        let s = until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        assert!(
+            matches!(marks(&s, StepGroup::Countdown)[1], StepMark::Now(_)),
+            "{:?}",
+            marks(&s, StepGroup::Countdown)
+        );
+        h.player.emit(PlayerEvent::Ended);
+        let s = until(&mut e, "Live", |s| s.stage == Stage::Live && s.job.is_none()).await;
+        assert!(all_done(&s, StepGroup::Countdown), "{:?}", marks(&s, StepGroup::Countdown));
+        send(&e, Command::EndService).await;
+        let s = until(&mut e, "Ending", |s| matches!(s.stage, Stage::Ending { .. })).await;
+        assert!(matches!(marks(&s, StepGroup::End)[2], StepMark::Now(_)), "{:?}", marks(&s, StepGroup::End));
+        let s = until(&mut e, "Ended", |s| s.stage == Stage::Ended && s.job.is_none()).await;
+        assert!(all_done(&s, StepGroup::End), "{:?}", marks(&s, StepGroup::End));
+        assert!(all_done(&s, StepGroup::Prepare), "the earlier stages keep their marks");
+        // The next service starts every step again.
+        send(&e, Command::Prepare).await;
+        let s = until(&mut e, "Preparing", |s| s.job.is_some()).await;
+        assert!(marks(&s, StepGroup::End).iter().all(|m| *m == StepMark::Todo));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_step_says_why() {
+        let (d, _log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        h.encoder.fail_next("start");
+        send(&e, Command::Prepare).await;
+        let s = until(&mut e, "Prepared(Warning)", |s| matches!(s.stage, Stage::Prepared(Readiness::Warning(_)))).await;
+        let m = &marks(&s, StepGroup::Prepare)[3];
+        assert!(matches!(m, StepMark::Failed(_)), "{m:?}");
     }
 
     #[tokio::test(start_paused = true)]

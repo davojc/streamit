@@ -275,7 +275,7 @@ impl StreamItApp {
         });
     }
 
-    pub(super) fn ending_screen(&mut self, ui: &mut Ui, snap: &Snapshot) {
+    pub(super) fn ending_screen(&mut self, ui: &mut Ui, snap: &Snapshot, c: &Config) {
         let remaining = match snap.stage {
             Stage::Ending { remaining } => remaining,
             _ => return,
@@ -298,7 +298,7 @@ impl StreamItApp {
                     }
                 });
             },
-            |_, ui| activity(ui, snap),
+            |_, ui| super::steps::steps_panel(ui, snap, c, streamit_core::steps::StepGroup::End),
         );
     }
 }

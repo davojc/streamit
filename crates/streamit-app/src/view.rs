@@ -11,6 +11,7 @@ use streamit_core::golive::{Readiness, Stage};
 use streamit_core::recovery::Offer;
 use streamit_core::rollin::{Cue, CueState, Destination};
 use streamit_core::routing::Target;
+use streamit_core::steps::{self, StepGroup, StepId, StepMark};
 use streamit_sim::{Fault, Input8Source, PlayerView, Speed};
 
 /// The colour family of a badge, a dot or a step.
@@ -791,6 +792,82 @@ pub fn mic_fraction(db: f32) -> f32 {
     ((db + 40.0) / 46.0).clamp(0.0, 1.0)
 }
 
+/// One circle in the list of steps: grey to do, amber now, green done, red failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepRow {
+    pub label: &'static str,
+    pub detail: Option<String>,
+    /// When it was done ("10:18:24").
+    pub time: Option<String>,
+    pub tone: Tone,
+}
+
+/// The list's heading, as the steps bar names the stage.
+pub fn step_heading(g: StepGroup) -> &'static str {
+    match g {
+        StepGroup::Prepare => "1 Prepare",
+        StepGroup::Countdown => "2 Countdown",
+        StepGroup::End => "4 End service",
+    }
+}
+
+/// `g`'s steps as they stand, with a line under each saying what it waits on, why it
+/// failed or (not started yet) what to expect.
+pub fn step_rows(s: &Snapshot, c: &Config, g: StepGroup) -> Vec<StepRow> {
+    steps::of_group(&s.steps, g)
+        .into_iter()
+        .map(|st| {
+            let (tone, detail, time) = match st.mark {
+                StepMark::Todo => (Tone::Grey, todo_detail(st.id, c), None),
+                StepMark::Now(d) => (Tone::Amber, d.or_else(|| now_detail(st.id, s)), None),
+                StepMark::Done(at) => (
+                    Tone::Green,
+                    None,
+                    Some(chrono::DateTime::<chrono::Local>::from(at).format("%H:%M:%S").to_string()),
+                ),
+                StepMark::Failed(why) => (Tone::Red, Some(why), None),
+            };
+            StepRow { label: st.id.label(), detail, time, tone }
+        })
+        .collect()
+}
+
+/// The heading's circle: green once every step is done, red if one failed, amber
+/// while under way.
+pub fn steps_tone(rows: &[StepRow]) -> Tone {
+    if rows.iter().all(|r| r.tone == Tone::Green) {
+        Tone::Green
+    } else if rows.iter().any(|r| r.tone == Tone::Amber) {
+        Tone::Amber
+    } else if rows.iter().any(|r| r.tone == Tone::Red) {
+        Tone::Red
+    } else if rows.iter().any(|r| r.tone == Tone::Green) {
+        Tone::Amber
+    } else {
+        Tone::Grey
+    }
+}
+
+fn todo_detail(id: StepId, c: &Config) -> Option<String> {
+    Some(match id {
+        StepId::OpeningStill => "Online sees “Stream starting soon…”".into(),
+        StepId::YouTubeReceiving => "Waits up to 60 s".into(),
+        StepId::YouTubeTesting => "Still private".into(),
+        StepId::HallCountdown => format!("Screens ATEM input {}", c.screens_atem.decklink_input),
+        StepId::YouTubePublic => format!("At {} left", fmt_mmss(c.timings.go_public_offset)),
+        StepId::ClosingHold => format!("{}, can be skipped", fmt_mmss(c.timings.closing_hold)),
+        _ => return None,
+    })
+}
+
+fn now_detail(id: StepId, s: &Snapshot) -> Option<String> {
+    match (id, &s.stage) {
+        (StepId::CountdownVideo, Stage::Countdown { remaining, .. }) => Some(format!("{} left", fmt_mmss(*remaining))),
+        (StepId::ClosingHold, Stage::Ending { remaining }) => Some(format!("{} left", fmt_mmss(*remaining))),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1330,5 +1407,35 @@ mod tests {
         assert_eq!(chat_url("abc"), "https://www.youtube.com/live_chat?is_popout=1&v=abc");
         assert_eq!(chat_time("not a time"), "");
         assert_eq!(chat_time("2026-10-25T10:31:00Z").len(), 5);
+    }
+
+    #[test]
+    fn step_rows_show_how_far_each_step_has_got() {
+        use streamit_core::steps::{Step, StepGroup, StepId, StepMark};
+        let c = Config::default();
+        let mut s = Snapshot::default();
+        let rows = step_rows(&s, &c, StepGroup::Countdown);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r.tone == Tone::Grey));
+        assert_eq!(rows[2].detail.as_deref(), Some("At 0:10 left"));
+        assert_eq!(steps_tone(&rows), Tone::Grey);
+
+        s.stage = Stage::Countdown { remaining: Duration::from_secs(192), public: false };
+        s.steps = vec![
+            Step { id: StepId::HallCountdown, mark: StepMark::done() },
+            Step { id: StepId::CountdownVideo, mark: StepMark::Now(None) },
+            Step { id: StepId::YouTubePublic, mark: StepMark::Todo },
+        ];
+        let rows = step_rows(&s, &c, StepGroup::Countdown);
+        assert_eq!(rows[0].tone, Tone::Green);
+        assert_eq!(rows[0].time.as_ref().map(|t| t.len()), Some(8));
+        assert_eq!((rows[1].tone, rows[1].detail.as_deref()), (Tone::Amber, Some("3:12 left")));
+        assert_eq!(steps_tone(&rows), Tone::Amber);
+
+        s.steps[1].mark = StepMark::Failed("no signal".into());
+        s.steps[2].mark = StepMark::done();
+        let rows = step_rows(&s, &c, StepGroup::Countdown);
+        assert_eq!((rows[1].tone, rows[1].detail.as_deref()), (Tone::Red, Some("no signal")));
+        assert_eq!(steps_tone(&rows), Tone::Red);
     }
 }

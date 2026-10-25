@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::devices::{
     BroadcastCheck, BroadcastSummary, DeviceError, Devices, Health, Phase, PlayerEvent, Result, Switcher,
 };
+use crate::steps::{StepId, StepMark};
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::{JoinError, JoinHandle};
@@ -63,6 +64,8 @@ pub enum CountdownReport {
     Started(Duration),
     /// A plain-language step for the activity list.
     Note(String),
+    /// How far one of the countdown's steps has got.
+    Step(StepId, StepMark),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,7 +156,8 @@ fn problem(problems: &mut Vec<String>, warn: &impl Fn(String), msg: String) {
 
 /// Stage 1: holding still on air, mics down, encoder on, YouTube in testing.
 /// Never aborts early: each failed step becomes part of a `Warning`. `note` gets a
-/// plain-language line for each milestone reached.
+/// plain-language line for each milestone reached, and `step` how far each step has got.
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare(
     d: &Devices,
     c: &Config,
@@ -162,17 +166,22 @@ pub async fn prepare(
     progress: impl Fn(Readiness),
     warn: impl Fn(String),
     note: impl Fn(String),
+    step: impl Fn(StepId, StepMark),
 ) -> Readiness {
     let sa = &c.stream_atem;
     let mut problems = Vec::new();
     let waiting = |s: &str| progress(Readiness::Waiting(s.to_string()));
 
     waiting("Capturing the stream audio levels");
-    if let Err(e) = levels.recapture(&*d.stream, &sa.mic_sources, down_threshold(sa.duck_db)).await {
+    step(StepId::LevelsRead, StepMark::Now(None));
+    let r = levels.recapture(&*d.stream, &sa.mic_sources, down_threshold(sa.duck_db)).await;
+    step(StepId::LevelsRead, StepMark::of(&r));
+    if let Err(e) = r {
         problem(&mut problems, &warn, format!("Could not read the stream audio levels: {e}"));
     }
 
     waiting("Putting the opening still on air");
+    step(StepId::OpeningStill, StepMark::Now(None));
     let before = problems.len();
     if let Err(e) = d.stream.set_media_player_still(sa.media_player, sa.opening_still).await {
         problem(&mut problems, &warn, format!("Could not set the opening still: {e}"));
@@ -181,9 +190,13 @@ pub async fn prepare(
     if let Err(e) = cut(&*d.stream, still_input).await {
         problem(&mut problems, &warn, format!("Could not cut the stream to the opening still: {e}"));
     }
+    step(StepId::OpeningStill, failed_since(&problems, before));
 
     waiting("Fading the stream audio down");
-    if let Err(e) = fade(&*d.stream, &sa.mic_sources, Target::Floor, sa.fade).await {
+    step(StepId::PrepareAudioDown, StepMark::Now(None));
+    let r = fade(&*d.stream, &sa.mic_sources, Target::Floor, sa.fade).await;
+    step(StepId::PrepareAudioDown, StepMark::of(&r));
+    if let Err(e) = r {
         problem(&mut problems, &warn, format!("Could not fade the stream audio down: {e}"));
     }
     if problems.len() == before {
@@ -191,11 +204,16 @@ pub async fn prepare(
     }
 
     waiting("Starting the encoder");
-    match d.encoder.start().await {
+    step(StepId::EncoderStarted, StepMark::Now(None));
+    let r = d.encoder.start().await;
+    step(StepId::EncoderStarted, StepMark::of(&r));
+    match r {
         Ok(()) => note("Web Presenter streaming".into()),
         Err(e) => problem(&mut problems, &warn, format!("Could not start the encoder: {e}")),
     }
 
+    step(StepId::YouTubeReceiving, StepMark::Now(None));
+    let started = Instant::now();
     let deadline = Instant::now() + HEALTH_TIMEOUT;
     let healthy = loop {
         let last = match d.yt.health().await {
@@ -205,15 +223,21 @@ pub async fn prepare(
         };
         if Instant::now() >= deadline {
             let msg = format!("YouTube is not receiving a healthy stream after 60 s ({last})");
+            step(StepId::YouTubeReceiving, StepMark::Failed(format!("Not after 60 s ({last})")));
             problem(&mut problems, &warn, msg);
             break false;
         }
+        let waited = started.elapsed().as_secs();
+        step(StepId::YouTubeReceiving, StepMark::Now(Some(format!("Waiting for the stream · {waited} s ({last})"))));
         progress(Readiness::Waiting(format!("Waiting for YouTube to receive the stream ({last})")));
         sleep(HEALTH_POLL).await;
     };
 
     if healthy {
+        step(StepId::YouTubeReceiving, StepMark::done());
         note("YouTube receiving · private".into());
+        step(StepId::YouTubeTesting, StepMark::Now(None));
+        let before = problems.len();
         let lc = match d.yt.life_cycle(bid).await {
             Ok(l) => Some(l),
             Err(e) => {
@@ -228,11 +252,22 @@ pub async fn prepare(
                 problem(&mut problems, &warn, format!("Could not put the broadcast into testing: {e}"));
             }
         }
+        step(StepId::YouTubeTesting, failed_since(&problems, before));
+    } else {
+        step(StepId::YouTubeTesting, StepMark::Failed("Not started: YouTube is not receiving".into()));
     }
 
     let r = if problems.is_empty() { Readiness::Ready } else { Readiness::Warning(problems.join("; ")) };
     progress(r.clone());
     r
+}
+
+/// Done, or Failed with the problems found since `before` (an index into `problems`).
+fn failed_since(problems: &[String], before: usize) -> StepMark {
+    match &problems[before..] {
+        [] => StepMark::done(),
+        new => StepMark::Failed(new.join("; ")),
+    }
 }
 
 /// Preview then Auto. Auto is skipped when the preview could not be set, so a
@@ -298,9 +333,17 @@ pub async fn countdown(
     if let Readiness::Warning(r) | Readiness::Waiting(r) = ready {
         warn(format!("Starting the countdown although not ready: {r}"));
     }
+    let step = |id, m| report(CountdownReport::Step(id, m));
     // Subscribe before playing so `Ended` cannot be missed.
     let mut events = d.player.events();
-    let duration = d.player.load(&c.playout.countdown_file, 0.0).await?;
+    step(StepId::CountdownVideo, StepMark::Now(Some("Loading".into())));
+    let duration = match d.player.load(&c.playout.countdown_file, 0.0).await {
+        Ok(d) => d,
+        Err(e) => {
+            step(StepId::CountdownVideo, StepMark::Failed(e.to_string()));
+            return Err(e);
+        }
+    };
     if duration <= offset {
         warn(format!(
             "The countdown video ({:.1} s) is not longer than the go-public offset ({:.1} s); going public now",
@@ -308,12 +351,16 @@ pub async fn countdown(
             offset.as_secs_f32()
         ));
     }
-    if let Err(e) = cut(&*d.screens, c.screens_atem.decklink_input).await {
+    step(StepId::HallCountdown, StepMark::Now(None));
+    let r = cut(&*d.screens, c.screens_atem.decklink_input).await;
+    step(StepId::HallCountdown, StepMark::of(&r));
+    if let Err(e) = r {
         warn(format!("Could not switch the hall to the countdown: {e}"));
     }
     if let Err(e) = d.player.play().await {
         return video_failed(d, c, &progress, &warn, &report, None, duration, e.to_string()).await;
     }
+    step(StepId::CountdownVideo, StepMark::Now(None));
     report(CountdownReport::Started(duration));
 
     let mut public = false;
@@ -344,7 +391,10 @@ pub async fn countdown(
                 return Ok(CountdownOutcome::Stopped);
             }
             ev = events.recv() => match ev {
-                Ok(PlayerEvent::Ended) => break,
+                Ok(PlayerEvent::Ended) => {
+                    step(StepId::CountdownVideo, StepMark::done());
+                    break;
+                }
                 Ok(PlayerEvent::Error(e)) => {
                     return video_failed(d, c, &progress, &warn, &report, pub_task.take(), remaining, e).await;
                 }
@@ -364,9 +414,13 @@ pub async fn countdown(
                 match joined(res) {
                     Ok(took) => {
                         public = true;
+                        step(StepId::YouTubePublic, StepMark::done());
                         report(CountdownReport::Note(public_note(took)));
                     }
-                    Err(e) => warn(format!("Could not make the YouTube broadcast public: {e}")),
+                    Err(e) => {
+                        step(StepId::YouTubePublic, StepMark::Failed(e.to_string()));
+                        warn(format!("Could not make the YouTube broadcast public: {e}"));
+                    }
                 }
                 progress(Stage::Countdown { remaining, public });
             }
@@ -374,6 +428,7 @@ pub async fn countdown(
                 remaining = duration.saturating_sub(d.player.position().unwrap_or_default());
                 if !pub_started && remaining <= offset {
                     pub_started = true;
+                    step(StepId::YouTubePublic, StepMark::Now(None));
                     pub_task = Some(spawn_go_public(d, bid));
                 }
                 if let Err(e) = d.counter.show(remaining).await
@@ -413,8 +468,12 @@ pub async fn countdown(
     })
     .await;
     let public = match out.public {
-        Some(Ok(())) => true,
+        Some(Ok(())) => {
+            step(StepId::YouTubePublic, StepMark::done());
+            true
+        }
         Some(Err(e)) => {
+            step(StepId::YouTubePublic, StepMark::Failed(e.to_string()));
             warn(format!("Could not make the YouTube broadcast public: {e}"));
             false
         }
@@ -440,15 +499,18 @@ async fn settle_go_public(
     match tokio::time::timeout(GO_PUBLIC_WAIT, &mut t.0).await {
         Ok(res) => match joined(res) {
             Ok(took) => {
+                report(CountdownReport::Step(StepId::YouTubePublic, StepMark::done()));
                 report(CountdownReport::Note(public_note(took)));
                 Some(true)
             }
             Err(e) => {
+                report(CountdownReport::Step(StepId::YouTubePublic, StepMark::Failed(e.to_string())));
                 warn(format!("Could not make the YouTube broadcast public: {e}"));
                 Some(false)
             }
         },
         Err(_) => {
+            report(CountdownReport::Step(StepId::YouTubePublic, StepMark::Failed("Took too long".into())));
             t.abort();
             warn(format!(
                 "Making the YouTube broadcast public did not finish within {} s; check YouTube Studio",
@@ -472,6 +534,7 @@ async fn video_failed(
     remaining: Duration,
     err: String,
 ) -> Result<CountdownOutcome> {
+    report(CountdownReport::Step(StepId::CountdownVideo, StepMark::Failed(err.clone())));
     warn(format!(
         "The countdown video failed ({err}). The hall screens are back on their normal input; press Go Live manually."
     ));
@@ -800,7 +863,7 @@ mod tests {
         let mut levels = LiveLevels::default();
         let (progress, p) = sink();
         let (warns, w) = sink();
-        let r = prepare(&d, &c, "b", &mut levels, p, w, |_| {}).await;
+        let r = prepare(&d, &c, "b", &mut levels, p, w, |_| {}, |_, _| {}).await;
         assert_eq!(r, Readiness::Ready);
         assert_eq!(levels.0[&MIC], -3.0);
         let calls = log.calls();
@@ -835,7 +898,7 @@ mod tests {
         c.stream_atem.duck_db = -20.0;
         h.stream.set_audio_level_state(MIC, -3.0);
         let mut levels = LiveLevels::default();
-        prepare(&d, &c, "b", &mut levels, |_| {}, |_| {}, |_| {}).await;
+        prepare(&d, &c, "b", &mut levels, |_| {}, |_| {}, |_| {}, |_, _| {}).await;
         assert!(log.calls().contains(&Call::StreamSetAudioLevel(MIC, FLOOR_DB)), "{:?}", log.calls());
         assert_eq!(levels.0[&MIC], -3.0);
     }
@@ -846,7 +909,7 @@ mod tests {
             let (d, log, h) = fake_devices();
             h.yt.set_life_cycle(lc);
             let mut levels = LiveLevels::default();
-            let r = prepare(&d, &Config::default(), "b", &mut levels, |_| {}, |_| {}, |_| {}).await;
+            let r = prepare(&d, &Config::default(), "b", &mut levels, |_| {}, |_| {}, |_| {}, |_, _| {}).await;
             assert_eq!(r, Readiness::Ready);
             assert!(yt_calls(&log.calls()).is_empty(), "{lc}");
             assert!(log.calls().contains(&Call::EncoderStart));
@@ -861,7 +924,7 @@ mod tests {
         let (progress, p) = sink();
         let (warns, w) = sink();
         let start = Instant::now();
-        let r = prepare(&d, &Config::default(), "b", &mut levels, p, w, |_| {}).await;
+        let r = prepare(&d, &Config::default(), "b", &mut levels, p, w, |_| {}, |_, _| {}).await;
         let took = start.elapsed();
         assert!(matches!(r, Readiness::Warning(_)), "{r:?}");
         assert!(took >= Duration::from_secs(60) && took < Duration::from_secs(62), "{took:?}");
@@ -882,7 +945,7 @@ mod tests {
         });
         let mut levels = LiveLevels::default();
         let start = Instant::now();
-        let r = prepare(&d, &Config::default(), "b", &mut levels, |_| {}, |_| {}, |_| {}).await;
+        let r = prepare(&d, &Config::default(), "b", &mut levels, |_| {}, |_| {}, |_| {}, |_, _| {}).await;
         assert_eq!(r, Readiness::Ready);
         assert!(start.elapsed() < Duration::from_secs(10));
         assert_eq!(yt_calls(&log.calls()), vec![Call::YtTransition(Phase::Testing)]);

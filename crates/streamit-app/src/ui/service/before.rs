@@ -1,24 +1,32 @@
 //! Screen 1: before the service (also Prepared and Ended).
 use super::*;
+use streamit_core::steps::StepGroup;
+
+/// The next-step panel's height, buttons included.
+const NEXT_STEP_H: f32 = 500.0;
 
 impl StreamItApp {
     pub(super) fn before_service(&mut self, ui: &mut Ui, snap: &Snapshot, c: &Config, tall: f32) {
+        // The next step fills about half the height; the checks follow below it.
+        let h = (tall - 58.0).min(NEXT_STEP_H);
         self.columns(
             ui,
             440.0,
             |app, ui| {
                 theme::panel().inner_margin(28).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.set_min_height(tall - 58.0);
-                    let bottom = ui.cursor().top() + tall - 58.0;
+                    ui.set_min_height(h);
+                    let bottom = ui.cursor().top() + h;
                     app.next_step_panel(ui, snap, c, bottom);
                 });
-            },
-            |app, ui| {
                 app.preflight(ui, snap);
-                equipment(ui, snap);
-                lined_up(ui, snap);
+                ui.columns(2, |cols| {
+                    cols[0].spacing_mut().item_spacing.y = GAP;
+                    equipment(&mut cols[0], snap);
+                    lined_up(&mut cols[1], snap);
+                });
             },
+            |_, ui| steps::steps_panel(ui, snap, c, StepGroup::Prepare),
         );
     }
 
@@ -153,7 +161,7 @@ impl StreamItApp {
                 snap.broadcast.as_ref().map(|b| b.title.clone()).unwrap_or_else(|| "Choose a broadcast".into());
             let mut choice: Option<String> = None;
             let busy = self.broadcasts_job.running;
-            let width = (ui.available_width() - 110.0).max(120.0);
+            let width = (ui.available_width() - 130.0).max(120.0);
             egui::ComboBox::from_id_salt("broadcast").selected_text(selected).width(width).show_ui(ui, |ui| {
                 for b in &self.broadcasts {
                     let label = match &b.scheduled_start {
@@ -183,6 +191,10 @@ impl StreamItApp {
 }
 
 fn deck_hint(ui: &mut Ui, key: &str, place: &str) {
+    // On a line of its own when it would not fit beside the buttons (it would widen the panel).
+    if ui.available_size_before_wrap().x < 360.0 {
+        ui.end_row();
+    }
     ui.label(RichText::new("Stream Deck:").size(15.0).color(theme::MUTED));
     ui.label(RichText::new(key).font(theme::body_bold(15.0)));
     ui.label(RichText::new(format!("({place})")).size(15.0).color(theme::MUTED));

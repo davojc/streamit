@@ -6,6 +6,7 @@ use crate::audio::{Target, fade};
 use crate::config::Config;
 use crate::devices::{Devices, Phase};
 use crate::golive::{GO_PUBLIC_WAIT, Stage, cut, transition_with_retry};
+use crate::steps::{StepId, StepMark};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -19,24 +20,36 @@ pub struct EndOutcome {
 }
 
 /// Closing still, mics to the floor, hold (skippable), broadcast complete, encoder stop.
+/// `step` gets how far each step has got.
 pub async fn end_service(
     d: &Devices,
     c: &Config,
     bid: &str,
     skip_hold: Arc<Notify>,
     progress: impl Fn(Stage),
+    step: impl Fn(StepId, StepMark),
 ) -> EndOutcome {
     let sa = &c.stream_atem;
     let mut warnings = Vec::new();
 
-    if let Err(e) = d.stream.set_media_player_still(sa.media_player, sa.closing_still).await {
+    step(StepId::ClosingStill, StepMark::Now(None));
+    let mut still = d.stream.set_media_player_still(sa.media_player, sa.closing_still).await;
+    if let Err(e) = &still {
         warnings.push(format!("Could not set the closing still: {e}"));
     }
     let still_input = d.stream.media_player_input(sa.media_player);
-    if let Err(e) = cut(&*d.stream, still_input).await {
+    let r = cut(&*d.stream, still_input).await;
+    if let Err(e) = &r {
         warnings.push(format!("Could not cut the stream to the closing still: {e}"));
     }
-    if let Err(e) = fade(&*d.stream, &sa.mic_sources, Target::Floor, sa.fade).await {
+    if still.is_ok() {
+        still = r;
+    }
+    step(StepId::ClosingStill, StepMark::of(&still));
+    step(StepId::EndAudioDown, StepMark::Now(None));
+    let r = fade(&*d.stream, &sa.mic_sources, Target::Floor, sa.fade).await;
+    step(StepId::EndAudioDown, StepMark::of(&r));
+    if let Err(e) = r {
         warnings.push(format!("Could not fade the stream audio down: {e}"));
     }
 
@@ -45,6 +58,7 @@ pub async fn end_service(
     tokio::pin!(skip);
     let mut remaining = c.timings.closing_hold;
     let second = Duration::from_secs(1);
+    step(StepId::ClosingHold, StepMark::Now(None));
     while !remaining.is_zero() {
         progress(Stage::Ending { remaining });
         tokio::select! {
@@ -55,6 +69,9 @@ pub async fn end_service(
         remaining = remaining.saturating_sub(second);
     }
 
+    step(StepId::ClosingHold, StepMark::done());
+
+    step(StepId::YouTubeEnded, StepMark::Now(None));
     let ended_broadcast =
         match tokio::time::timeout(GO_PUBLIC_WAIT, transition_with_retry(d, bid, Phase::Complete)).await {
             Ok(Ok(())) => true,
@@ -71,7 +88,16 @@ pub async fn end_service(
             }
         };
 
-    let stopped_encoder = match d.encoder.stop().await {
+    if ended_broadcast {
+        step(StepId::YouTubeEnded, StepMark::done());
+    } else if let Some(w) = warnings.last() {
+        step(StepId::YouTubeEnded, StepMark::Failed(w.clone()));
+    }
+
+    step(StepId::EncoderStopped, StepMark::Now(None));
+    let r = d.encoder.stop().await;
+    step(StepId::EncoderStopped, StepMark::of(&r));
+    let stopped_encoder = match r {
         Ok(()) => true,
         Err(e) => {
             warnings.push(format!("Could not stop the encoder: {e}"));
@@ -111,7 +137,7 @@ mod tests {
         c.stream_atem.closing_still = 2;
         let (seen, p) = stages();
         let start = Instant::now();
-        let out = end_service(&d, &c, "b", Arc::default(), p).await;
+        let out = end_service(&d, &c, "b", Arc::default(), p, |_, _| {}).await;
         let took = start.elapsed();
         assert_eq!(out, EndOutcome { ended_broadcast: true, stopped_encoder: true, warnings: vec![] });
         // 1 s mic fade, then the 10 s hold, then YouTube.
@@ -136,7 +162,7 @@ mod tests {
         let (d, log, _h) = fake_devices();
         let c = Config::default();
         let (d2, c2) = (d.clone(), c.clone());
-        let task = tokio::spawn(async move { end_service(&d2, &c2, "b", Arc::default(), |_| {}).await });
+        let task = tokio::spawn(async move { end_service(&d2, &c2, "b", Arc::default(), |_| {}, |_, _| {}).await });
         tokio::time::sleep(Duration::from_millis(10_900)).await;
         assert!(!log.calls().contains(&Call::YtTransition(Phase::Complete)));
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -151,7 +177,7 @@ mod tests {
         let skip = Arc::new(Notify::new());
         skip.notify_one();
         let start = Instant::now();
-        let out = end_service(&d, &Config::default(), "b", skip, |_| {}).await;
+        let out = end_service(&d, &Config::default(), "b", skip, |_| {}, |_, _| {}).await;
         assert_eq!(start.elapsed(), Duration::from_secs(1)); // only the fade
         assert!(out.ended_broadcast && out.stopped_encoder);
         assert!(log.calls().ends_with(&[Call::YtTransition(Phase::Complete), Call::EncoderStop]));
@@ -161,7 +187,7 @@ mod tests {
         let skip = Arc::new(Notify::new());
         let (d2, s2) = (d.clone(), skip.clone());
         let (seen, p) = stages();
-        let task = tokio::spawn(async move { end_service(&d2, &Config::default(), "b", s2, p).await });
+        let task = tokio::spawn(async move { end_service(&d2, &Config::default(), "b", s2, p, |_, _| {}).await });
         let start = Instant::now();
         tokio::time::sleep(Duration::from_millis(3_500)).await;
         skip.notify_one();
@@ -177,7 +203,7 @@ mod tests {
     async fn youtube_failure_still_stops_encoder() {
         let (d, log, h) = fake_devices();
         h.yt.fail_times("transition", 4);
-        let out = end_service(&d, &Config::default(), "b", Arc::default(), |_| {}).await;
+        let out = end_service(&d, &Config::default(), "b", Arc::default(), |_| {}, |_, _| {}).await;
         assert!(!out.ended_broadcast);
         assert!(out.stopped_encoder);
         assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
@@ -192,7 +218,7 @@ mod tests {
         let (d, _log, h) = fake_devices();
         h.yt.fail_next("transition");
         h.yt.set_life_cycle("complete");
-        let out = end_service(&d, &Config::default(), "b", Arc::default(), |_| {}).await;
+        let out = end_service(&d, &Config::default(), "b", Arc::default(), |_| {}, |_, _| {}).await;
         assert!(out.ended_broadcast, "{:?}", out.warnings);
     }
 
@@ -201,7 +227,7 @@ mod tests {
         let (d, log, h) = fake_devices();
         h.yt.set_transition_hangs(true);
         let start = Instant::now();
-        let out = end_service(&d, &Config::default(), "b", Arc::default(), |_| {}).await;
+        let out = end_service(&d, &Config::default(), "b", Arc::default(), |_| {}, |_, _| {}).await;
         assert_eq!(start.elapsed(), Duration::from_secs(11) + GO_PUBLIC_WAIT);
         assert!(!out.ended_broadcast && out.stopped_encoder);
         assert!(out.warnings.iter().any(|w| w.contains("YouTube")));
@@ -214,7 +240,7 @@ mod tests {
         h.stream.fail_next("set_media_player_still");
         h.stream.fail_next("set_preview");
         h.encoder.fail_next("stop");
-        let out = end_service(&d, &Config::default(), "b", Arc::default(), |_| {}).await;
+        let out = end_service(&d, &Config::default(), "b", Arc::default(), |_| {}, |_, _| {}).await;
         assert!(out.ended_broadcast);
         assert!(!out.stopped_encoder);
         assert_eq!(out.warnings.len(), 3, "{:?}", out.warnings);

@@ -10,3 +10,4 @@ pub mod recovery;
 pub mod rollin;
 pub mod routing;
 pub mod scenes;
+pub mod steps;

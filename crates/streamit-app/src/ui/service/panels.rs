@@ -134,7 +134,8 @@ fn audio_panel(ui: &mut Ui, snap: &Snapshot) -> Ask {
             Tone::Green => (theme::GREEN, theme::SOFT),
         };
         ui.horizontal(|ui| {
-            let bar_w = (ui.available_width() - 130.0).max(40.0);
+            // Room for the longest words, "down for the close", so the panel never outgrows its column.
+            let bar_w = (ui.available_width() - 160.0).max(40.0);
             ui.allocate_ui_with_layout(vec2(bar_w, 10.0), Layout::left_to_right(Align::Center), |ui| {
                 theme::progress(ui, bar.fraction, color);
             });

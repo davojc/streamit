@@ -1,5 +1,6 @@
 //! Screen 2: the countdown.
 use super::*;
+use streamit_core::steps::StepGroup;
 
 impl StreamItApp {
     pub(super) fn countdown_screen(&mut self, ui: &mut Ui, snap: &Snapshot, c: &Config, saved: &Config, tall: f32) {
@@ -104,6 +105,7 @@ impl StreamItApp {
                 });
             },
             |app, ui| {
+                steps::steps_panel(ui, snap, c, StepGroup::Countdown);
                 theme::panel().show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     theme::lbl(ui, "What happens if you stop");
@@ -134,7 +136,6 @@ impl StreamItApp {
                         }
                     });
                 }
-                activity(ui, snap);
             },
         );
     }
