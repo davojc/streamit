@@ -20,6 +20,7 @@ use streamit_core::devices::{
 use streamit_core::engine::{AudioReading, Command, DeviceHealth, DeviceKind, Snapshot};
 use streamit_core::golive::Stage;
 use streamit_core::routing::{RoutingRead, Target, TargetRead};
+use streamit_videohub::multiview::{MultiView, labels_to_set};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{Instrument, info, warn};
@@ -439,23 +440,21 @@ pub struct Probes {
     counter: Arc<Late<dyn Counter>>,
     /// A lighting console is set up, so its health is polled.
     lighting: bool,
-    /// A MultiView 4 is set up: its address (or why it is not one), checked by a connect.
-    multiview: Option<Result<SocketAddr, String>>,
+    /// A MultiView 4 is set up: its client (or why there is none).
+    multiview: Option<Result<Arc<MultiView>, String>>,
 }
 
 /// The MultiView 4's Videohub Ethernet protocol port.
 pub const MULTIVIEW_PORT: u16 = 9990;
 
-/// The MultiView answers if it takes a TCP connection on its control port.
-async fn multiview_health(addr: &Result<SocketAddr, String>) -> DeviceHealth {
-    let addr = match addr {
-        Ok(a) => *a,
-        Err(e) => return DeviceHealth::Down(e.clone()),
-    };
-    match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(addr)).await {
-        Ok(Ok(_)) => DeviceHealth::Ok,
-        Ok(Err(e)) => DeviceHealth::Down(format!("no answer on port {}: {e}", addr.port())),
-        Err(_) => DeviceHealth::Down(format!("no answer on port {}", addr.port())),
+/// The MultiView is up once its client is connected and has its labels.
+fn multiview_health(mv: &Result<Arc<MultiView>, String>) -> DeviceHealth {
+    match mv {
+        Ok(mv) => match mv.ensure_usable() {
+            Ok(()) => DeviceHealth::Ok,
+            Err(e) => DeviceHealth::Down(e.to_string()),
+        },
+        Err(e) => DeviceHealth::Down(e.clone()),
     }
 }
 
@@ -546,7 +545,10 @@ pub async fn build(c: &Config) -> Wired {
         counter: counter.clone() as Arc<dyn Counter>,
         lights,
     });
-    let multiview = c.multiview_device.is_set().then(|| socket_addr(&c.multiview_device.address, MULTIVIEW_PORT));
+    let multiview = c
+        .multiview_device
+        .is_set()
+        .then(|| socket_addr(&c.multiview_device.address, MULTIVIEW_PORT).map(MultiView::connect));
     let probes = Probes { devices: devices.clone(), player, counter, lighting: c.lighting.is_set(), multiview };
     // Stand-ins never come up, so only wait for the devices that were really built.
     let real: Vec<DeviceKind> = NETWORK.iter().copied().filter(|k| !stand_ins.contains(k)).collect();
@@ -611,6 +613,38 @@ async fn probe<T>(f: impl Future<Output = devices::Result<T>>) -> DeviceHealth {
 }
 
 impl Probes {
+    /// Names each MultiView view after the VideoHub input on it (its VideoHub label, else
+    /// "Input n") when the MultiView's label differs. A label the MultiView refused is not
+    /// sent again until a different one is wanted.
+    pub async fn name_views(
+        &self,
+        hub_labels: &[String],
+        dests: &[Option<u16>],
+        tried: &mut std::collections::HashMap<u16, String>,
+    ) {
+        let Some(Ok(mv)) = &self.multiview else { return };
+        let Ok(current) = mv.labels() else { return };
+        let label = |n: u16| {
+            let own = usize::from(n).checked_sub(1).and_then(|i| hub_labels.get(i)).map(|l| l.trim().to_string());
+            own.filter(|l| !l.is_empty()).unwrap_or_else(|| format!("Input {n}"))
+        };
+        for (view, text) in labels_to_set(dests, &current, label) {
+            if tried.get(&view) == Some(&text) {
+                continue;
+            }
+            match mv.set_label(view, &text).await {
+                Ok(()) => {
+                    info!(view, label = %text, "MultiView view named after its input");
+                    tried.remove(&view);
+                }
+                Err(e) => {
+                    warn!(view, label = %text, "could not name the MultiView view: {e}");
+                    tried.insert(view, text);
+                }
+            }
+        }
+    }
+
     /// Probes for devices that are all there from the start (the pretend ones): the
     /// player and counter are installed at once.
     pub fn ready(devices: Devices) -> Probes {
@@ -647,7 +681,7 @@ impl Probes {
             DeviceKind::StreamDeck => DeviceHealth::Ok, // reported by the deck itself
             DeviceKind::Lighting => probe(d.lights.status()).await,
             DeviceKind::MultiView => match &self.multiview {
-                Some(a) => multiview_health(a).await,
+                Some(mv) => multiview_health(mv),
                 None => DeviceHealth::Down("no MultiView set up".into()),
             },
         }
@@ -779,6 +813,8 @@ pub fn spawn_health_poll(
     tokio::spawn(
         async move {
             let mut last_routing = None;
+            // MultiView view labels sent and refused, so a refusal is not resent every poll.
+            let mut views_tried = std::collections::HashMap::new();
             let mut last_lighting = None;
             let mut last_audio = None;
             let mut stream_checked: Option<tokio::time::Instant> = None;
@@ -839,6 +875,7 @@ pub fn spawn_health_poll(
                     last_audio = Some(audio);
                 }
                 let routing = probes.read_routing(&c).await;
+                probes.name_views(&routing.0, &routing.2[Target::MultiView.index()].dests, &mut views_tried).await;
                 if last_routing.as_ref() != Some(&routing) {
                     let (labels, output_labels, targets, routes) = routing.clone();
                     let read = RoutingRead { labels, output_labels, targets, media: c.media_dest(), routes };

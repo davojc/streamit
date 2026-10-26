@@ -3,6 +3,7 @@
 //! The protocol is 0-based; this crate's public API (and the `Router` trait and the config)
 //! is 1-based, as the device front panel and Companion number things. Conversion happens
 //! only at the protocol boundary, in `format_route` and when reading routing blocks.
+pub mod multiview;
 pub mod probe;
 
 use async_trait::async_trait;
@@ -14,7 +15,7 @@ pub use streamit_blockproto::{Timings, parse_blocks};
 use streamit_core::devices::{DeviceError, LabelKind, Result, Router};
 
 const ROUTING: &str = "VIDEO OUTPUT ROUTING";
-const INPUT_LABELS: &str = "INPUT LABELS";
+pub(crate) const INPUT_LABELS: &str = "INPUT LABELS";
 const OUTPUT_LABELS: &str = "OUTPUT LABELS";
 const DEVICE: &str = "VIDEOHUB DEVICE";
 
@@ -205,11 +206,15 @@ impl Router for VideoHub {
 }
 
 fn apply_labels(labels: &Mutex<Labels>, kind: LabelKind, block: &Block) {
-    let mut l = labels.lock().unwrap_or_else(|e| e.into_inner());
+    apply_labels_into(labels.lock().unwrap_or_else(|e| e.into_inner()).map(kind), block);
+}
+
+/// A labels block's lines into `map` (1-based number -> label).
+pub(crate) fn apply_labels_into(map: &mut HashMap<u16, String>, block: &Block) {
     for line in &block.lines {
         let (n, text) = line.split_once(' ').unwrap_or((line.as_str(), ""));
         if let Ok(n) = n.trim().parse::<u16>() {
-            l.map(kind).insert(n.saturating_add(1), text.trim().to_string());
+            map.insert(n.saturating_add(1), text.trim().to_string());
         }
     }
 }
