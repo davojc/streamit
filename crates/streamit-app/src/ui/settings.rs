@@ -395,6 +395,17 @@ impl StreamItApp {
     /// answers, its active cue, and a row to fire a cue by hand.
     fn lighting_card(&mut self, ui: &mut Ui, snap: &Snapshot, simulating: bool) {
         theme::lbl(ui, "Lighting console (ETC Eos)");
+        let mut on = !self.draft.lighting.off;
+        if ui
+            .checkbox(&mut on, "Use lighting control")
+            .on_hover_text(
+                "Off: StreamIt sends the console nothing (scenes change only the hall screens) and, after a \
+                 restart, stops connecting to it.",
+            )
+            .changed()
+        {
+            self.draft.lighting.off = !on;
+        }
         sub(
             ui,
             "Optional. StreamIt talks OSC over TCP (port 3032). On the console, turn on OSC TCP and set \

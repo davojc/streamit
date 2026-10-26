@@ -233,12 +233,15 @@ impl MultiViewDevice {
 pub struct LightingConfig {
     pub address: Option<String>,
     pub framing: OscFraming,
+    /// Lighting control is turned off: StreamIt neither connects to the console nor sends
+    /// it anything, and scenes change only the hall screens.
+    pub off: bool,
 }
 
 impl LightingConfig {
-    /// A console is set up.
+    /// A console is set up and lighting control is on.
     pub fn is_set(&self) -> bool {
-        self.address.as_deref().is_some_and(|a| !a.trim().is_empty())
+        !self.off && self.address.as_deref().is_some_and(|a| !a.trim().is_empty())
     }
 }
 

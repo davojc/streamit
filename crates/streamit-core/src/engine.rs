@@ -939,6 +939,9 @@ impl Engine {
                 if list == 0 || cue.is_empty() {
                     return self.ignore(&cmd, "a cue needs a list (from 1) and a number");
                 }
+                if self.config().lighting.off {
+                    return self.ignore(&cmd, "lighting control is turned off");
+                }
                 info!(list, cue = %cue, "firing a lighting cue");
                 let (lights, snap) = (self.d.lights.clone(), self.snap.clone());
                 tokio::spawn(
@@ -1398,7 +1401,9 @@ impl Engine {
     fn fire_scene(&mut self, id: u32, keep_hall: bool, kept: &str) {
         let Some(scene) = scenes::find(&self.snap.borrow().scenes, id).cloned() else { return };
         let screens = scene.screens.filter(|_| !keep_hall);
-        let cue = scene.cue.clone().filter(|c| !c.cue.trim().is_empty());
+        // Lighting control turned off: the scene changes only the hall screens.
+        let lights_on = !self.config().lighting.off;
+        let cue = scene.cue.clone().filter(|c| lights_on && !c.cue.trim().is_empty());
         let mut line = format!("Scene · {}", scene.name);
         if keep_hall && scene.screens.is_some() {
             line.push_str(kept);
@@ -3900,7 +3905,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn firing_a_lighting_cue_logs_it_and_a_refusal_warns() {
         let (d, log, h) = rig();
-        let mut e = Engine::spawn(d, cfg(vec![]));
+        let c = cfg(vec![]);
+        let mut e = Engine::spawn(d, c.clone());
         send(&e, Command::FireLightingCue { list: 1, cue: " 5.5 ".into() }).await;
         until_call(&log, Call::LightsFireCue(1, "5.5".into())).await;
         until(&mut e, "the activity line", |s| s.activity.iter().any(|a| a.text == "Lighting · cue 1/5.5 fired")).await;
@@ -3912,6 +3918,16 @@ mod tests {
         send(&e, Command::Refresh).await;
         sleep(MS(200)).await;
         assert!(!log.calls().contains(&Call::LightsFireCue(0, "1".into())));
+        // Lighting control turned off: neither a cue by hand nor a scene's cue is sent.
+        c.write().unwrap().lighting.off = true;
+        let scenes = vec![scene(1, "Worship", Some(1), Some((1, "2")))];
+        send(&e, Command::SetScenes(scenes)).await;
+        send(&e, Command::FireLightingCue { list: 1, cue: "7".into() }).await;
+        send(&e, Command::GoScene(1)).await;
+        until_call(&log, Call::ScreensSetProgram(1)).await;
+        sleep(MS(200)).await;
+        assert!(!log.calls().contains(&Call::LightsFireCue(1, "7".into())));
+        assert!(!log.calls().contains(&Call::LightsFireCue(1, "2".into())));
     }
 
     #[tokio::test(start_paused = true)]

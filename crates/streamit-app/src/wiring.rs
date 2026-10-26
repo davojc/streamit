@@ -532,6 +532,7 @@ pub async fn build(c: &Config) -> Wired {
             streamit_eos::EosClient::connect(a, framing)
         }
         (true, Err(e)) => absent("Lighting console", e),
+        (false, _) if c.lighting.off => Absent::new("lighting control is turned off (Settings › Equipment)"),
         (false, _) => Absent::new("no lighting console set up (Settings › Equipment)"),
     };
     let (player, counter, tasks) = playout(c).await;
