@@ -192,6 +192,13 @@ impl SimRouter {
 
 #[async_trait]
 impl Router for SimRouter {
+    /// The pretend VideoHub has 40 outputs.
+    async fn routing_table(&self) -> Result<Vec<u16>> {
+        let w = self.sim.lock();
+        w.check_plugged(DeviceKind::VideoHub)?;
+        Ok((1..=40).map(|o| w.routes.get(&o).copied().unwrap_or(0)).collect())
+    }
+
     async fn route_of(&self, output: u16) -> Result<u16> {
         let w = self.sim.lock();
         w.check_plugged(DeviceKind::VideoHub)?;

@@ -6,6 +6,7 @@
 //! that is on program asks first. Right-clicking an ATEM input, a preset or a media pool
 //! slot sets up what StreamIt uses it for (see `setup`).
 mod setup;
+mod videohub;
 
 use super::StreamItApp;
 use crate::theme::{self, Kind};
@@ -36,8 +37,6 @@ const COL_W: f32 = 230.0;
 const GAP: f32 = 28.0;
 const CHIP_H: f32 = 24.0;
 const SLOT_H: f32 = 64.0;
-/// A row on the VideoHub sub-tab.
-const LABEL_ROW_H: f32 = 24.0;
 const MV_TILE_MAX_W: f32 = 290.0;
 const ATEM_TILE_MAX_W: f32 = 200.0;
 
@@ -84,6 +83,10 @@ pub(super) struct RtUi {
     on_air: Option<OnAir>,
     /// A preset clicked this frame: recalled once the frame is drawn.
     recall: Option<Recall>,
+    /// The input or output picked on the VideoHub sub-tab.
+    vh_pick: Option<videohub::Pick>,
+    /// The VideoHub name being edited (after a double-click).
+    vh_editing: Option<(LabelKind, u16)>,
 }
 
 impl RtUi {
@@ -111,6 +114,8 @@ impl Default for RtUi {
             clearing: None,
             on_air: None,
             recall: None,
+            vh_pick: None,
+            vh_editing: None,
         }
     }
 }
@@ -212,17 +217,7 @@ impl StreamItApp {
             ui.add_space(16.0);
             self.media_pool(ui, snap, target);
         }
-        // The input being dragged follows the pointer.
-        if let (Some(d), Some(pos)) =
-            (egui::DragAndDrop::payload::<InputDrag>(ui.ctx()), ui.ctx().pointer_interact_pos())
-        {
-            let painter = ui.ctx().layer_painter(egui::LayerId::new(Order::Tooltip, egui::Id::unique("rt-drag")));
-            let text = format!("{} · {}", d.0, routing.label(d.0));
-            let galley = painter.layout_no_wrap(text, theme::body_bold(14.0), Color32::WHITE);
-            let rect = Rect::from_center_size(pos - vec2(0.0, 28.0), galley.size() + vec2(20.0, 12.0));
-            painter.rect_filled(rect, 6.0, theme::BLUE_FILL);
-            painter.galley(rect.min + vec2(10.0, 6.0), galley, Color32::WHITE);
-        }
+        drag_ghost(ui, routing);
         self.take_routing_recall(snap);
         self.on_air_question(ui.ctx());
     }
@@ -762,138 +757,6 @@ fn cleared_label(n: u16) -> String {
 }
 
 impl StreamItApp {
-    /// Rename the VideoHub's inputs and outputs. A name goes to the VideoHub when its field
-    /// loses focus (Enter or a click elsewhere); Escape puts it back.
-    fn videohub_page(&mut self, ui: &mut Ui, snap: &Snapshot) {
-        let routing = &snap.routing;
-        theme::panel().inner_margin(20).show(ui, |ui| {
-            theme::lbl(ui, "VideoHub labels");
-            ui.label(
-                RichText::new(
-                    "The names the VideoHub shows on its front panel and in Videohub Setup. Change one and press \
-                     Enter (or click away): it goes to the VideoHub straight away, and StreamIt uses the new name \
-                     everywhere. Escape puts it back. × clears a name to its number (#5).",
-                )
-                .color(theme::SOFT),
-            );
-            ui.add_space(12.0);
-            let half = (ui.available_width() - GAP) / 2.0;
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = GAP;
-                for (kind, title, sub) in
-                    [(LabelKind::Input, "Inputs", "what comes in"), (LabelKind::Output, "Outputs", "what it feeds")]
-                {
-                    ui.allocate_ui_with_layout(vec2(half, 0.0), Layout::top_down(Align::Min), |ui| {
-                        ui.horizontal(|ui| {
-                            theme::lbl(ui, title);
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| theme::lbl(ui, sub));
-                        });
-                        ui.add_space(4.0);
-                        let count = port_count(routing.labels_of(kind));
-                        let (left, right) = input_columns(count);
-                        let col_w = (half - 12.0) / 2.0;
-                        ui.horizontal_top(|ui| {
-                            ui.spacing_mut().item_spacing.x = 12.0;
-                            for range in [left, right] {
-                                ui.allocate_ui_with_layout(vec2(col_w, 0.0), Layout::top_down(Align::Min), |ui| {
-                                    ui.spacing_mut().item_spacing.y = 4.0;
-                                    for n in range {
-                                        self.label_row(ui, routing, kind, n);
-                                    }
-                                });
-                            }
-                        });
-                    });
-                }
-            });
-            if let Some(w) = snap.last_warning.as_deref().filter(|w| w.starts_with("VideoHub")) {
-                ui.add_space(8.0);
-                ui.label(RichText::new(w).size(14.0).color(theme::AMBER_SOFT));
-            }
-        });
-    }
-
-    fn label_row(&mut self, ui: &mut Ui, routing: &RoutingState, kind: LabelKind, n: u16) {
-        let current =
-            n.checked_sub(1).and_then(|i| routing.labels_of(kind).get(i as usize)).cloned().unwrap_or_default();
-        let key = (kind, n);
-        let mut text = self.routes_ui.drafts.get(&key).cloned().unwrap_or_else(|| current.clone());
-        // One exact-width row: the number, the name, then (for an output) what it feeds.
-        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), LABEL_ROW_H), Sense::hover());
-        ui.painter().text(
-            row.left_center() + vec2(22.0, 0.0),
-            Align2::RIGHT_CENTER,
-            n.to_string(),
-            theme::mono_bold(12.0),
-            theme::DIM,
-        );
-        let fed = if kind == LabelKind::Output { routing.fed_by(n) } else { Vec::new() };
-        // The input the DeckLink player comes in on: StreamIt's video source.
-        let source = kind == LabelKind::Input
-            && n == self.config.read().unwrap_or_else(|e| e.into_inner()).videohub.decklink_input;
-        let badges_w = if source { 58.0 } else { fed.len() as f32 * 27.0 };
-        let field = Rect::from_min_max(row.min + vec2(30.0, 0.0), row.max - vec2(badges_w + CLEAR_W, 0.0));
-        let cleared = cleared_label(n);
-        let clear = Rect::from_min_size(egui::pos2(field.right() + 3.0, row.center().y - 10.0), vec2(20.0, 20.0));
-        let clear_r =
-            ui.put(clear, egui::Button::new(RichText::new("×").size(14.0).color(theme::MUTED)).frame(false).small());
-        if current != cleared && clear_r.on_hover_text(format!("Clear the label: it becomes {cleared}")).clicked() {
-            info!(?kind, n, "VideoHub: clearing a label from the window");
-            self.routes_ui.drafts.remove(&key);
-            self.send(Command::SetLabel { kind, n, text: cleared });
-            return;
-        }
-        let r = ui.put(
-            field,
-            egui::TextEdit::singleline(&mut text)
-                .id(egui::Id::unique(("vh-label", kind == LabelKind::Output, n)))
-                .hint_text(RichText::new("No label").size(13.0))
-                .font(egui::FontId::proportional(13.0))
-                .align(Align2::LEFT_CENTER)
-                .margin(vec2(6.0, 2.0))
-                .desired_width(f32::INFINITY)
-                .char_limit(40),
-        );
-        if source {
-            setup::badge(ui, egui::pos2(field.right() + CLEAR_W + 3.0, row.center().y - 8.0), "VIDEOS", setup::MEDIA);
-        }
-        if kind == LabelKind::Input {
-            r.context_menu(|ui| {
-                ui.label(RichText::new(format!("ROUTER INPUT {n}")).size(11.0).color(theme::MUTED));
-                if ui
-                    .add_enabled(!source, egui::Button::new("Mark as the video source"))
-                    .on_hover_text(
-                        "The DeckLink player's output. StreamIt routes this input to the Media input for a video.",
-                    )
-                    .clicked()
-                {
-                    info!(input = n, "VideoHub: video source marked");
-                    self.save_setup(move |c| c.videohub.decklink_input = n);
-                    ui.close();
-                }
-            });
-        }
-        for (k, (t, i)) in fed.into_iter().enumerate() {
-            let b = Rect::from_min_size(
-                egui::pos2(field.right() + CLEAR_W + 3.0 + k as f32 * 27.0, row.center().y - 8.0),
-                vec2(24.0, 16.0),
-            );
-            ui.painter().rect_filled(b, 4.0, colour(t, i));
-            ui.painter().text(b.center(), Align2::CENTER_CENTER, t.dest_key(i), theme::mono_bold(10.0), Color32::BLACK);
-        }
-        if r.has_focus() || r.changed() {
-            self.routes_ui.drafts.insert(key, text.clone());
-        }
-        if r.lost_focus() {
-            let escaped = ui.input(|i| i.key_pressed(egui::Key::Escape));
-            self.routes_ui.drafts.remove(&key);
-            if let Some(name) = label_to_send(&text, &current, escaped) {
-                info!(?kind, n, name = %name, "VideoHub: renaming from the window");
-                self.send(Command::SetLabel { kind, n, text: name });
-            }
-        }
-    }
-
     /// Which router output feeds each destination. A change applies and is saved at once.
     fn config_page(&mut self, ui: &mut Ui, snap: &Snapshot) {
         let routing = &snap.routing;
@@ -989,6 +852,18 @@ impl StreamItApp {
                 );
             }
         }
+    }
+}
+
+/// The input being dragged follows the pointer.
+fn drag_ghost(ui: &Ui, routing: &RoutingState) {
+    if let (Some(d), Some(pos)) = (egui::DragAndDrop::payload::<InputDrag>(ui.ctx()), ui.ctx().pointer_interact_pos()) {
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(Order::Tooltip, egui::Id::unique("rt-drag")));
+        let text = format!("{} · {}", d.0, routing.label(d.0));
+        let galley = painter.layout_no_wrap(text, theme::body_bold(14.0), Color32::WHITE);
+        let rect = Rect::from_center_size(pos - vec2(0.0, 28.0), galley.size() + vec2(20.0, 12.0));
+        painter.rect_filled(rect, 6.0, theme::BLUE_FILL);
+        painter.galley(rect.min + vec2(10.0, 6.0), galley, Color32::WHITE);
     }
 }
 

@@ -681,7 +681,7 @@ impl Probes {
     /// For each routing target: the router output feeding each destination (from `c`), the
     /// input on each (`None` when not fed or unreadable) and, for the ATEMs, their program
     /// and preview. Also the VideoHub's input labels.
-    pub async fn read_routing(&self, c: &Config) -> (Vec<String>, Vec<String>, [TargetRead; 3]) {
+    pub async fn read_routing(&self, c: &Config) -> (Vec<String>, Vec<String>, [TargetRead; 3], Vec<u16>) {
         let d = &self.devices;
         let mut reads: [TargetRead; 3] = Default::default();
         for t in Target::ALL {
@@ -700,7 +700,8 @@ impl Probes {
             reads[t.index()] = TargetRead { outputs, dests, program, preview, stills };
         }
         let inputs = d.hub.input_labels().await.unwrap_or_default();
-        (inputs, d.hub.output_labels().await.unwrap_or_default(), reads)
+        let routes = d.hub.routing_table().await.unwrap_or_default();
+        (inputs, d.hub.output_labels().await.unwrap_or_default(), reads, routes)
     }
 
     /// One read per device, all at once.
@@ -839,8 +840,8 @@ pub fn spawn_health_poll(
                 }
                 let routing = probes.read_routing(&c).await;
                 if last_routing.as_ref() != Some(&routing) {
-                    let (labels, output_labels, targets) = routing.clone();
-                    let read = RoutingRead { labels, output_labels, targets, media: c.media_dest() };
+                    let (labels, output_labels, targets, routes) = routing.clone();
+                    let read = RoutingRead { labels, output_labels, targets, media: c.media_dest(), routes };
                     if tx.send(Command::RoutingRead(Box::new(read))).await.is_err() {
                         return;
                     }
@@ -1139,7 +1140,7 @@ mod tests {
         c.multiview.outputs = vec![37, 0, 39, 40];
         c.videohub.input8_output = 11;
         let p = Probes::new(d, Late::new("x"), Late::new("x"));
-        let (labels, output_labels, reads) = p.read_routing(&c).await;
+        let (labels, output_labels, reads, _routes) = p.read_routing(&c).await;
         assert!(labels.is_empty() && output_labels.is_empty());
         let mv = &reads[Target::MultiView.index()];
         assert_eq!(mv.dests, vec![Some(6), None, Some(12), None], "output 40 reads 0: nothing routed");

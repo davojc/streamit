@@ -90,6 +90,12 @@ pub enum Command {
         dest: usize,
         input: u16,
     },
+    /// Show `input` on VideoHub `output` (both 1-based), from the VideoHub page. Refused
+    /// when the output feeds a locked destination (the Media input during a sequence).
+    RouteOutput {
+        output: u16,
+        input: u16,
+    },
     /// Route `target` to the preset in `slot` (1..=8).
     RecallPreset(Target, u8),
     /// Replace a target's presets (after a save or a clear in the window).
@@ -848,6 +854,40 @@ impl Engine {
                 let what = format!("{} {}: input {input}", target.name(), target.dest_name(dest));
                 self.route_dests(target, vec![(dest, input)], what);
             }
+            Command::RouteOutput { output, input } => {
+                let (output, input) = (*output, *input);
+                if output == 0 || input == 0 {
+                    return self.ignore(&cmd, "no such output or input");
+                }
+                let fed = self.snap.borrow().routing.fed_by(output);
+                if let Some(why) = fed.iter().find_map(|&(t, d)| self.locked_why(t, d)) {
+                    set_warning(&self.snap, why.clone());
+                    return self.ignore(&cmd, &why);
+                }
+                info!(output, input, "routing a VideoHub output");
+                let (hub, snap) = (self.d.hub.clone(), self.snap.clone());
+                tokio::spawn(
+                    async move {
+                        match hub.route(output, input).await {
+                            Ok(()) => snap.send_modify(|s| {
+                                s.routing.set_route(output, input);
+                                for (t, d) in fed {
+                                    let state = s.routing.target_mut(t);
+                                    if state.dests.len() < t.size() {
+                                        state.dests.resize(t.size(), None);
+                                    }
+                                    state.dests[d] = Some(input);
+                                }
+                            }),
+                            Err(e) => set_warning(
+                                &snap,
+                                format!("VideoHub output {output}: could not route input {input}: {e}"),
+                            ),
+                        }
+                    }
+                    .in_current_span(),
+                );
+            }
             Command::RecallPreset(target, slot) => {
                 let target = *target;
                 let (p, mut routes) = {
@@ -1004,9 +1044,12 @@ impl Engine {
                 self.set(|s| s.lighting = status);
             }
             Command::RoutingRead(read) => {
-                let RoutingRead { labels, output_labels, targets, media } = (**read).clone();
+                let RoutingRead { labels, output_labels, targets, media, routes } = (**read).clone();
                 self.set(|s| {
                     s.routing.media = media;
+                    if !routes.is_empty() {
+                        s.routing.routes = routes;
+                    }
                     for (state, read) in s.routing.targets.iter_mut().zip(targets) {
                         state.outputs = read.outputs;
                         state.dests = read.dests;
@@ -1056,6 +1099,7 @@ impl Engine {
                 for (dest, input) in routes {
                     match hub.route(outputs[dest], input).await {
                         Ok(()) => snap.send_modify(|s| {
+                            s.routing.set_route(outputs[dest], input);
                             let t = s.routing.target_mut(target);
                             if t.dests.len() < target.size() {
                                 t.dests.resize(target.size(), None);
@@ -2011,6 +2055,7 @@ fn routing_from(c: &Config) -> RoutingState {
         labels: Vec::new(),
         output_labels: Vec::new(),
         media: c.media_dest(),
+        routes: Vec::new(),
         targets: Target::ALL.map(|t| TargetState {
             outputs: c.routing_outputs(t),
             dests: vec![None; t.size()],
@@ -3681,7 +3726,13 @@ mod tests {
             preview: None,
             stills: vec![],
         };
-        Command::RoutingRead(Box::new(RoutingRead { labels: vec![], output_labels: vec![], targets, media: Some(7) }))
+        Command::RoutingRead(Box::new(RoutingRead {
+            labels: vec![],
+            output_labels: vec![],
+            targets,
+            media: Some(7),
+            routes: vec![],
+        }))
     }
 
     fn hub_routes(log: &CallLog) -> Vec<Call> {
@@ -3698,6 +3749,29 @@ mod tests {
         assert_eq!(s.routing.target(Target::MultiView).dests, vec![None, None, Some(12), None]);
         send(&e, Command::Route { target: Target::StreamAtem, dest: 3, input: 25 }).await;
         until_call(&log, Call::HubRoute { output: 4, input: 25 }).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_output_routes_from_the_videohub_page_unless_it_feeds_a_locked_input() {
+        let (d, log, _h) = rig();
+        let c = rt_cfg();
+        c.write().unwrap().videohub.input8_output = OUT;
+        let mut e = Engine::spawn(d, c);
+        // An output that feeds nothing StreamIt knows.
+        send(&e, Command::RouteOutput { output: 25, input: 7 }).await;
+        until_call(&log, Call::HubRoute { output: 25, input: 7 }).await;
+        let s = until(&mut e, "output 25 on input 7", |s| s.routing.route(25) == Some(7)).await;
+        assert_eq!(s.routing.outputs_of(7), vec![25]);
+        // An output that feeds a MultiView view: the view shows it too.
+        send(&e, Command::RouteOutput { output: 38, input: 12 }).await;
+        until(&mut e, "view 1 on input 12", |s| s.routing.target(Target::MultiView).dest(1) == Some(12)).await;
+        // The Media input's output, while a sequence runs: refused.
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        send(&e, Command::RouteOutput { output: OUT, input: 3 }).await;
+        until(&mut e, "locked", |s| s.last_warning.as_deref().is_some_and(|w| w.contains("carries StreamIt's videos")))
+            .await;
+        assert!(!log.calls().contains(&Call::HubRoute { output: OUT, input: 3 }));
     }
 
     #[tokio::test(start_paused = true)]

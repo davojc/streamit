@@ -197,9 +197,31 @@ pub struct RoutingState {
     pub targets: [TargetState; 3],
     /// The Stream ATEM's Media input as a destination index (`Config::media_dest`).
     pub media: Option<usize>,
+    /// The VideoHub input on every output; index 0 is output 1, 0 where not known.
+    pub routes: Vec<u16>,
 }
 
 impl RoutingState {
+    /// The input on `output` now, if known.
+    pub fn route(&self, output: u16) -> Option<u16> {
+        let i = usize::from(output).checked_sub(1)?;
+        self.routes.get(i).copied().filter(|&n| n != 0)
+    }
+
+    /// The outputs showing `input` now, in order.
+    pub fn outputs_of(&self, input: u16) -> Vec<u16> {
+        (1..=self.routes.len() as u16).filter(|&o| self.route(o) == Some(input)).collect()
+    }
+
+    /// Note that `output` now shows `input`.
+    pub fn set_route(&mut self, output: u16, input: u16) {
+        let Some(i) = usize::from(output).checked_sub(1) else { return };
+        if self.routes.len() <= i {
+            self.routes.resize(i + 1, 0);
+        }
+        self.routes[i] = input;
+    }
+
     pub fn target(&self, t: Target) -> &TargetState {
         &self.targets[t.index()]
     }
@@ -283,6 +305,8 @@ pub struct RoutingRead {
     pub output_labels: Vec<String>,
     pub targets: [TargetRead; 3],
     pub media: Option<usize>,
+    /// The input on every output, as `RoutingState::routes`; empty when not read.
+    pub routes: Vec<u16>,
 }
 
 /// `presets` with `p` in its slot (replacing what was there), in slot order.
