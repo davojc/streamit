@@ -178,6 +178,28 @@ fn prepared_offers_the_countdown_and_start_now_at_once() {
 }
 
 #[test]
+fn abandon_asks_first_while_prepared_or_counting_down_and_youtube_is_private() {
+    for stage in [Stage::Prepared(Readiness::Ready), CD] {
+        let s = Snapshot { stage, ..Snapshot::default() };
+        assert_eq!(press_for(Page::Service, ABANDON, &s), Some(Press::Ask(Asked::Abandon)));
+        assert_eq!(appearance(Page::Service, ABANDON, &s, true).text, "ABANDON");
+        assert_eq!(press_for(Page::Service, CONFIRM_ABANDON, &s), Some(Press::Confirm(Asked::Abandon)));
+        let on = appearance_with(Page::Service, CONFIRM_ABANDON, &s, true, None, Some(Asked::Abandon));
+        assert_eq!((on.text.as_str(), on.blink), ("CONFIRM\nABANDON", true));
+        // Going public: no abandoning, and no stopping the countdown.
+        let public = Snapshot { public_started: true, ..s };
+        assert_eq!(press_for(Page::Service, ABANDON, &public), None);
+        assert_eq!(appearance(Page::Service, ABANDON, &public, true), blank());
+    }
+    assert_eq!(Asked::Abandon.command(), Command::Abandon);
+    let going = Snapshot { stage: CD, public_started: true, ..Snapshot::default() };
+    assert_eq!(cmd(Page::Service, 9, &going), None);
+    assert_eq!(appearance(Page::Service, 9, &going, true), blank());
+    // Not before the service.
+    assert_eq!(press_for(Page::Service, ABANDON, &Snapshot::default()), None);
+}
+
+#[test]
 fn the_countdown_page_starts_now_stops_or_goes_public() {
     let s = Snapshot { stage: CD, ..Snapshot::default() };
     assert_eq!(cmd(Page::Service, 8, &s), Some(Command::GoLive));

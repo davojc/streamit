@@ -58,6 +58,8 @@ pub enum Asked {
     EndService,
     /// Start service now from Idle: nothing has been prepared.
     StartNow,
+    /// Back to Idle from Prepared or the countdown.
+    Abandon,
 }
 
 impl Asked {
@@ -66,6 +68,7 @@ impl Asked {
         match self {
             Asked::EndService => CONFIRM_END,
             Asked::StartNow => CONFIRM_START,
+            Asked::Abandon => CONFIRM_ABANDON,
         }
     }
 
@@ -74,6 +77,7 @@ impl Asked {
         match self {
             Asked::EndService => Command::EndService,
             Asked::StartNow => Command::GoLive,
+            Asked::Abandon => Command::Abandon,
         }
     }
 }
@@ -110,6 +114,10 @@ const END_BROADCAST: u8 = 14;
 const RECOVER: u8 = 15;
 /// Below START SERVICE NOW, when it asks first.
 pub const CONFIRM_START: u8 = 19;
+/// Prepared or counting down, while YouTube is still private.
+const ABANDON: u8 = 13;
+/// Below ABANDON.
+pub const CONFIRM_ABANDON: u8 = 21;
 // Service, countdown.
 const CD_START_NOW: u8 = 8;
 const STOP_COUNTDOWN: u8 = 9;
@@ -308,11 +316,16 @@ fn service_press(key: u8, snap: &Snapshot) -> Option<Press> {
             COUNTDOWN => cmd(Command::Countdown),
             START_NOW => cmd(Command::GoLive),
             RECOVER if offered(snap, Offer::Recover) => cmd(Command::Recover),
+            ABANDON if snap.can_abandon() => Some(Press::Ask(Asked::Abandon)),
+            CONFIRM_ABANDON => Some(Press::Confirm(Asked::Abandon)),
             _ => None,
         },
         ServiceStep::Countdown => match key {
             CD_START_NOW => cmd(Command::GoLive),
-            STOP_COUNTDOWN => cmd(Command::StopCountdown),
+            // Once YouTube is going public the service goes on.
+            STOP_COUNTDOWN if !snap.public_before_live() => cmd(Command::StopCountdown),
+            ABANDON if snap.can_abandon() => Some(Press::Ask(Asked::Abandon)),
+            CONFIRM_ABANDON => Some(Press::Confirm(Asked::Abandon)),
             // A redundant transition is harmless.
             GO_PUBLIC => cmd(Command::GoPublic),
             _ => None,
@@ -461,6 +474,7 @@ pub fn appearance_with(
         let text = match a {
             Asked::EndService => "CONFIRM\nEND",
             Asked::StartNow => "CONFIRM\nSTART",
+            Asked::Abandon => "CONFIRM\nABANDON",
         };
         return blinking(look(text, RED, WHITE), blink_phase);
     }
@@ -518,6 +532,8 @@ fn service_look(key: u8, snap: &Snapshot, phase: bool) -> KeyLook {
     };
     let start_now =
         |snap: &Snapshot| action("START\nSERVICE\nNOW", RED, WHITE, true, Some(FlashKey::GoLive), snap, phase);
+    let abandon =
+        |snap: &Snapshot| if snap.can_abandon() { look("ABANDON", Rgb(120, 30, 30), WHITE) } else { blank() };
     match service_step(&snap.stage) {
         ServiceStep::Before => match key {
             PREPARE => look("PREPARE", BLUE, WHITE),
@@ -531,11 +547,14 @@ fn service_look(key: u8, snap: &Snapshot, phase: bool) -> KeyLook {
             COUNTDOWN => look("START\nCOUNT\nDOWN", AMBER, BLACK),
             START_NOW => start_now(snap),
             RECOVER => recover(snap),
+            ABANDON => abandon(snap),
             _ => blank(),
         },
         ServiceStep::Countdown => match key {
             CD_START_NOW => start_now(snap),
+            STOP_COUNTDOWN if snap.public_before_live() => blank(),
             STOP_COUNTDOWN => look("STOP\nCOUNT\nDOWN", AMBER, BLACK),
+            ABANDON => abandon(snap),
             GO_PUBLIC => {
                 let public = matches!(snap.stage, Stage::Countdown { public: true, .. });
                 if public { dim("PUBLIC") } else { look("GO\nPUBLIC\nNOW", Rgb(0, 110, 160), WHITE) }

@@ -172,6 +172,8 @@ pub struct StreamItApp {
     unsaved_ok: bool,
     /// "Start service now" from Idle was clicked once in the More menu: the next click sends it.
     confirm_start_now: bool,
+    /// Abandon was clicked once, at this time: a second click within `CONFIRM_FOR` does it.
+    confirm_abandon: Option<std::time::Instant>,
     /// End service was pressed: the window asks before ending.
     confirm_end: bool,
     /// The reply typed in the live chat panel.
@@ -284,6 +286,7 @@ impl StreamItApp {
             confirm_unsaved: false,
             unsaved_ok: false,
             confirm_start_now: false,
+            confirm_abandon: None,
             confirm_end: false,
             chat_reply: String::new(),
             scene_sel: None,

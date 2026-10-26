@@ -99,9 +99,13 @@ impl StreamItApp {
                             if theme::big_button(ui, "Start service now", Kind::Danger, true).clicked() {
                                 app.send(Command::GoLive);
                             }
-                            if theme::big_button(ui, "Stop countdown", Kind::WarnOutline, true).clicked() {
+                            // Once YouTube is going public the service goes on: no stopping.
+                            if !snap.public_before_live()
+                                && theme::big_button(ui, "Stop countdown", Kind::WarnOutline, true).clicked()
+                            {
                                 app.send(Command::StopCountdown);
                             }
+                            app.abandon_button(ui, snap);
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(
@@ -128,13 +132,17 @@ impl StreamItApp {
                     } else {
                         "The countdown video stops and the hall goes back to what it showed."
                     };
-                    ui.label(
-                        RichText::new(format!(
-                            "{back} YouTube stays as it is. Start service then goes live straight away."
-                        ))
-                        .size(15.0)
-                        .color(theme::SOFT),
-                    );
+                    let text = if snap.public_before_live() {
+                        "YouTube is going public, so the countdown can no longer be stopped or abandoned: the \
+                         service goes on. Start service now skips the rest of the video, and End Service ends it."
+                            .to_string()
+                    } else {
+                        format!(
+                            "{back} YouTube stays as it is. Start service then goes live straight away. Abandon \
+                             also stops the Web Presenter and goes back to the start."
+                        )
+                    };
+                    ui.label(RichText::new(text).size(15.0).color(theme::SOFT));
                 });
                 if v.show_retry_public {
                     theme::panel().stroke(egui::Stroke::new(1.0, theme::AMBER_PANEL_BORDER)).show(ui, |ui| {

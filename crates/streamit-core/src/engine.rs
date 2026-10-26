@@ -59,6 +59,10 @@ pub enum Command {
     Prepare,
     Countdown,
     StopCountdown,
+    /// Back to Idle from Prepared or the countdown: the countdown stops as with Stop,
+    /// and the encoder stops. YouTube is left as it is. Refused once the broadcast is
+    /// going public: then the service goes on, and End Service ends it.
+    Abandon,
     GoPublic,
     GoLive,
     EndService,
@@ -209,6 +213,22 @@ pub struct Snapshot {
     /// How far the steps of Prepare, the countdown and End Service have got this service.
     /// Prepare starts them all again; the countdown and End Service their own.
     pub steps: Vec<Step>,
+    /// Going public has started this service, by the countdown or by hand. The end of the
+    /// service clears it.
+    pub public_started: bool,
+}
+
+impl Snapshot {
+    /// The broadcast has gone public (or is going public) before the service is live:
+    /// from then on the service only goes on, to Start service now and End Service.
+    pub fn public_before_live(&self) -> bool {
+        matches!(self.stage, Stage::Prepared(_) | Stage::Countdown { .. }) && self.public_started
+    }
+
+    /// Abandon can be pressed: prepared or counting down, still private.
+    pub fn can_abandon(&self) -> bool {
+        matches!(self.stage, Stage::Prepared(_) | Stage::Countdown { .. }) && !self.public_before_live()
+    }
 }
 
 /// How far the playing roll-in is.
@@ -267,6 +287,7 @@ impl Default for Snapshot {
             scenes: Vec::new(),
             active_scene: None,
             steps: Vec::new(),
+            public_started: false,
         }
     }
 }
@@ -309,6 +330,7 @@ enum Job {
     /// Start service now by hand: T-0, going public alongside it unless already public.
     GoLive(GoLiveStart),
     Recover,
+    Abandon,
 }
 
 impl Job {
@@ -321,6 +343,7 @@ impl Job {
             Job::Test { .. } => "a test play",
             Job::GoLive(_) => "Go Live",
             Job::Recover => "Recover",
+            Job::Abandon => "Abandon",
         }
     }
 }
@@ -369,6 +392,8 @@ enum Done {
         ok: bool,
         assessment: Assessment,
     },
+    /// The encoder's stop.
+    Abandoned(devices::Result<()>),
 }
 
 struct Refreshed {
@@ -421,6 +446,8 @@ pub struct Engine {
     sel_gen: u64,
     /// Go Live is waiting for the countdown it pre-empted to run its cancel path.
     golive_pending: bool,
+    /// Abandon is waiting for the countdown it stopped to run its cancel path.
+    abandon_pending: bool,
     /// Recover / End Service are waiting for the running video's return path
     /// (Recover first, then End).
     recover_pending: bool,
@@ -484,6 +511,7 @@ impl Engine {
             epoch: 0,
             sel_gen: 0,
             golive_pending: false,
+            abandon_pending: false,
             recover_pending: false,
             end_pending: false,
             flash_gen: 0,
@@ -624,6 +652,9 @@ impl Engine {
                 }
                 self.start_countdown(before);
             }
+            Command::StopCountdown if self.snap.borrow().public_before_live() => {
+                self.ignore(&cmd, "the broadcast is going public: the service goes on")
+            }
             Command::StopCountdown => match &self.running {
                 Some(Running { job: Job::Countdown { cancel }, .. }) if !self.golive_pending => cancel.cancel(),
                 Some(Running { job: Job::Countdown { .. }, .. }) => {
@@ -678,7 +709,36 @@ impl Engine {
                 Some(Running { job: Job::Video { unmute, .. }, .. }) => unmute.notify_one(),
                 _ => self.ignore(&cmd, "no video is playing"),
             },
-            Command::GoPublic => self.spawn_go_public(),
+            Command::Abandon => {
+                let (public, can) = {
+                    let s = self.snap.borrow();
+                    (s.public_before_live(), s.can_abandon())
+                };
+                if public {
+                    return self.ignore(&cmd, "the broadcast is going public: the service goes on");
+                }
+                if !can {
+                    return self.ignore(&cmd, "nothing is prepared or counting down");
+                }
+                match &self.running {
+                    None => self.start_abandon(),
+                    Some(Running { job: Job::Countdown { cancel }, .. })
+                        if !self.golive_pending && !self.abandon_pending =>
+                    {
+                        info!("Abandon during the countdown: stopping the countdown first");
+                        cancel.cancel();
+                        self.abandon_pending = true;
+                    }
+                    Some(r) => {
+                        let why = format!("{} is running", r.job.name());
+                        self.ignore(&cmd, &why);
+                    }
+                }
+            }
+            Command::GoPublic => {
+                self.set(|s| s.public_started = true);
+                self.spawn_go_public();
+            }
             Command::EndBroadcast => self.spawn_end_broadcast(),
             Command::GoLive => {
                 // R22: the deck lets Go Live be pressed in Idle/Prepared/Countdown; the
@@ -695,7 +755,9 @@ impl Engine {
                 }
                 match &self.running {
                     None => self.start_golive(None),
-                    Some(Running { job: Job::Countdown { cancel }, .. }) if !self.golive_pending => {
+                    Some(Running { job: Job::Countdown { cancel }, .. })
+                        if !self.golive_pending && !self.abandon_pending =>
+                    {
                         info!("Go Live during the countdown: stopping the countdown first");
                         cancel.cancel();
                         self.golive_pending = true;
@@ -1126,6 +1188,27 @@ impl Engine {
         self.begin(Job::Countdown { cancel }, handle);
     }
 
+    fn start_abandon(&mut self) {
+        let d = self.d.clone();
+        let handle = tokio::spawn(async move { Done::Abandoned(d.encoder.stop().await) }.in_current_span());
+        self.begin(Job::Abandon, handle);
+    }
+
+    /// Back to Idle with nothing started; YouTube is left as it is (still private, so
+    /// Prepare can use the same broadcast again).
+    fn finish_abandon(&mut self, stopped: devices::Result<()>) {
+        self.set(|s| {
+            set_stage(s, Stage::Idle);
+            s.steps.clear();
+            remove(&mut s.offers, Offer::GoLive);
+            remove(&mut s.offers, Offer::GoPublic);
+            log(s, "Service abandoned".into());
+            if let Err(e) = &stopped {
+                warn_in(s, format!("Could not stop the encoder: {e}"));
+            }
+        });
+    }
+
     fn start_end(&mut self) {
         let skip = Arc::new(Notify::new());
         let (d, c, snap, bid, s2) = (self.d.clone(), self.config(), self.snap.clone(), self.bid(), skip.clone());
@@ -1380,6 +1463,7 @@ impl Engine {
             Ok(Done::Video { index, outcome }) => self.finish_video(index, outcome),
             Ok(Done::Tested { name, outcome }) => self.finish_test(&name, outcome),
             Ok(Done::WentLive { result, public, start }) => self.finish_golive(result, public, start),
+            Ok(Done::Abandoned(r)) => self.finish_abandon(r),
             Ok(Done::Recovered { ok, assessment }) => {
                 if ok {
                     self.set(|s| {
@@ -1428,6 +1512,7 @@ impl Engine {
 
     fn finish_countdown(&mut self, result: devices::Result<CountdownOutcome>, public: bool, before: Stage) {
         let golive = std::mem::take(&mut self.golive_pending);
+        let abandon = std::mem::take(&mut self.abandon_pending);
         match result {
             // Reached T-0 by itself (even if Go Live was pressed meanwhile): no second t0.
             Ok(CountdownOutcome::Live { public, mics_failed }) => self.set(|s| {
@@ -1447,6 +1532,10 @@ impl Engine {
             Ok(CountdownOutcome::Stopped) if golive => {
                 self.set(|s| set_stage(s, Stage::Prepared(Readiness::Waiting("Going live".into()))));
                 self.start_golive(Some(public));
+            }
+            Ok(CountdownOutcome::Stopped) if abandon => {
+                self.set(|s| log(s, "Countdown stopped".into()));
+                self.start_abandon();
             }
             // R22: Go Live (and Go Public, if the countdown had not gone public) stay offered.
             Ok(CountdownOutcome::Stopped) => self.set(|s| {
@@ -1592,7 +1681,10 @@ impl Engine {
                         remove(&mut s.offers, Offer::GoPublic);
                         log(s, golive::public_note(start.elapsed()));
                     }),
-                    Err(e) => set_warning(&snap, format!("Could not make the YouTube broadcast public: {e}")),
+                    Err(e) => snap.send_modify(|s| {
+                        s.public_started = false;
+                        warn_in(s, format!("Could not make the YouTube broadcast public: {e}"));
+                    }),
                 }
             }
             .in_current_span(),
@@ -1783,7 +1875,10 @@ fn set_stage(s: &mut Snapshot, stage: Stage) {
     }
     match stage {
         Stage::Live if s.on_air_since.is_none() => s.on_air_since = Some(SystemTime::now()),
-        Stage::Ended => s.on_air_since = None,
+        Stage::Ended => {
+            s.on_air_since = None;
+            s.public_started = false;
+        }
         _ => {}
     }
     s.stage = stage;
@@ -1796,7 +1891,12 @@ fn log(s: &mut Snapshot, text: String) {
 }
 
 fn set_step(snap: &Shared, id: StepId, m: StepMark) {
-    snap.send_modify(|s| steps::mark(&mut s.steps, id, m));
+    snap.send_modify(|s| {
+        if id == StepId::YouTubePublic {
+            s.public_started = matches!(m, StepMark::Now(_) | StepMark::Done(_));
+        }
+        steps::mark(&mut s.steps, id, m)
+    });
 }
 
 /// Show `msg` as the warning and record it in the activity list.
@@ -2255,6 +2355,62 @@ mod tests {
         send(&e, Command::Countdown).await;
         until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
         assert_eq!(count(&log, |c| matches!(c, Call::PlayerLoad(..))), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandon_from_prepared_stops_the_encoder_and_goes_back_to_idle() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Prepare).await;
+        until(&mut e, "Prepared(Ready)", |s| s.stage == Stage::Prepared(Readiness::Ready)).await;
+        assert!(snap(&e).can_abandon());
+        send(&e, Command::Abandon).await;
+        let s = until(&mut e, "Idle", |s| s.stage == Stage::Idle && s.job.is_none()).await;
+        assert!(s.steps.is_empty(), "{:?}", s.steps);
+        assert!(log.calls().ends_with(&[Call::EncoderStop]), "{:?}", log.calls());
+        // YouTube is left as it is.
+        assert_eq!(count(&log, |c| *c == Call::YtTransition(Phase::Complete)), 0);
+        // A new service can be prepared.
+        send(&e, Command::Prepare).await;
+        until(&mut e, "Prepared again", |s| s.stage == Stage::Prepared(Readiness::Ready)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandon_during_the_countdown_stops_it_then_goes_back_to_idle() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Prepare).await;
+        until(&mut e, "Prepared(Ready)", |s| s.stage == Stage::Prepared(Readiness::Ready)).await;
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        send(&e, Command::Abandon).await;
+        let s = until(&mut e, "Idle", |s| s.stage == Stage::Idle && s.job.is_none()).await;
+        assert!(!s.offers.contains(&Offer::GoLive) && !s.offers.contains(&Offer::GoPublic), "{:?}", s.offers);
+        let calls = log.calls();
+        let stop = calls.iter().position(|c| *c == Call::PlayerStop).expect("the countdown video stopped");
+        let enc = calls.iter().position(|c| *c == Call::EncoderStop).expect("the encoder stopped");
+        assert!(stop < enc, "{calls:?}");
+        assert_eq!(count(&log, |c| matches!(c, Call::YtTransition(_))), 1, "only Prepare's testing: {calls:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn once_going_public_the_countdown_cannot_be_abandoned_or_stopped() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        send(&e, Command::Prepare).await;
+        until(&mut e, "Prepared(Ready)", |s| s.stage == Stage::Prepared(Readiness::Ready)).await;
+        send(&e, Command::Countdown).await;
+        until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        send(&e, Command::GoPublic).await;
+        until_call(&log, Call::YtTransition(Phase::Live)).await;
+        let s = snap(&e);
+        assert!(s.public_before_live() && !s.can_abandon());
+        send(&e, Command::Abandon).await;
+        send(&e, Command::StopCountdown).await;
+        sleep(Duration::from_secs(2)).await;
+        assert!(matches!(snap(&e).stage, Stage::Countdown { .. }), "{:?}", snap(&e).stage);
+        assert!(!log.calls().contains(&Call::EncoderStop));
+        assert!(!log.calls().contains(&Call::PlayerStop));
     }
 
     #[tokio::test(start_paused = true)]

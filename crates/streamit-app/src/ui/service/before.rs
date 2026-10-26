@@ -79,6 +79,7 @@ impl StreamItApp {
                         if theme::big_button(ui, "Start service now", Kind::DangerOutline, !busy).clicked() {
                             self.send(Command::GoLive);
                         }
+                        self.abandon_button(ui, snap);
                         deck_hint(ui, "START COUNTDOWN", "Service page, row 2, key 2");
                     }
                     // S6: Recover before Prepare, which would put the still on air.

@@ -83,6 +83,38 @@ impl StreamItApp {
         });
     }
 
+    /// Abandon, while the service is prepared or counting down and YouTube is still
+    /// private. It takes a second click within `CONFIRM_FOR`, like the deck's CONFIRM.
+    fn abandon_button(&mut self, ui: &mut Ui, snap: &Snapshot) {
+        const CONFIRM_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+        let asked = self.confirm_abandon.filter(|t| t.elapsed() < CONFIRM_FOR);
+        if !snap.can_abandon() || asked.is_none() {
+            self.confirm_abandon = None;
+        }
+        if !snap.can_abandon() {
+            return;
+        }
+        // While the countdown runs its job is the countdown, which Abandon stops.
+        let enabled = snap.job.is_none() || matches!(snap.stage, Stage::Countdown { .. });
+        let text = if asked.is_some() { "Click again to abandon" } else { "Abandon" };
+        let r = theme::big_button(ui, text, Kind::DangerOutline, enabled);
+        let r = r.on_hover_text(
+            "Back to the start: the countdown stops and the Web Presenter stops. YouTube stays private, so you can \
+             prepare again.",
+        );
+        if r.clicked() {
+            if asked.is_some() {
+                self.confirm_abandon = None;
+                self.send(Command::Abandon);
+            } else {
+                self.confirm_abandon = Some(std::time::Instant::now());
+            }
+        }
+        if let Some(t) = self.confirm_abandon {
+            ui.ctx().request_repaint_after(CONFIRM_FOR.saturating_sub(t.elapsed()));
+        }
+    }
+
     /// The commands with no place on the current screen, so the window can do everything
     /// the Stream Deck can when the deck is down.
     pub(in crate::ui) fn more_menu(&mut self, ui: &mut Ui, snap: &Snapshot) {
