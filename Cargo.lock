@@ -4264,7 +4264,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "streamit-app"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4301,7 +4301,7 @@ dependencies = [
 
 [[package]]
 name = "streamit-atem"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4312,7 +4312,7 @@ dependencies = [
 
 [[package]]
 name = "streamit-blockproto"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "streamit-core",
  "tokio",
@@ -4321,7 +4321,7 @@ dependencies = [
 
 [[package]]
 name = "streamit-core"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4336,7 +4336,7 @@ dependencies = [
 
 [[package]]
 name = "streamit-deck"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -4349,7 +4349,7 @@ dependencies = [
 
 [[package]]
 name = "streamit-eos"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-trait",
  "streamit-core",
@@ -4359,7 +4359,7 @@ dependencies = [
 
 [[package]]
 name = "streamit-playout"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4373,7 +4373,7 @@ dependencies = [
 
 [[package]]
 name = "streamit-sim"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-trait",
  "mp4",
@@ -4385,7 +4385,7 @@ dependencies = [
 
 [[package]]
 name = "streamit-videohub"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4397,7 +4397,7 @@ dependencies = [
 
 [[package]]
 name = "streamit-webpresenter"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4408,7 +4408,7 @@ dependencies = [
 
 [[package]]
 name = "streamit-youtube"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "async-trait",
