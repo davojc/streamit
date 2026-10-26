@@ -176,6 +176,12 @@ fn fader_hundredths(db: f32) -> Result<i32> {
 
 #[async_trait]
 impl Switcher for AtemClient {
+    fn stills(&self) -> Vec<Option<String>> {
+        let s = self.shared.borrow();
+        let len = s.state.stills.keys().next_back().map_or(0, |&i| usize::from(i) + 1);
+        (0..len).map(|i| s.state.stills.get(&(i as u16)).cloned().flatten()).collect()
+    }
+
     async fn program(&self) -> Result<u16> {
         self.read(|s| {
             s.program.get(&ME).copied().ok_or_else(|| DeviceError::Other("atem reported no program input".into()))

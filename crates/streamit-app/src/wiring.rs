@@ -690,12 +690,14 @@ impl Probes {
             for &out in &outputs {
                 dests.push(if out == 0 { None } else { d.hub.route_of(out).await.ok().filter(|&i| i != 0) });
             }
-            let (program, preview) = match t {
-                Target::MultiView => (None, None),
-                Target::StreamAtem => (d.stream.program().await.ok(), d.stream.preview().await.ok()),
-                Target::ScreensAtem => (d.screens.program().await.ok(), d.screens.preview().await.ok()),
+            let (program, preview, stills) = match t {
+                Target::MultiView => (None, None, Vec::new()),
+                Target::StreamAtem => (d.stream.program().await.ok(), d.stream.preview().await.ok(), d.stream.stills()),
+                Target::ScreensAtem => {
+                    (d.screens.program().await.ok(), d.screens.preview().await.ok(), d.screens.stills())
+                }
             };
-            reads[t.index()] = TargetRead { outputs, dests, program, preview };
+            reads[t.index()] = TargetRead { outputs, dests, program, preview, stills };
         }
         let inputs = d.hub.input_labels().await.unwrap_or_default();
         (inputs, d.hub.output_labels().await.unwrap_or_default(), reads)
@@ -838,7 +840,7 @@ pub fn spawn_health_poll(
                 let routing = probes.read_routing(&c).await;
                 if last_routing.as_ref() != Some(&routing) {
                     let (labels, output_labels, targets) = routing.clone();
-                    let read = RoutingRead { labels, output_labels, targets };
+                    let read = RoutingRead { labels, output_labels, targets, media: c.media_dest() };
                     if tx.send(Command::RoutingRead(Box::new(read))).await.is_err() {
                         return;
                     }

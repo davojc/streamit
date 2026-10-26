@@ -930,7 +930,7 @@ pub fn test_block(s: &Snapshot, c: &Config) -> Option<String> {
     }
     if c.videohub.input8_output == 0 || c.videohub.decklink_input == 0 {
         return Some(
-            "Set “Router output to input 8” and “DeckLink on router input” in Settings › Inputs & routing".into(),
+            "Set the Media input's router output (Routing › Config) and the video source (Routing › VideoHub)".into(),
         );
     }
     if test_on_stream(s, c) {
@@ -958,7 +958,7 @@ mod tests {
     fn test_play_says_why_it_cannot_start() {
         let mut c = Config::default();
         let mut s = Snapshot::default();
-        assert!(test_block(&s, &c).unwrap().contains("Settings"), "router numbers unset");
+        assert!(test_block(&s, &c).unwrap().contains("Routing › Config"), "router numbers unset");
         c.videohub.input8_output = 11;
         c.videohub.decklink_input = 39;
         assert_eq!(test_block(&s, &c), None);

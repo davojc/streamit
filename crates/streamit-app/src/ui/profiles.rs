@@ -262,7 +262,6 @@ impl StreamItApp {
             self.notice = Some(format!("Loaded, but could not save the settings file: {e:#}"));
         }
         self.draft = cfg.clone();
-        self.live_inputs_text = super::settings::join_inputs(&cfg.stream_atem.live_inputs);
         self.cues = cfg.cues.clone();
         self.send(Command::SetCues(cfg.cues.clone()));
         for t in Target::ALL {

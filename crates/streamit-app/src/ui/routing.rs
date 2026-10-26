@@ -3,16 +3,19 @@
 //! (the MultiView's views, or an ATEM's inputs) sit in the middle with eight presets
 //! under them, and dropping an input on a destination routes the VideoHub output feeding
 //! it. What the destinations show always comes from the VideoHub. Changing an ATEM input
-//! that is on program asks first.
+//! that is on program asks first. Right-clicking an ATEM input, a preset or a media pool
+//! slot sets up what StreamIt uses it for (see `setup`).
+mod setup;
+
 use super::StreamItApp;
 use crate::theme::{self, Kind};
 use eframe::egui::{self, Align, Align2, Color32, Layout, Order, Rect, RichText, Sense, Stroke, Ui, vec2};
+pub(super) use setup::DefaultsAsk;
 use std::collections::HashMap;
 use streamit_core::devices::LabelKind;
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
 use streamit_core::routing::{
-    PRESET_SLOTS, Preset, RoutingState, STREAM_VIDEO_INPUT, Target, TargetState, locked, preset_name, with_preset,
-    without_preset,
+    PRESET_SLOTS, Preset, RoutingState, Target, TargetState, locked, preset_name, with_preset, without_preset,
 };
 use tracing::info;
 
@@ -205,6 +208,10 @@ impl StreamItApp {
                 });
             });
         });
+        if target.is_atem() {
+            ui.add_space(16.0);
+            self.media_pool(ui, snap, target);
+        }
         // The input being dragged follows the pointer.
         if let (Some(d), Some(pos)) =
             (egui::DragAndDrop::payload::<InputDrag>(ui.ctx()), ui.ctx().pointer_interact_pos())
@@ -298,13 +305,17 @@ impl StreamItApp {
             theme::lbl(ui, if target == Target::MultiView { "MultiView 4" } else { target.name() });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let sub = if target.is_atem() {
-                    "Red: on program · green: on preview"
+                    "Red: on program · green: on preview · right-click an input to give it a job"
                 } else {
                     "Each view is fed by one router output"
                 };
                 ui.label(RichText::new(sub).size(13.0).color(theme::MUTED));
             });
         });
+        if target == Target::ScreensAtem {
+            ui.add_space(4.0);
+            self.go_live_scene(ui, snap);
+        }
         ui.add_space(6.0);
         // 16:9 tiles, small enough that the presets below stay on screen.
         let (cols, max_w) = if target.is_atem() { (4, ATEM_TILE_MAX_W) } else { (2, MV_TILE_MAX_W) };
@@ -340,7 +351,7 @@ impl StreamItApp {
         let target = self.routes_ui.target;
         let state = snap.routing.target(target);
         let output = state.output(i);
-        let is_locked = locked(target, i, snap.job.is_some());
+        let is_locked = locked(target, i, snap.job.is_some(), snap.routing.media);
         let r = ui.interact(rect, ui.scope_id().with(("rt-dest", target.index(), i)), Sense::click());
         let col = if output == 0 { theme::BORDER } else { colour(target, i) };
         let hovering = output != 0
@@ -379,6 +390,10 @@ impl StreamItApp {
         }
         let out = if output == 0 { String::new() } else { format!("Router out {output}") };
         p.text(rect.right_bottom() - vec2(8.0, 5.0), Align2::RIGHT_BOTTOM, out, theme::mono(10.5), theme::DIM);
+        if target.is_atem() {
+            self.job_badges(ui, rect, target, i);
+            r.context_menu(|ui| self.input_menu(ui, target, i, snap.job.is_some()));
+        }
         let (small, big) = match state.dest(i) {
             _ if output == 0 => (String::new(), "Not from the router".to_string()),
             Some(n) => (format!("INPUT {n}"), snap.routing.label(n)),
@@ -414,7 +429,8 @@ impl StreamItApp {
                 self.notice = Some(format!("{} {} is not fed by the router.", target.name(), target.dest_name(i)));
             } else if is_locked {
                 self.notice = Some(format!(
-                    "Stream ATEM input 8 carries StreamIt's videos: it can't be routed while {} runs.",
+                    "Stream ATEM input {} carries StreamIt's videos: it can't be routed while {} runs.",
+                    i + 1,
                     snap.job.unwrap_or("a sequence")
                 ));
             } else if state.dest(i) != Some(input) {
@@ -546,6 +562,8 @@ impl StreamItApp {
             if preset.is_some() || self.routes_ui.saving { Sense::click() } else { Sense::hover() },
         );
         let current = preset.as_ref().is_some_and(|p| state.is_current(p)) && !self.routes_ui.saving;
+        let default = self.config.read().unwrap_or_else(|e| e.into_inner()).routing(target).default_preset;
+        let is_default = preset.is_some() && default == Some(slot);
         let (fill, border) = match (&preset, self.routes_ui.saving, current) {
             (_, true, _) => (theme::AMBER_DARK, theme::AMBER),
             (Some(_), false, true) => (theme::INSET, theme::GREEN),
@@ -587,6 +605,35 @@ impl StreamItApp {
                     colour,
                 );
             }
+        }
+        if is_default {
+            setup::badge(ui, rect.right_bottom() + vec2(-78.0, -22.0), "★ DEFAULT", setup::DEFAULT_STAR);
+        }
+        if let Some(pr) = &preset
+            && !self.routes_ui.saving
+        {
+            let name = pr.name.clone();
+            r.context_menu(|ui| {
+                ui.label(RichText::new(format!("PRESET {slot} · {}", name.to_uppercase())).size(11.0).color(theme::MUTED));
+                let (text, new) = if is_default {
+                    ("No longer the default", None)
+                } else {
+                    ("Make the default", Some(slot))
+                };
+                if ui
+                    .button(text)
+                    .on_hover_text("Recover puts the Media input back to the Default, and at start-up StreamIt offers to restore it")
+                    .clicked()
+                {
+                    info!(target = target.name(), slot, default = new.is_some(), "Default preset changed");
+                    self.save_routing(target, move |r| r.default_preset = new);
+                    ui.close();
+                }
+                if ui.button("Clear…").clicked() {
+                    self.routes_ui.clearing = Some(slot);
+                    ui.close();
+                }
+            });
         }
         // × clears the preset (after asking). It never changes the routing.
         if let Some(pr) = &preset
@@ -668,6 +715,12 @@ impl StreamItApp {
                 if ui.small_button(RichText::new("Clear").color(theme::RED)).clicked() {
                     self.routes_ui.clearing = None;
                     info!(target = target.name(), slot = p.slot, name = %p.name, "routing preset cleared");
+                    let slot = p.slot;
+                    self.save_routing(target, move |r| {
+                        if r.default_preset == Some(slot) {
+                            r.default_preset = None;
+                        }
+                    });
                     self.save_presets(target, without_preset(&state.presets, p.slot));
                 }
             });
@@ -775,7 +828,10 @@ impl StreamItApp {
             theme::DIM,
         );
         let fed = if kind == LabelKind::Output { routing.fed_by(n) } else { Vec::new() };
-        let badges_w = fed.len() as f32 * 27.0;
+        // The input the DeckLink player comes in on: StreamIt's video source.
+        let source = kind == LabelKind::Input
+            && n == self.config.read().unwrap_or_else(|e| e.into_inner()).videohub.decklink_input;
+        let badges_w = if source { 58.0 } else { fed.len() as f32 * 27.0 };
         let field = Rect::from_min_max(row.min + vec2(30.0, 0.0), row.max - vec2(badges_w + CLEAR_W, 0.0));
         let cleared = cleared_label(n);
         let clear = Rect::from_min_size(egui::pos2(field.right() + 3.0, row.center().y - 10.0), vec2(20.0, 20.0));
@@ -798,6 +854,25 @@ impl StreamItApp {
                 .desired_width(f32::INFINITY)
                 .char_limit(40),
         );
+        if source {
+            setup::badge(ui, egui::pos2(field.right() + CLEAR_W + 3.0, row.center().y - 8.0), "VIDEOS", setup::MEDIA);
+        }
+        if kind == LabelKind::Input {
+            r.context_menu(|ui| {
+                ui.label(RichText::new(format!("ROUTER INPUT {n}")).size(11.0).color(theme::MUTED));
+                if ui
+                    .add_enabled(!source, egui::Button::new("Mark as the video source"))
+                    .on_hover_text(
+                        "The DeckLink player's output. StreamIt routes this input to the Media input for a video.",
+                    )
+                    .clicked()
+                {
+                    info!(input = n, "VideoHub: video source marked");
+                    self.save_setup(move |c| c.videohub.decklink_input = n);
+                    ui.close();
+                }
+            });
+        }
         for (k, (t, i)) in fed.into_iter().enumerate() {
             let b = Rect::from_min_size(
                 egui::pos2(field.right() + CLEAR_W + 3.0 + k as f32 * 27.0, row.center().y - 8.0),
@@ -822,13 +897,14 @@ impl StreamItApp {
     /// Which router output feeds each destination. A change applies and is saved at once.
     fn config_page(&mut self, ui: &mut Ui, snap: &Snapshot) {
         let routing = &snap.routing;
-        let (config, video_out) = {
+        let (config, video_out, media) = {
             let c = self.config.read().unwrap_or_else(|e| e.into_inner());
-            (Target::ALL.map(|t| c.routing(t).outputs_for(t.size())), c.videohub.input8_output)
+            (Target::ALL.map(|t| c.routing(t).outputs_for(t.size())), c.videohub.input8_output, c.media_dest())
         };
         let outputs = port_count(&routing.output_labels);
         theme::panel().inner_margin(20).show(ui, |ui| {
             theme::lbl(ui, "Routing config");
+            self.sim_router_notes(ui);
             ui.label(
                 RichText::new(
                     "Which router output feeds each destination, or \"Not from the router\" (plugged straight \
@@ -848,26 +924,19 @@ impl StreamItApp {
                             if i >= t.size() {
                                 continue;
                             }
+                            // The Media input's output is the one StreamIt routes videos through.
+                            let is_media = t == Target::StreamAtem && Some(i) == media;
                             let name = if t == Target::MultiView {
                                 format!("{} (MV in {})", t.dest_name(i), i + 1)
+                            } else if is_media {
+                                format!("{} (media)", t.dest_name(i))
                             } else {
                                 t.dest_name(i)
                             };
                             col.label(
                                 RichText::new(name.to_uppercase()).font(theme::label_font(11.0)).color(theme::MUTED),
                             );
-                            if t == Target::StreamAtem && i == STREAM_VIDEO_INPUT {
-                                // One setting: the output StreamIt routes videos through.
-                                let text = if video_out == 0 {
-                                    "Set in Settings › Inputs & routing".to_string()
-                                } else {
-                                    format!("{} (videos)", routing.output_name(video_out))
-                                };
-                                col.label(RichText::new(text).color(theme::SOFT))
-                                    .on_hover_text("The router output to input 8, in Settings › Inputs & routing");
-                                continue;
-                            }
-                            let now = config[t.index()][i];
+                            let now = if is_media { video_out } else { config[t.index()][i] };
                             let shown =
                                 if now == 0 { "Not from the router".to_string() } else { routing.output_name(now) };
                             let mut picked = now;
@@ -881,7 +950,10 @@ impl StreamItApp {
                                         ui.selectable_value(&mut picked, o, routing.output_name(o));
                                     }
                                 });
-                            if picked != now {
+                            if picked != now && is_media {
+                                info!(output = picked, "routing config: the Media input's output changed");
+                                self.save_setup(move |c| c.videohub.input8_output = picked);
+                            } else if picked != now {
                                 info!(target = t.name(), dest = i, output = picked, "routing config changed");
                                 self.save_routing(t, |r| {
                                     if r.outputs.len() < t.size() {
@@ -895,6 +967,28 @@ impl StreamItApp {
                 }
             }
         });
+    }
+}
+
+impl StreamItApp {
+    /// In simulation: the router numbers it fills in itself because they are not set yet.
+    fn sim_router_notes(&self, ui: &mut Ui) {
+        let defaulted = self.sim_defaults.borrow().clone();
+        let Some(hub) = self.sim.borrow().as_ref().map(|s| s.config().videohub.clone()) else { return };
+        let fields = [
+            ("videohub.input8_output", "the Media input's router output", hub.input8_output),
+            ("videohub.decklink_input", "the video source", hub.decklink_input),
+            ("videohub.fallback_normal_input", "what the Media input normally shows", hub.fallback_normal_input),
+        ];
+        for (field, what, value) in fields {
+            if let Some(n) = crate::view::sim_default_note(&defaulted, field, value) {
+                ui.label(
+                    RichText::new(format!("Not set: {what}. {n}; it is not saved."))
+                        .size(13.0)
+                        .color(theme::AMBER_SOFT),
+                );
+            }
+        }
     }
 }
 

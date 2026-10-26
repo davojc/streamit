@@ -16,7 +16,7 @@ use crate::session::{Front, Mode, Sessions, SwitchRefused};
 use crate::theme;
 use crate::view::{self, CueSync};
 use eframe::egui::{self, Color32, Margin, RichText, Ui};
-use settings::{RESTART_NOTE, Section, device_settings, join_inputs};
+use settings::{RESTART_NOTE, Section, device_settings};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -174,6 +174,8 @@ pub struct StreamItApp {
     confirm_start_now: bool,
     /// Abandon was clicked once, at this time: a second click within `CONFIRM_FOR` does it.
     confirm_abandon: Option<std::time::Instant>,
+    /// The start-up question about restoring the Default presets.
+    defaults_ask: routing::DefaultsAsk,
     /// End service was pressed: the window asks before ending.
     confirm_end: bool,
     /// The reply typed in the live chat panel.
@@ -218,7 +220,6 @@ pub struct StreamItApp {
     light_list: u32,
     light_cue: String,
     add_kind: Option<BmdKind>,
-    live_inputs_text: String,
     signin_job: Pending<Result<(), String>>,
     signin_status: String,
     channel_job: Pending<Result<Option<String>, String>>,
@@ -287,13 +288,13 @@ impl StreamItApp {
             unsaved_ok: false,
             confirm_start_now: false,
             confirm_abandon: None,
+            defaults_ask: routing::DefaultsAsk::default(),
             confirm_end: false,
             chat_reply: String::new(),
             scene_sel: None,
             scene_draft: None,
             scene_remove: None,
             pending_go: None,
-            live_inputs_text: join_inputs(&draft.stream_atem.live_inputs),
             cues: startup.cues.clone(),
             engine_cues: startup.cues.clone(),
             startup,
@@ -608,19 +609,26 @@ impl StreamItApp {
     /// Changes a routing target's config in the shared settings, the draft and the file at
     /// once: the Routing tab saves as it goes (Save in Settings does not cover it).
     fn save_routing(&mut self, target: Target, change: impl Fn(&mut streamit_core::routing::RoutingConfig)) {
+        self.save_setup(move |c| change(c.routing_mut(target)));
+    }
+
+    /// Changes what the Routing tab sets up (routing, input jobs, stills, the Go Live scene)
+    /// in the shared settings, the draft and the file at once: the Routing tab saves as it
+    /// goes (Save in Settings does not cover it).
+    fn save_setup(&mut self, change: impl Fn(&mut Config)) {
         let c = {
             let mut shared = self.config.write().unwrap_or_else(|e| e.into_inner());
-            change(shared.routing_mut(target));
+            change(&mut shared);
             shared.clone()
         };
-        change(self.draft.routing_mut(target));
+        change(&mut self.draft);
         if !self.file.writable {
             self.notice = Some("Not saved: the settings file could not be backed up (see the log).".into());
             return;
         }
         if let Err(e) = c.save(&self.file.path) {
-            warn!("saving the {} routing: {e:#}", target.name());
-            self.notice = Some(format!("Could not save the {} routing: {e:#}", target.name()));
+            warn!("saving the routing setup: {e:#}");
+            self.notice = Some(format!("Could not save the routing setup: {e:#}"));
         }
     }
 
@@ -823,6 +831,7 @@ impl eframe::App for StreamItApp {
             self.section = Section::Equipment;
             self.scroll_to = Some(Section::Equipment);
         }
+        self.defaults_prompt(ui, &snap);
         if let Some(n) = self.notice.clone() {
             egui::Panel::top("notice")
                 .frame(egui::Frame::new().fill(theme::AMBER_DARK).inner_margin(Margin::symmetric(28, 8)))

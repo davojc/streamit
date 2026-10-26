@@ -352,8 +352,11 @@ fn the_scenes_page_goes_to_a_scene_and_lights_the_one_on_now() {
 // ---- Routing
 
 fn rt_snap() -> Snapshot {
-    let mut routing =
-        RoutingState { labels: vec!["Cam 1".into(), "Cam 2".into(), "Choir".into()], ..RoutingState::default() };
+    let mut routing = RoutingState {
+        labels: vec!["Cam 1".into(), "Cam 2".into(), "Choir".into()],
+        media: Some(7),
+        ..RoutingState::default()
+    };
     routing.targets[0] = TargetState {
         outputs: vec![37, 38, 39, 40],
         dests: vec![Some(1), Some(2), Some(3), None],
@@ -363,6 +366,7 @@ fn rt_snap() -> Snapshot {
         ],
         program: None,
         preview: None,
+        stills: vec![],
     };
     routing.targets[1] = TargetState {
         outputs: vec![1, 2, 3, 4, 0, 0, 0, 11],
@@ -374,6 +378,7 @@ fn rt_snap() -> Snapshot {
         ],
         program: Some(2),
         preview: Some(3),
+        stills: vec![],
     };
     Snapshot { routing, ..Snapshot::default() }
 }

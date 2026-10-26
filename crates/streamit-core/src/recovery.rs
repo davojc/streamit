@@ -162,11 +162,13 @@ pub async fn recover(d: &Devices, c: &Config, levels: &LiveLevels) -> Result<()>
     if hub.input8_output != 0 {
         match d.stream.program().await {
             Ok(p) if p != sa.decklink_input => {
-                if hub.fallback_normal_input == 0 {
+                let normal = c.media_normal_input();
+                if normal == 0 {
                     failures.push(
-                        "No normal input is configured for input 8, so its VideoHub route was not restored".into(),
+                        "No Default preset says what input 8 normally shows, so its VideoHub route was not restored"
+                            .into(),
                     );
-                } else if let Err(e) = d.hub.route(hub.input8_output, hub.fallback_normal_input).await {
+                } else if let Err(e) = d.hub.route(hub.input8_output, normal).await {
                     fail("Could not restore the VideoHub route for input 8", e);
                 }
             }

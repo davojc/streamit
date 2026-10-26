@@ -1004,13 +1004,15 @@ impl Engine {
                 self.set(|s| s.lighting = status);
             }
             Command::RoutingRead(read) => {
-                let RoutingRead { labels, output_labels, targets } = (**read).clone();
+                let RoutingRead { labels, output_labels, targets, media } = (**read).clone();
                 self.set(|s| {
+                    s.routing.media = media;
                     for (state, read) in s.routing.targets.iter_mut().zip(targets) {
                         state.outputs = read.outputs;
                         state.dests = read.dests;
                         state.program = read.program;
                         state.preview = read.preview;
+                        state.stills = read.stills;
                     }
                     if !labels.is_empty() {
                         s.routing.labels = labels;
@@ -1026,9 +1028,11 @@ impl Engine {
     /// Why `dest` of `target` cannot be routed now, if it cannot.
     fn locked_why(&self, target: Target, dest: usize) -> Option<String> {
         let job = self.running.as_ref().map(|r| r.job.name());
-        locked(target, dest, job.is_some()).then(|| {
+        let media = self.config().media_dest();
+        locked(target, dest, job.is_some(), media).then(|| {
             format!(
-                "Stream ATEM input 8 carries StreamIt's videos: it can't be routed while {} is running.",
+                "Stream ATEM input {} carries StreamIt's videos: it can't be routed while {} is running.",
+                dest + 1,
                 job.unwrap_or("a sequence")
             )
         })
@@ -1333,12 +1337,27 @@ impl Engine {
     /// Puts the scene's input on the hall screens (unless `keep_hall`) and fires its
     /// lighting cue. Each part that fails warns; the other still runs.
     fn go_scene(&mut self, id: u32, keep_hall: bool) {
+        self.fire_scene(id, keep_hall, " · the hall stays on the video");
+    }
+
+    /// Live: the Go Live scene is the scene on now, and its lighting cue fires. T-0 has
+    /// already put its input on the hall screens.
+    fn t0_scene(&mut self) {
+        if let Some(id) = self.config().screens_atem.t0_scene
+            && scenes::find(&self.snap.borrow().scenes, id).is_some()
+        {
+            self.fire_scene(id, true, " · at Go Live");
+        }
+    }
+
+    /// `go_scene`, saying `kept` after the scene's name when its hall input is left alone.
+    fn fire_scene(&mut self, id: u32, keep_hall: bool, kept: &str) {
         let Some(scene) = scenes::find(&self.snap.borrow().scenes, id).cloned() else { return };
         let screens = scene.screens.filter(|_| !keep_hall);
         let cue = scene.cue.clone().filter(|c| !c.cue.trim().is_empty());
         let mut line = format!("Scene · {}", scene.name);
         if keep_hall && scene.screens.is_some() {
-            line.push_str(" · the hall stays on the video");
+            line.push_str(kept);
         }
         info!(scene = %scene.name, ?screens, cue = ?scene.cue, "going to a scene");
         self.set(|s| {
@@ -1515,18 +1534,21 @@ impl Engine {
         let abandon = std::mem::take(&mut self.abandon_pending);
         match result {
             // Reached T-0 by itself (even if Go Live was pressed meanwhile): no second t0.
-            Ok(CountdownOutcome::Live { public, mics_failed }) => self.set(|s| {
-                set_stage(s, Stage::Live);
-                remove(&mut s.offers, Offer::GoLive);
-                if mics_failed {
-                    mics_left_down(s);
-                }
-                if public {
-                    remove(&mut s.offers, Offer::GoPublic);
-                } else {
-                    add(&mut s.offers, Offer::GoPublic);
-                }
-            }),
+            Ok(CountdownOutcome::Live { public, mics_failed }) => {
+                self.set(|s| {
+                    set_stage(s, Stage::Live);
+                    remove(&mut s.offers, Offer::GoLive);
+                    if mics_failed {
+                        mics_left_down(s);
+                    }
+                    if public {
+                        remove(&mut s.offers, Offer::GoPublic);
+                    } else {
+                        add(&mut s.offers, Offer::GoPublic);
+                    }
+                });
+                self.t0_scene();
+            }
             // Pre-empted by Go Live: the hall is back, so run t0 now. The stage is
             // not left on Countdown; the Go Live job's result sets the final one.
             Ok(CountdownOutcome::Stopped) if golive => {
@@ -1610,6 +1632,9 @@ impl Engine {
                 warn_in(s, w);
             }
         });
+        if on_air {
+            self.t0_scene();
+        }
     }
 
     fn finish_end(&mut self, out: EndOutcome) {
@@ -1985,12 +2010,14 @@ fn routing_from(c: &Config) -> RoutingState {
     RoutingState {
         labels: Vec::new(),
         output_labels: Vec::new(),
+        media: c.media_dest(),
         targets: Target::ALL.map(|t| TargetState {
             outputs: c.routing_outputs(t),
             dests: vec![None; t.size()],
             presets: c.routing(t).presets.clone(),
             program: None,
             preview: None,
+            stills: Vec::new(),
         }),
     }
 }
@@ -3647,9 +3674,14 @@ mod tests {
             TargetRead { outputs: vec![37, 38, 39, 40], dests: mv.map(Some).to_vec(), ..TargetRead::default() };
         let mut dests: Vec<Option<u16>> = stream.map(Some).to_vec();
         dests.resize(8, None);
-        targets[1] =
-            TargetRead { outputs: vec![1, 2, 3, 4, 0, 0, 0, OUT], dests, program: Some(program), preview: None };
-        Command::RoutingRead(Box::new(RoutingRead { labels: vec![], output_labels: vec![], targets }))
+        targets[1] = TargetRead {
+            outputs: vec![1, 2, 3, 4, 0, 0, 0, OUT],
+            dests,
+            program: Some(program),
+            preview: None,
+            stills: vec![],
+        };
+        Command::RoutingRead(Box::new(RoutingRead { labels: vec![], output_labels: vec![], targets, media: Some(7) }))
     }
 
     fn hub_routes(log: &CallLog) -> Vec<Call> {
@@ -3920,6 +3952,21 @@ mod tests {
         send(&e, Command::SetScenes(vec![scene(1, "Worship", None, None)])).await;
         let s = until(&mut e, "the new list", |s| s.scenes.len() == 1).await;
         assert_eq!(s.active_scene, None, "the active scene was removed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn go_live_takes_the_hall_to_the_go_live_scene_and_fires_its_cue() {
+        let (d, log, _h) = rig();
+        let c = with_scenes(cfg(vec![]));
+        c.write().unwrap().screens_atem.t0_scene = Some(2);
+        let mut e = Engine::spawn(d, c);
+        send(&e, Command::GoLive).await;
+        until(&mut e, "Live", |s| s.stage == Stage::Live).await;
+        until_call(&log, Call::LightsFireCue(1, "4".into())).await;
+        let s = until(&mut e, "active", |s| s.active_scene == Some(2)).await;
+        assert!(log.calls().contains(&Call::ScreensSetPreview(3)), "{:?}", log.calls());
+        assert!(!log.calls().contains(&Call::ScreensSetProgram(3)), "the hall is cut once, by T-0");
+        assert!(has(&s, "Scene · Preach · at Go Live"), "{:?}", texts(&s));
     }
 
     #[tokio::test(start_paused = true)]

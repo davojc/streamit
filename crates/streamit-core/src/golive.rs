@@ -403,7 +403,9 @@ pub async fn countdown(
                 if let Err(e) = d.counter.clear().await {
                     warn(format!("Could not clear the counter: {e}"));
                 }
-                if let Err(e) = cut(&*d.screens, c.screens_atem.t0_input).await {
+                if let Some(hall) = c.hall_t0_input()
+                    && let Err(e) = cut(&*d.screens, hall).await
+                {
                     warn(format!("Could not return the hall screens: {e}"));
                 }
                 return Ok(CountdownOutcome::Stopped);
@@ -649,7 +651,9 @@ async fn video_failed(
     if let Some(prev) = stream_route {
         stream_off_countdown(d, c, prev, warn).await;
     }
-    if let Err(e) = cut(&*d.screens, c.screens_atem.t0_input).await {
+    if let Some(hall) = c.hall_t0_input()
+        && let Err(e) = cut(&*d.screens, hall).await
+    {
         warn(format!("Could not return the hall screens: {e}"));
     }
     if let Err(e) = d.counter.clear().await {
@@ -774,7 +778,8 @@ impl std::fmt::Display for T0Error {
 
 impl std::error::Error for T0Error {}
 
-/// T-0: stream to live action, then stream audio up and hall to `t0_input` together (the hall
+/// T-0: stream to live action, then stream audio up and hall to the Go Live scene's input
+/// (`Config::hall_t0_input`) together (the hall
 /// does not wait out the 1 s mic fade, as for roll-ins), then counter off.
 /// Mics come up only if the stream cut succeeded. Every step is attempted.
 pub async fn t0(d: &Devices, c: &Config, levels: &LiveLevels) -> std::result::Result<(), T0Error> {
@@ -809,16 +814,24 @@ pub async fn t0_reporting(
             Err(_) => None,
         }
     };
-    let (faded, hall) = tokio::join!(mics_up, cut(&*d.screens, c.screens_atem.t0_input));
+    let hall_input = c.hall_t0_input();
+    let hall_cut = async {
+        match hall_input {
+            Some(i) => cut(&*d.screens, i).await,
+            None => Ok(()),
+        }
+    };
+    let (faded, hall) = tokio::join!(mics_up, hall_cut);
     if let Err(e) = &stream_cut {
         failures.push(format!("Could not cut the stream to live action: {e}"));
     }
     let mics_failed = matches!(faded, Some(Err(_)));
     if let Ok(input) = &stream_cut {
         let mics = if mics_failed { "stream audio still down" } else { "stream audio up" };
-        let hall = match &hall {
-            Ok(()) => format!("hall → input {}", c.screens_atem.t0_input),
-            Err(_) => "hall not switched".into(),
+        let hall = match (&hall, hall_input) {
+            (Ok(()), Some(i)) => format!("hall → input {i}"),
+            (Ok(()), None) => "hall as it was".into(),
+            (Err(_), _) => "hall not switched".into(),
         };
         note(format!("Live · Cam {input} on air · {mics} · {hall}"));
     }

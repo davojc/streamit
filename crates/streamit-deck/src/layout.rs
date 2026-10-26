@@ -532,8 +532,7 @@ fn service_look(key: u8, snap: &Snapshot, phase: bool) -> KeyLook {
     };
     let start_now =
         |snap: &Snapshot| action("START\nSERVICE\nNOW", RED, WHITE, true, Some(FlashKey::GoLive), snap, phase);
-    let abandon =
-        |snap: &Snapshot| if snap.can_abandon() { look("ABANDON", Rgb(120, 30, 30), WHITE) } else { blank() };
+    let abandon = |snap: &Snapshot| if snap.can_abandon() { look("ABANDON", Rgb(120, 30, 30), WHITE) } else { blank() };
     match service_step(&snap.stage) {
         ServiceStep::Before => match key {
             PREPARE => look("PREPARE", BLUE, WHITE),
@@ -662,7 +661,7 @@ fn atem_input_look(
     if state.output(i) == 0 {
         return look(format!("{name}\n—"), DIM_BG, DIM_FG);
     }
-    if locked(t, i, snap.job.is_some()) {
+    if locked(t, i, snap.job.is_some(), snap.routing.media) {
         return look(format!("{name}\nLOCKED"), DIM_BG, AMBER);
     }
     let text = format!("{name}\n{}", wrap_cue_name(&label(state.dest(i)), CUE_LINE_WIDTH));

@@ -56,6 +56,16 @@ impl SimSwitcher {
 
 #[async_trait]
 impl Switcher for SimSwitcher {
+    fn stills(&self) -> Vec<Option<String>> {
+        let named: &[&str] = match self.which {
+            Which::Stream => &["Stream starting soon", "Thanks for watching", "Notices", "Offering"],
+            Which::Screens => &["Welcome", "Notices", "Hymn backdrop"],
+        };
+        let mut v: Vec<Option<String>> = named.iter().map(|n| Some(n.to_string())).collect();
+        v.resize(20, None);
+        v
+    }
+
     async fn program(&self) -> Result<u16> {
         self.state(|s| s.program)
     }

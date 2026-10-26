@@ -33,6 +33,8 @@ pub struct AtemState {
     pub media_players: BTreeMap<u8, MediaPlayer>,
     /// By (input index, source id).
     pub fairlight: BTreeMap<(u16, i64), FairlightSource>,
+    /// The media pool's still slots by 0-based index: the file name, `None` when empty.
+    pub stills: BTreeMap<u16, Option<String>>,
 }
 
 impl AtemState {
@@ -59,6 +61,9 @@ impl AtemState {
             Decoded::FairlightSource { index, source, fader_gain, supported_mix_options, mix_option } => {
                 self.fairlight
                     .insert((index, source), FairlightSource { fader_gain, mix_option, supported_mix_options });
+            }
+            Decoded::MediaPoolStill { index, ref name } => {
+                self.stills.insert(index, name.clone());
             }
         }
     }

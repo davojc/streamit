@@ -200,13 +200,44 @@ impl Reader<'_> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decoded {
     Version(u32),
-    Topology { mix_effects: u8, sources: u8, media_players: u8 },
+    Topology {
+        mix_effects: u8,
+        sources: u8,
+        media_players: u8,
+    },
     InitComplete,
-    ProgramInput { mix_effect: u8, source: u16 },
-    PreviewInput { mix_effect: u8, source: u16 },
-    TransitionPosition { mix_effect: u8, in_transition: bool, remaining_frames: u8, handle_position: u16 },
-    MediaPlayerSource { player: u8, source_type: u8, still_index: u8, clip_index: u8 },
-    FairlightSource { index: u16, source: i64, fader_gain: i32, supported_mix_options: u8, mix_option: u8 },
+    ProgramInput {
+        mix_effect: u8,
+        source: u16,
+    },
+    PreviewInput {
+        mix_effect: u8,
+        source: u16,
+    },
+    TransitionPosition {
+        mix_effect: u8,
+        in_transition: bool,
+        remaining_frames: u8,
+        handle_position: u16,
+    },
+    MediaPlayerSource {
+        player: u8,
+        source_type: u8,
+        still_index: u8,
+        clip_index: u8,
+    },
+    FairlightSource {
+        index: u16,
+        source: i64,
+        fader_gain: i32,
+        supported_mix_options: u8,
+        mix_option: u8,
+    },
+    /// A still slot in the media pool (0-based `index`), and its file name while used.
+    MediaPoolStill {
+        index: u16,
+        name: Option<String>,
+    },
 }
 
 /// Decodes one command, or `None` for one StreamIt ignores (or one too short to read).
@@ -232,6 +263,21 @@ pub fn decode(cmd: &RawCommand<'_>) -> Option<Decoded> {
             remaining_frames: r.u8(2)?,
             handle_position: r.u16(4)?,
         }),
+        // Upstream: src/commands/Media/MediaPoolFrameDescriptionCommand.ts
+        // (`MediaPoolFrameDescriptionCommand.deserialize`): bank, index, used, MD5 hash,
+        // then the file name's length at 23 and the name from 24. Bank 0 is the stills.
+        b"MPfe" if r.u8(0)? == 0 => {
+            let index = r.u16(2)?;
+            let name = if r.u8(4)? == 1 {
+                let len = usize::from(r.u8(23)?);
+                let raw = cmd.body.get(24..24 + len).unwrap_or(cmd.body.get(24..).unwrap_or_default());
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                Some(String::from_utf8_lossy(&raw[..end]).trim().to_string())
+            } else {
+                None
+            };
+            Some(Decoded::MediaPoolStill { index, name })
+        }
         // Upstream: src/commands/Media/MediaPlayerSourceCommand.ts (`MediaPlayerSourceUpdateCommand.deserialize`).
         b"MPCE" => Some(Decoded::MediaPlayerSource {
             player: r.u8(0)?,
@@ -442,6 +488,27 @@ mod tests {
                 handle_position: 694,
             })
         );
+    }
+
+    #[test]
+    fn decode_mpfe_names_the_still_slots() {
+        // Bank 0 (stills), index 4, used, a 16-byte hash, the name's length at 23.
+        let mut body = vec![0, 0, 0, 4, 1];
+        body.extend([0xAB; 16]);
+        body.extend([0, 0, 13]);
+        body.extend(b"Notices.png  ");
+        assert_eq!(
+            decode_bytes(&frame(b"MPfe", &body)),
+            Some(Decoded::MediaPoolStill { index: 4, name: Some("Notices.png".into()) })
+        );
+        // An empty slot has no name.
+        let mut empty = vec![0, 0, 0, 5, 0];
+        empty.extend([0; 19]);
+        assert_eq!(decode_bytes(&frame(b"MPfe", &empty)), Some(Decoded::MediaPoolStill { index: 5, name: None }));
+        // Bank 1 is clips: not stills.
+        let mut clip = body.clone();
+        clip[0] = 1;
+        assert_eq!(decode_bytes(&frame(b"MPfe", &clip)), None);
     }
 
     #[test]

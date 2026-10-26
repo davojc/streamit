@@ -1,6 +1,6 @@
 //! StreamIt configuration: device addresses, input numbers and timings.
 
-use crate::routing::{RoutingConfig, STREAM_VIDEO_INPUT, Target};
+use crate::routing::{RoutingConfig, Target};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -78,12 +78,27 @@ impl Default for StreamAtemConfig {
 pub struct ScreensAtemConfig {
     pub address: Option<String>,
     pub decklink_input: u16,
+    /// The hall input at T-0 when no Go Live scene is set (from before scenes).
     pub t0_input: u16,
+    /// The scene the hall goes to at Go Live (its screens input and lighting cue).
+    pub t0_scene: Option<u32>,
+    /// Media player and stills marked on the Screens ATEM's media pool. Not used yet.
+    pub media_player: u8,
+    pub opening_still: Option<u16>,
+    pub closing_still: Option<u16>,
 }
 
 impl Default for ScreensAtemConfig {
     fn default() -> Self {
-        Self { address: Some("192.168.4.98".into()), decklink_input: 8, t0_input: 6 }
+        Self {
+            address: Some("192.168.4.98".into()),
+            decklink_input: 8,
+            t0_input: 6,
+            t0_scene: None,
+            media_player: 1,
+            opening_still: None,
+            closing_still: None,
+        }
     }
 }
 
@@ -270,14 +285,66 @@ impl Config {
         }
     }
 
+    /// The Stream ATEM's Media input as a destination index (videos and the countdown
+    /// come in there), while it is one of the inputs the router feeds.
+    pub fn media_dest(&self) -> Option<usize> {
+        let i = usize::from(self.stream_atem.decklink_input).checked_sub(1)?;
+        (i < Target::StreamAtem.size()).then_some(i)
+    }
+
     /// The VideoHub output feeding each destination of `t` (0 = not from the router).
-    /// Stream ATEM input 8 is always the output StreamIt uses for videos.
+    /// The Stream ATEM's Media input is always fed by the output StreamIt uses for videos.
     pub fn routing_outputs(&self, t: Target) -> Vec<u16> {
         let mut outputs = self.routing(t).outputs_for(t.size());
-        if t == Target::StreamAtem {
-            outputs[STREAM_VIDEO_INPUT] = self.videohub.input8_output;
+        if t == Target::StreamAtem
+            && let Some(m) = self.media_dest()
+        {
+            outputs[m] = self.videohub.input8_output;
         }
         outputs
+    }
+
+    /// Make Stream ATEM input `input` (1-based) the Media input. Its router output becomes
+    /// the videos output, and the input that was the Media input keeps the output that fed it.
+    pub fn set_media_input(&mut self, input: u16) {
+        let old = self.media_dest();
+        let new = usize::from(input).saturating_sub(1);
+        if old == Some(new) || new >= Target::StreamAtem.size() {
+            return;
+        }
+        let r = &mut self.stream_routing;
+        if r.outputs.len() < Target::StreamAtem.size() {
+            r.outputs.resize(Target::StreamAtem.size(), 0);
+        }
+        let new_out = r.outputs[new];
+        if let Some(o) = old {
+            r.outputs[o] = self.videohub.input8_output;
+        }
+        r.outputs[new] = 0;
+        self.videohub.input8_output = new_out;
+        self.stream_atem.decklink_input = input;
+    }
+
+    /// The router input the Media input normally shows: the Default preset's, else the
+    /// one set before Default presets (0 = not known).
+    pub fn media_normal_input(&self) -> u16 {
+        let from_default =
+            self.media_dest().and_then(|m| self.stream_routing.normal_preset().map(|p| p.input(m))).filter(|&i| i != 0);
+        from_default.unwrap_or(self.videohub.fallback_normal_input)
+    }
+
+    /// The Go Live scene, while it still exists.
+    pub fn t0_scene(&self) -> Option<&Scene> {
+        self.screens_atem.t0_scene.and_then(|id| crate::scenes::find(&self.scenes, id))
+    }
+
+    /// The Screens ATEM input the hall goes to at T-0: the Go Live scene's, else
+    /// `t0_input`. A Go Live scene that leaves the screens alone gives `None`.
+    pub fn hall_t0_input(&self) -> Option<u16> {
+        match self.t0_scene() {
+            Some(s) => s.screens,
+            None => Some(self.screens_atem.t0_input),
+        }
     }
 
     /// Load from `path`. A missing file yields the defaults.
@@ -389,6 +456,51 @@ pub fn config_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_media_input_moves_and_keeps_each_input_fed() {
+        let mut c = Config::default();
+        c.stream_atem.decklink_input = 8;
+        c.videohub.input8_output = 11;
+        c.stream_routing.outputs = vec![1, 2, 3, 4, 5, 6, 7, 0];
+        assert_eq!(c.media_dest(), Some(7));
+        assert_eq!(c.routing_outputs(Target::StreamAtem)[7], 11);
+        c.set_media_input(6);
+        assert_eq!((c.stream_atem.decklink_input, c.videohub.input8_output, c.media_dest()), (6, 6, Some(5)));
+        assert_eq!(c.routing_outputs(Target::StreamAtem), vec![1, 2, 3, 4, 5, 6, 7, 11]);
+        c.stream_atem.decklink_input = 9;
+        assert_eq!(c.media_dest(), None, "not a routed input");
+    }
+
+    #[test]
+    fn the_media_input_normally_shows_the_default_presets_input() {
+        use crate::routing::Preset;
+        let mut c = Config::default();
+        c.stream_atem.decklink_input = 8;
+        c.videohub.fallback_normal_input = 13;
+        assert_eq!(c.media_normal_input(), 13, "no Default preset: the old setting");
+        c.stream_routing.presets =
+            vec![Preset { slot: 2, name: "Service".into(), inputs: vec![1, 2, 3, 4, 5, 6, 7, 5] }];
+        assert_eq!(c.media_normal_input(), 13, "slot 2 is not the default");
+        c.stream_routing.default_preset = Some(2);
+        assert_eq!(c.media_normal_input(), 5);
+    }
+
+    #[test]
+    fn the_hall_at_t0_follows_the_go_live_scene() {
+        let mut c = Config::default();
+        c.screens_atem.t0_input = 6;
+        assert_eq!(c.hall_t0_input(), Some(6));
+        let mut s = Scene::new(&[]);
+        s.screens = Some(3);
+        c.screens_atem.t0_scene = Some(s.id);
+        c.scenes = vec![s.clone()];
+        assert_eq!(c.hall_t0_input(), Some(3));
+        c.scenes[0].screens = None;
+        assert_eq!(c.hall_t0_input(), None, "the scene leaves the hall alone");
+        c.scenes.clear();
+        assert_eq!(c.hall_t0_input(), Some(6), "a removed scene falls back");
+    }
+
     use super::*;
     use crate::rollin::Destination;
     use std::time::Duration;

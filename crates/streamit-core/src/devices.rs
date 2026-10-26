@@ -27,6 +27,11 @@ pub trait Switcher: Send + Sync {
     async fn set_program(&self, input: u16) -> Result<()>;
     async fn auto(&self) -> Result<()>;
     async fn wait_transition_done(&self, timeout: Duration) -> Result<()>;
+    /// The media pool's still slots as last reported, from slot 1: each one's name, `None`
+    /// when empty. Empty when the switcher has not said.
+    fn stills(&self) -> Vec<Option<String>> {
+        Vec::new()
+    }
 }
 
 #[async_trait]

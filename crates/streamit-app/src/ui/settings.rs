@@ -39,17 +39,15 @@ pub(super) enum Section {
     #[default]
     Profiles,
     Equipment,
-    Routing,
     Timings,
     YouTube,
     Playout,
     Updates,
 }
 
-const SECTIONS: [(Section, &str); 7] = [
+const SECTIONS: [(Section, &str); 6] = [
     (Section::Profiles, "Profiles"),
     (Section::Equipment, "Equipment"),
-    (Section::Routing, "Inputs & routing"),
     (Section::Timings, "Timings & audio"),
     (Section::YouTube, "YouTube"),
     (Section::Playout, "Playout & NDI counter"),
@@ -127,34 +125,6 @@ pub(super) fn device_settings(c: &Config) -> impl PartialEq + use<> {
     )
 }
 
-pub(super) fn join_inputs(v: &[u16]) -> String {
-    v.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
-}
-
-pub(super) fn parse_inputs(s: &str) -> Result<Vec<u16>, String> {
-    s.split(',')
-        .map(str::trim)
-        .filter(|x| !x.is_empty())
-        .map(|x| x.parse::<u16>().map_err(|_| format!("Live cameras: {x:?} is not an input number")))
-        .collect()
-}
-
-/// The digits in a typed field ("Input 13" → 13); `None` if there are none.
-/// A leading word ("Input", "Slot", "MP") is allowed; anything else that is not a digit
-/// ("1.5", "12a") is rejected, so the field keeps its value rather than guessing.
-fn digits(s: &str) -> Option<f64> {
-    let rest = s.trim().trim_start_matches(|c: char| c.is_ascii_alphabetic()).trim_start();
-    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    rest.parse().ok()
-}
-
-/// A router field cleared or typed as "not set" means 0.
-fn router_digits(s: &str) -> Option<f64> {
-    if s.chars().all(|c| c.is_ascii_alphabetic() || c.is_whitespace()) { Some(0.0) } else { digits(s) }
-}
-
 // ---------------------------------------------------------------- fields
 
 /// A field: its small upper-case label above the control.
@@ -182,27 +152,6 @@ fn opt_text(ui: &mut Ui, a: &mut Option<String>, hint: &str) {
 fn number<N: egui::emath::Numeric>(ui: &mut Ui, v: &mut N, prefix: &str) {
     let w = ui.available_width();
     ui.add_sized([w, FIELD_H], egui::DragValue::new(v).prefix(prefix));
-}
-
-/// A router number, where 0 means "not set".
-fn router_number(ui: &mut Ui, v: &mut u16, prefix: &'static str) {
-    let w = ui.available_width();
-    let d = egui::DragValue::new(v)
-        .range(0..=999)
-        .custom_formatter(move |n, _| if n == 0.0 { "not set".into() } else { format!("{prefix}{n}") })
-        .custom_parser(router_digits);
-    ui.add_sized([w, FIELD_H], d);
-}
-
-/// A media-pool still, stored from 0 and shown from 1 as on the ATEM ("Slot 1"). The
-/// range is wide so an existing value is never clamped.
-fn slot(ui: &mut Ui, v: &mut u16) {
-    let w = ui.available_width();
-    let d = egui::DragValue::new(v)
-        .range(0..=255)
-        .custom_formatter(|n, _| format!("Slot {}", n as u64 + 1))
-        .custom_parser(|s| digits(s).map(|n| (n - 1.0).max(0.0)));
-    ui.add_sized([w, FIELD_H], d);
 }
 
 fn seconds(ui: &mut Ui, d: &mut Duration) {
@@ -372,7 +321,6 @@ impl StreamItApp {
             Section::Equipment,
             section(ui, target == Some(Section::Equipment), |ui| self.equipment(ui, snap, simulating)),
         );
-        add(Section::Routing, section(ui, target == Some(Section::Routing), |ui| self.routing(ui, simulating)));
         add(Section::Timings, section(ui, target == Some(Section::Timings), |ui| self.timings(ui)));
         add(Section::YouTube, section(ui, target == Some(Section::YouTube), |ui| self.youtube(ui, simulating)));
         add(Section::Playout, section(ui, target == Some(Section::Playout), |ui| self.playout(ui)));
@@ -728,69 +676,6 @@ impl StreamItApp {
         });
     }
 
-    // ---- Inputs & routing
-
-    fn routing(&mut self, ui: &mut Ui, simulating: bool) {
-        heading(ui, "Inputs & routing");
-        ui.add_space(8.0);
-        let defaulted = if simulating { self.sim_defaults.borrow().clone() } else { Vec::new() };
-        // The values the running simulation uses: its effective config.
-        let running = self.sim.borrow().as_ref().map(|s| s.config().videohub.clone());
-        let sim = running.unwrap_or_default();
-        let note = |ui: &mut Ui, field: &str, value: u16| {
-            if let Some(n) = view::sim_default_note(&defaulted, field, value) {
-                amber_note(ui, &n);
-            }
-        };
-        let c = &mut self.draft;
-        let live = &mut self.live_inputs_text;
-        ui.columns(3, |col| {
-            field(&mut col[0], "Live cameras", |ui| {
-                text(ui, live, "1, 2, 3");
-            });
-            field(&mut col[1], "Safe camera (default at T-0)", |ui| {
-                number(ui, &mut c.stream_atem.default_live_input, "Cam ")
-            });
-            field(&mut col[2], "Hall screens at T-0", |ui| number(ui, &mut c.screens_atem.t0_input, "Input "));
-        });
-        ui.columns(3, |col| {
-            field(&mut col[0], "Video comes in on", |ui| number(ui, &mut c.stream_atem.decklink_input, "Input "));
-            field(&mut col[1], "Router output to input 8", |ui| {
-                router_number(ui, &mut c.videohub.input8_output, "Output ");
-                note(ui, "videohub.input8_output", sim.input8_output);
-            });
-            field(&mut col[2], "Cam 8 normally on router input", |ui| {
-                router_number(ui, &mut c.videohub.fallback_normal_input, "Input ");
-                note(ui, "videohub.fallback_normal_input", sim.fallback_normal_input);
-            });
-        });
-        ui.columns(3, |col| {
-            field(&mut col[0], "Opening still", |ui| slot(ui, &mut c.stream_atem.opening_still));
-            field(&mut col[1], "Closing still", |ui| slot(ui, &mut c.stream_atem.closing_still));
-            field(&mut col[2], "DeckLink on router input", |ui| {
-                router_number(ui, &mut c.videohub.decklink_input, "Input ");
-                note(ui, "videohub.decklink_input", sim.decklink_input);
-            });
-        });
-        ui.columns(3, |col| {
-            field(&mut col[0], "Hall screens: video comes in on", |ui| {
-                number(ui, &mut c.screens_atem.decklink_input, "Input ")
-            });
-            field(&mut col[1], "Media player", |ui| {
-                // Media players count from 1 on the ATEM.
-                let w = ui.available_width();
-                let d = egui::DragValue::new(&mut c.stream_atem.media_player).range(1..=u8::MAX).prefix("MP");
-                ui.add_sized([w, FIELD_H], d);
-            });
-        });
-        if !defaulted.is_empty() {
-            amber_note(
-                ui,
-                "The simulation fills in router numbers that are not set yet. They are not saved: set the real ones above.",
-            );
-        }
-    }
-
     // ---- Timings & audio
 
     fn timings(&mut self, ui: &mut Ui) {
@@ -1030,7 +915,7 @@ impl StreamItApp {
         for t in Target::ALL {
             *d.routing_mut(t) = saved.routing(t).clone();
         }
-        d != saved || self.live_inputs_text != join_inputs(&saved.stream_atem.live_inputs)
+        d != saved
     }
 
     fn save_bar(&mut self, ui: &mut Ui) {
@@ -1042,7 +927,6 @@ impl StreamItApp {
             }
             if theme::button_enabled(ui, dirty, "Discard changes", Kind::Plain).clicked() {
                 self.draft = self.config.read().unwrap_or_else(|e| e.into_inner()).clone();
-                self.live_inputs_text = join_inputs(&self.draft.stream_atem.live_inputs);
             }
             if dirty {
                 ui.label(RichText::new("Unsaved changes").color(theme::AMBER_SOFT));
@@ -1052,13 +936,6 @@ impl StreamItApp {
 
     /// Saves the draft. True when it reached the file.
     pub(super) fn save_settings(&mut self) -> bool {
-        match parse_inputs(&self.live_inputs_text) {
-            Ok(v) => self.draft.stream_atem.live_inputs = v,
-            Err(e) => {
-                self.notice = Some(e);
-                return false;
-            }
-        }
         let c = {
             let mut shared = self.config.write().unwrap_or_else(|e| e.into_inner());
             let mut c = self.draft.clone();
@@ -1148,36 +1025,14 @@ mod tests {
 
     #[test]
     fn the_menu_lights_the_section_being_read() {
-        let tops = [(Section::Equipment, 100.0), (Section::Routing, 600.0), (Section::Timings, 1100.0)];
+        let tops = [(Section::Equipment, 100.0), (Section::YouTube, 600.0), (Section::Timings, 1100.0)];
         assert_eq!(section_in_view(&tops, 100.0, false), Some(Section::Equipment), "at the top");
-        assert_eq!(section_in_view(&tops, 560.0, false), Some(Section::Routing), "nearly at Routing's top");
-        assert_eq!(section_in_view(&tops, 900.0, false), Some(Section::Routing), "part way through Routing");
+        assert_eq!(section_in_view(&tops, 560.0, false), Some(Section::YouTube), "nearly at YouTube's top");
+        assert_eq!(section_in_view(&tops, 900.0, false), Some(Section::YouTube), "part way through YouTube");
         assert_eq!(section_in_view(&tops, 5000.0, false), Some(Section::Timings), "past the end");
         assert_eq!(section_in_view(&tops, -50.0, false), Some(Section::Equipment), "above the first");
         assert_eq!(section_in_view(&[], 0.0, false), None);
         assert_eq!(section_in_view(&tops, 300.0, true), Some(Section::Timings), "scrolled to the end");
-    }
-
-    #[test]
-    fn live_inputs_parse() {
-        assert_eq!(parse_inputs("1, 2,3"), Ok(vec![1, 2, 3]));
-        assert_eq!(parse_inputs(""), Ok(vec![]));
-        assert!(parse_inputs("1, x").is_err());
-    }
-
-    #[test]
-    fn typed_numbers_keep_their_digits() {
-        assert_eq!(digits("Input 13"), Some(13.0));
-        assert_eq!(digits(" 7 "), Some(7.0));
-        assert_eq!(digits("MP1"), Some(1.0));
-        assert_eq!(digits("not set"), None);
-        assert_eq!(digits("Slot 2"), Some(2.0));
-        assert_eq!(digits("1.5"), None, "not joined into 15");
-        assert_eq!(digits("12a"), None);
-        assert_eq!(router_digits("not set"), Some(0.0));
-        assert_eq!(router_digits(""), Some(0.0));
-        assert_eq!(router_digits("Output 11"), Some(11.0));
-        assert_eq!(router_digits("1.5"), None);
     }
 
     #[test]

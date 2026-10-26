@@ -19,9 +19,6 @@ pub const VIEWS: [&str; 4] = ["Top left", "Top right", "Bottom left", "Bottom ri
 pub const VIEW_KEYS: [&str; 4] = ["TL", "TR", "BL", "BR"];
 /// Inputs on each ATEM that can be fed by the VideoHub.
 pub const ATEM_INPUTS: usize = 8;
-/// The Stream ATEM input StreamIt plays videos into (its VideoHub output is
-/// `videohub.input8_output`). It is locked while a StreamIt sequence runs.
-pub const STREAM_VIDEO_INPUT: usize = 7;
 /// Preset slots per target, numbered from 1.
 pub const PRESET_SLOTS: u8 = 8;
 /// The most characters a preset name keeps.
@@ -72,10 +69,11 @@ impl Target {
     }
 }
 
-/// Is the destination locked now? Stream ATEM input 8 carries StreamIt's videos and the
-/// holding still, so it cannot be routed while a sequence (`busy`) runs.
-pub fn locked(target: Target, dest: usize, busy: bool) -> bool {
-    busy && target == Target::StreamAtem && dest == STREAM_VIDEO_INPUT
+/// Is the destination locked now? The Stream ATEM's Media input (`media`, an index)
+/// carries StreamIt's videos and the countdown, so it cannot be routed while a sequence
+/// (`busy`) runs.
+pub fn locked(target: Target, dest: usize, busy: bool, media: Option<usize>) -> bool {
+    busy && target == Target::StreamAtem && Some(dest) == media
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -86,9 +84,18 @@ pub struct RoutingConfig {
     pub outputs: Vec<u16>,
     /// Saved in place, like the cue list: Save in Settings does not cover them.
     pub presets: Vec<Preset>,
+    /// The preset StreamIt treats as how things normally are (its slot): Recover puts the
+    /// Media input back to it, and at start-up StreamIt offers to restore it.
+    pub default_preset: Option<u8>,
 }
 
 impl RoutingConfig {
+    /// The Default preset, while its slot holds one.
+    pub fn normal_preset(&self) -> Option<&Preset> {
+        let slot = self.default_preset?;
+        self.presets.iter().find(|p| p.slot == slot)
+    }
+
     pub fn output(&self, i: usize) -> u16 {
         self.outputs.get(i).copied().unwrap_or(0)
     }
@@ -126,6 +133,8 @@ pub struct TargetState {
     /// the ATEM has not said.
     pub program: Option<u16>,
     pub preview: Option<u16>,
+    /// An ATEM's media pool still slots from slot 1: each one's name, `None` when empty.
+    pub stills: Vec<Option<String>>,
 }
 
 impl TargetState {
@@ -186,6 +195,8 @@ pub struct RoutingState {
     /// The VideoHub's output labels; index 0 is output 1.
     pub output_labels: Vec<String>,
     pub targets: [TargetState; 3],
+    /// The Stream ATEM's Media input as a destination index (`Config::media_dest`).
+    pub media: Option<usize>,
 }
 
 impl RoutingState {
@@ -262,6 +273,7 @@ pub struct TargetRead {
     pub dests: Vec<Option<u16>>,
     pub program: Option<u16>,
     pub preview: Option<u16>,
+    pub stills: Vec<Option<String>>,
 }
 
 /// Everything one routing read found (the health poll sends these to the engine).
@@ -270,6 +282,7 @@ pub struct RoutingRead {
     pub labels: Vec<String>,
     pub output_labels: Vec<String>,
     pub targets: [TargetRead; 3],
+    pub media: Option<usize>,
 }
 
 /// `presets` with `p` in its slot (replacing what was there), in slot order.
@@ -308,6 +321,7 @@ mod tests {
             presets: vec![],
             program: Some(program),
             preview: None,
+            stills: vec![],
         }
     }
 
@@ -326,11 +340,14 @@ mod tests {
 
     #[test]
     fn only_stream_input_8_locks_and_only_while_busy() {
-        assert!(locked(Target::StreamAtem, 7, true));
-        assert!(!locked(Target::StreamAtem, 7, false));
-        assert!(!locked(Target::StreamAtem, 6, true));
-        assert!(!locked(Target::ScreensAtem, 7, true));
-        assert!(!locked(Target::MultiView, 3, true));
+        assert!(locked(Target::StreamAtem, 7, true, Some(7)));
+        assert!(!locked(Target::StreamAtem, 7, false, Some(7)));
+        assert!(!locked(Target::StreamAtem, 7, true, Some(3)), "the Media input moved");
+        assert!(locked(Target::StreamAtem, 3, true, Some(3)));
+        assert!(!locked(Target::ScreensAtem, 3, true, Some(3)));
+        assert!(!locked(Target::StreamAtem, 6, true, Some(7)));
+        assert!(!locked(Target::ScreensAtem, 7, true, Some(7)));
+        assert!(!locked(Target::MultiView, 3, true, Some(7)));
     }
 
     #[test]
@@ -402,7 +419,7 @@ mod tests {
 
     #[test]
     fn config_outputs_pad_to_the_target_size() {
-        let c = RoutingConfig { outputs: vec![37, 38], presets: vec![] };
+        let c = RoutingConfig { outputs: vec![37, 38], presets: vec![], default_preset: None };
         assert_eq!(c.outputs_for(4), vec![37, 38, 0, 0]);
         assert_eq!(c.output(9), 0);
     }
