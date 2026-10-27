@@ -112,6 +112,9 @@ pub struct VideoHubConfig {
     #[serde(with = "millis")]
     pub settle: Duration,
     pub fallback_normal_input: u16,
+    /// An unused (black) input. A VideoHub output always shows some input, so
+    /// disconnecting an output routes this one to it.
+    pub blank_input: u16,
 }
 
 impl Default for VideoHubConfig {
@@ -122,6 +125,7 @@ impl Default for VideoHubConfig {
             decklink_input: 0,
             settle: Duration::from_millis(1500),
             fallback_normal_input: 0,
+            blank_input: 0,
         }
     }
 }

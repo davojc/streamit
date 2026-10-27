@@ -2,7 +2,8 @@
 //! column each. Clicking an input shows the outputs it feeds (with a line to each);
 //! clicking an output shows its input. Dragging an input onto an output routes it.
 //! Double-clicking a name edits it in place; it goes to the VideoHub on Enter (or a click
-//! away) and Escape puts it back.
+//! away) and Escape puts it back. A VideoHub output always shows some input, so
+//! disconnecting one routes the input marked as blank to it.
 use super::super::StreamItApp;
 use super::{CLEAR_W, InputDrag, cleared_label, colour, label_to_send, port_count, setup};
 use crate::theme;
@@ -19,6 +20,7 @@ const LINK_W: f32 = 140.0;
 const NUM_W: f32 = 30.0;
 /// Room on an output row for its input ("← 12 Camera 1 Wide").
 const SRC_W: f32 = 190.0;
+const BLANK: Color32 = Color32::from_rgb(150, 156, 168);
 
 /// A row picked on the page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +51,12 @@ pub(in crate::ui) fn lit(routing: &RoutingState, pick: Option<Pick>) -> Lit {
     }
 }
 
+/// The input that disconnects output `o`: the blank input, unless none is marked or the
+/// output already shows it.
+pub(in crate::ui) fn disconnect_input(routing: &RoutingState, o: u16, blank: u16) -> Option<u16> {
+    (blank != 0 && routing.route(o) != Some(blank)).then_some(blank)
+}
+
 /// "→ 3 outputs" under an input; "not routed" when it feeds none.
 pub(in crate::ui) fn feeds_text(count: usize) -> String {
     match count {
@@ -72,7 +80,8 @@ impl StreamItApp {
                     "Click an input to see every output it feeds; click an output to see its input. Drag an input \
                      onto an output to route it. Double-click a name to rename it (Enter sends it to the VideoHub, \
                      Escape puts it back); × clears it to its number. Right-click an input to mark it as the \
-                     video source.",
+                     video source or the blank input; right-click an output to disconnect it (it then shows the \
+                     blank input).",
                 )
                 .color(theme::SOFT),
             );
@@ -127,7 +136,10 @@ impl StreamItApp {
         let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click_and_drag());
         let picked = self.routes_ui.vh_pick == Some(Pick::Input(n));
         let shown = lit.inputs.contains(&n);
-        let source = n == self.config.read().unwrap_or_else(|e| e.into_inner()).videohub.decklink_input;
+        let (source, blank) = {
+            let c = self.config.read().unwrap_or_else(|e| e.into_inner());
+            (n == c.videohub.decklink_input, n == c.videohub.blank_input)
+        };
         row_frame(ui, rect, picked, shown, false);
         number(ui, rect.left_center() + vec2(NUM_W - 6.0, 0.0), n);
         let count = routing.outputs_of(n).len();
@@ -141,6 +153,10 @@ impl StreamItApp {
         if source {
             name_right -= 58.0;
             setup::badge(ui, egui::pos2(name_right + 4.0, rect.center().y - 8.0), "VIDEOS", setup::MEDIA);
+        }
+        if blank {
+            name_right -= 54.0;
+            setup::badge(ui, egui::pos2(name_right + 4.0, rect.center().y - 8.0), "BLANK", BLANK);
         }
         let name = Rect::from_min_max(rect.min + vec2(NUM_W + 8.0, 3.0), egui::pos2(name_right, rect.bottom() - 3.0));
         self.name_cell(ui, routing, LabelKind::Input, n, name);
@@ -159,6 +175,16 @@ impl StreamItApp {
             {
                 info!(input = n, "VideoHub: video source marked");
                 self.save_setup(move |c| c.videohub.decklink_input = n);
+                ui.close();
+            }
+            let (text, mark) = if blank { ("Unmark as the blank input", 0) } else { ("Mark as the blank input", n) };
+            if ui
+                .button(text)
+                .on_hover_text("An unused (black) input. Disconnecting an output routes this input to it.")
+                .clicked()
+            {
+                info!(input = mark, "VideoHub: blank input marked");
+                self.save_setup(move |c| c.videohub.blank_input = mark);
                 ui.close();
             }
         });
@@ -185,7 +211,9 @@ impl StreamItApp {
         }
         // Its input, after the ×.
         let src_rect = Rect::from_min_size(rect.min + vec2(CLEAR_W + 4.0, 0.0), vec2(SRC_W, ROW_H));
+        let blank = self.config.read().unwrap_or_else(|e| e.into_inner()).videohub.blank_input;
         let (src, src_colour) = match routing.route(o) {
+            Some(n) if n == blank => ("— disconnected".to_string(), theme::DIM),
             Some(n) => (
                 format!("← {n} {}", routing.own_label(n).unwrap_or("")),
                 if shown { theme::BLUE } else { theme::MUTED },
@@ -207,6 +235,26 @@ impl StreamItApp {
         if let Some(d) = r.dnd_release_payload::<InputDrag>() {
             self.route_output(snap, o, d.0);
         }
+        r.context_menu(|ui| {
+            ui.label(RichText::new(format!("ROUTER OUTPUT {o}")).size(11.0).color(theme::MUTED));
+            let to = disconnect_input(routing, o, blank);
+            let hint = match (blank, to) {
+                (0, _) => "Mark an unused input as the blank input first (right-click an input).".to_string(),
+                (_, None) => "It already shows the blank input.".to_string(),
+                (b, Some(_)) => format!("Routes the blank input ({b}) to it."),
+            };
+            if let Some(b) = ui
+                .add_enabled(to.is_some(), egui::Button::new("Disconnect"))
+                .on_hover_text(hint)
+                .clicked()
+                .then_some(to)
+                .flatten()
+            {
+                info!(output = o, blank = b, "VideoHub: disconnecting an output");
+                self.route_output(snap, o, b);
+                ui.close();
+            }
+        });
         self.pick_or_edit(&r, Pick::Output(o), LabelKind::Output, o, routing);
         rect
     }
@@ -348,6 +396,14 @@ mod tests {
         );
         assert_eq!(lit(&routing(), Some(Pick::Output(3))), Lit { outputs: vec![3], ..Lit::default() });
         assert_eq!(lit(&routing(), None), Lit::default());
+    }
+
+    #[test]
+    fn disconnecting_routes_the_blank_input_once_one_is_marked() {
+        assert_eq!(disconnect_input(&routing(), 1, 9), Some(9));
+        assert_eq!(disconnect_input(&routing(), 1, 0), None, "no blank input marked");
+        assert_eq!(disconnect_input(&routing(), 5, 5), None, "already shows it");
+        assert_eq!(disconnect_input(&routing(), 3, 9), Some(9), "an output whose input is unknown");
     }
 
     #[test]
