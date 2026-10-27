@@ -4,6 +4,7 @@
 //! saved at once, like the presets. At start-up StreamIt offers to restore the Default
 //! presets when the routing differs from them.
 use super::super::StreamItApp;
+use super::pool::{self, Thumb};
 use crate::theme;
 use eframe::egui::{self, Align, Align2, Color32, Layout, Rect, RichText, Sense, Stroke, Ui, vec2};
 use streamit_core::config::Config;
@@ -15,7 +16,8 @@ use tracing::info;
 /// Media pool slots shown on an ATEM page: two rows of eight.
 pub(in crate::ui) const POOL_SHOWN: usize = 16;
 const POOL_COLS: usize = 8;
-const POOL_SLOT_H: f32 = 58.0;
+/// A slot's number line and name line, around its picture.
+const POOL_SLOT_TEXT_H: f32 = 48.0;
 /// Media players offered for the stills.
 const MEDIA_PLAYERS: u8 = 4;
 
@@ -228,6 +230,8 @@ impl StreamItApp {
             Target::StreamAtem => c.stream_atem.media_player,
             _ => c.screens_atem.media_player,
         };
+        self.pool_tick(&ui.ctx().clone(), target, stills, &snap.stage);
+        let busy = pool::under_way(&snap.stage);
         theme::panel().inner_margin(20).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -258,8 +262,14 @@ impl StreamItApp {
             });
             let note = match (target, stills.is_empty()) {
                 (_, true) => "The ATEM has not listed its media pool yet.",
-                (Target::StreamAtem, false) => "Right-click a slot to use it as the opening or closing still.",
-                _ => "Right-click a slot to mark it. The Screens ATEM's stills are not used by StreamIt yet.",
+                (Target::StreamAtem, false) => {
+                    "Right-click a slot to use it as the opening or closing still, put a picture in it, save it to a \
+                     file or clear it."
+                }
+                _ => {
+                    "Right-click a slot to mark it, put a picture in it, save it or clear it. The Screens ATEM's \
+                     stills are not used by StreamIt yet."
+                }
             };
             ui.label(RichText::new(note).size(13.0).color(theme::MUTED));
             ui.add_space(8.0);
@@ -271,7 +281,8 @@ impl StreamItApp {
                     for col in 0..POOL_COLS {
                         let slot = (row * POOL_COLS + col) as u16;
                         let name = stills.get(usize::from(slot)).cloned().flatten();
-                        self.pool_slot(ui, target, slot, name, w, (opening == Some(slot), closing == Some(slot)));
+                        let marks = (opening == Some(slot), closing == Some(slot));
+                        self.pool_slot(ui, target, slot, name, w, marks, busy);
                     }
                 });
                 ui.add_space(gap);
@@ -279,8 +290,20 @@ impl StreamItApp {
         });
     }
 
-    fn pool_slot(&mut self, ui: &mut Ui, target: Target, slot: u16, name: Option<String>, w: f32, marks: (bool, bool)) {
-        let (rect, r) = ui.allocate_exact_size(vec2(w, POOL_SLOT_H), Sense::click());
+    /// `under_way`: a service is under way, so pictures cannot be put in or cleared.
+    #[allow(clippy::too_many_arguments)]
+    fn pool_slot(
+        &mut self,
+        ui: &mut Ui,
+        target: Target,
+        slot: u16,
+        name: Option<String>,
+        w: f32,
+        marks: (bool, bool),
+        under_way: bool,
+    ) {
+        let pic_h = ((w - 12.0) * 9.0 / 16.0).max(20.0);
+        let (rect, r) = ui.allocate_exact_size(vec2(w, POOL_SLOT_TEXT_H + pic_h), Sense::click());
         let (is_open, is_close) = marks;
         let border = if is_open || is_close { theme::BLUE } else { theme::BORDER };
         let p = ui.painter();
@@ -304,8 +327,42 @@ impl StreamItApp {
             Some(_) => (format!("Still {}", slot + 1), theme::TEXT),
             None => ("Empty".to_string(), theme::DIM),
         };
-        let galley = ui.painter().layout(text, theme::body_bold(13.0), colour, rect.width() - 16.0);
-        ui.painter().with_clip_rect(rect.shrink(3.0)).galley(rect.left_top() + vec2(8.0, 26.0), galley, colour);
+        let galley = ui.painter().layout_no_wrap(text, theme::body_bold(13.0), colour);
+        let pic = Rect::from_min_size(rect.left_top() + vec2(6.0, 24.0), vec2(w - 12.0, pic_h));
+        ui.painter().with_clip_rect(rect.shrink(3.0)).galley(pic.left_bottom() + vec2(2.0, 4.0), galley, colour);
+        let p = ui.painter();
+        p.rect_filled(pic, 4.0, theme::SCREEN);
+        let note = |p: &egui::Painter, s: &str, c: Color32| {
+            p.text(pic.center(), Align2::CENTER_CENTER, s, egui::FontId::proportional(11.5), c);
+        };
+        let failed = match self.pool_thumb(target, slot, name.as_ref()) {
+            Thumb::Picture(tex) => {
+                let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                p.image(tex.id(), pic, uv, Color32::WHITE);
+                None
+            }
+            Thumb::Working(what) => {
+                note(p, what, theme::AMBER_SOFT);
+                None
+            }
+            Thumb::Failed(why) => {
+                note(p, "No picture", theme::DIM);
+                Some(why.to_string())
+            }
+            Thumb::Waiting if under_way => None,
+            Thumb::Waiting => {
+                note(p, "Loading…", theme::DIM);
+                None
+            }
+            Thumb::Empty => None,
+        };
+        let r = match failed {
+            Some(why) => r.on_hover_text(format!("Could not read the picture: {why}")),
+            None => r,
+        };
+        let used = name.is_some();
+        let can_change = !under_way && !self.pool_busy();
+        let still_name = name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| format!("Still {}", slot + 1));
         r.context_menu(|ui| {
             ui.label(RichText::new(format!("MEDIA SLOT {}", slot + 1)).size(11.0).color(theme::MUTED));
             let optional = target == Target::ScreensAtem;
@@ -330,6 +387,29 @@ impl StreamItApp {
                 });
                 ui.close();
             }
+            ui.separator();
+            let why = if under_way { "Not during a service." } else { "Waiting for the last one to finish." };
+            let put = ui.add_enabled(can_change, egui::Button::new("Put a picture in this slot…"));
+            if put
+                .on_hover_text("A PNG or JPEG, fitted to the switcher's format on black (no stretching).")
+                .on_disabled_hover_text(why)
+                .clicked()
+            {
+                self.put_picture(target, slot);
+                ui.close();
+            }
+            if ui.add_enabled(used && !self.pool_busy(), egui::Button::new("Save this still to a file…")).clicked() {
+                self.save_still(target, slot, still_name.clone());
+                ui.close();
+            }
+            ui.add_enabled_ui(used && can_change, |ui| {
+                ui.menu_button("Clear the slot", |ui| {
+                    if ui.button(format!("Empty slot {}", slot + 1)).clicked() {
+                        self.clear_slot(target, slot);
+                        ui.close();
+                    }
+                });
+            });
         });
     }
 

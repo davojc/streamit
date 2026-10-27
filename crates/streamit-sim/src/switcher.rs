@@ -3,9 +3,21 @@ use crate::{Fault, Mix, PendingRoute, SimHandle, SimWorld, SwitcherState};
 use async_trait::async_trait;
 use std::time::Duration;
 use streamit_core::config::AudioSourceId;
-use streamit_core::devices::{AudioInput, AudioMix, DeviceError, LabelKind, Result, Router, StreamSwitcher, Switcher};
+use streamit_core::devices::{
+    AudioInput, AudioMix, DeviceError, LabelKind, Result, Router, Still, StreamSwitcher, Switcher,
+};
 use streamit_core::engine::DeviceKind;
 use tokio::time::Instant;
+
+/// The pretend switchers run 1080p.
+const STILL_SIZE: (u32, u32) = (1920, 1080);
+
+/// A pretend still: a flat colour of its own for each slot.
+fn pretend_still(slot: u16) -> Still {
+    let (width, height) = STILL_SIZE;
+    let c = [(40 + slot * 53 % 180) as u8, (60 + slot * 97 % 160) as u8, (90 + slot * 31 % 150) as u8, 255];
+    Still { width, height, rgba: c.repeat((width * height) as usize) }
+}
 
 /// A pretend mix and a pretend route both take this long at 1x.
 pub(crate) const PRETEND_DELAY: Duration = Duration::from_secs(1);
@@ -63,7 +75,45 @@ impl Switcher for SimSwitcher {
         };
         let mut v: Vec<Option<String>> = named.iter().map(|n| Some(n.to_string())).collect();
         v.resize(20, None);
+        let mut w = self.sim.lock();
+        for (&slot, changed) in &w.switcher_mut(self.which).pool {
+            if let Some(s) = v.get_mut(usize::from(slot)) {
+                *s = changed.as_ref().map(|(name, _)| name.clone());
+            }
+        }
         v
+    }
+
+    fn still_size(&self) -> Option<(u32, u32)> {
+        Some(STILL_SIZE)
+    }
+
+    async fn download_still(&self, slot: u16) -> Result<Still> {
+        let used = self.stills().get(usize::from(slot)).cloned().flatten().is_some();
+        let picture = self.state(|s| s.pool.get(&slot).cloned())?;
+        match picture {
+            Some(Some((_, still))) => Ok(still),
+            Some(None) => Err(DeviceError::Other(format!("media slot {} is empty", slot + 1))),
+            None if used => Ok(pretend_still(slot)),
+            None => Err(DeviceError::Other(format!("media slot {} is empty", slot + 1))),
+        }
+    }
+
+    async fn upload_still(&self, slot: u16, still: Still, name: &str) -> Result<()> {
+        if (still.width, still.height) != STILL_SIZE {
+            return Err(DeviceError::Other("the picture is not the switcher's size".into()));
+        }
+        tokio::time::sleep(self.sim.clock.scale(PRETEND_DELAY)).await;
+        let name = name.to_string();
+        self.state(|s| {
+            s.pool.insert(slot, Some((name, still)));
+        })
+    }
+
+    async fn clear_still(&self, slot: u16) -> Result<()> {
+        self.state(|s| {
+            s.pool.insert(slot, None);
+        })
     }
 
     async fn program(&self) -> Result<u16> {

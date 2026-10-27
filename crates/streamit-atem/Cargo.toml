@@ -9,6 +9,7 @@ streamit-core = { path = "../streamit-core" }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["net", "time", "sync", "rt", "macros"] }
 tracing = { workspace = true }
+md-5 = "0.10"
 
 # Not "probe": the VideoHub and Web Presenter crates already have examples named probe, and
 # same-named examples in one workspace overwrite each other in target/debug/examples (on

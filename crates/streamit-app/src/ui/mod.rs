@@ -233,6 +233,8 @@ pub struct StreamItApp {
     lengths: videos::Lengths,
     updates: updates::Updates,
     routes_ui: routing::RtUi,
+    /// The media pool's thumbnails and picture jobs (kept across sub-tabs).
+    pool: routing::pool::Pool,
     /// The page the Stream Deck shows, shared with it: it follows the tab, and a page
     /// picked on the deck opens here.
     deck_page: Arc<tokio::sync::watch::Sender<DeckPage>>,
@@ -323,6 +325,7 @@ impl StreamItApp {
             lengths: videos::Lengths::default(),
             updates: updates::Updates::default(),
             routes_ui: routing::RtUi::default(),
+            pool: routing::pool::Pool::default(),
             deck_seen: deck_page.subscribe(),
             deck_page,
         };

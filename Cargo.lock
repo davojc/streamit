@@ -2488,6 +2488,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
+
+[[package]]
 name = "mdns-sd"
 version = "0.21.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4272,6 +4282,7 @@ dependencies = [
  "eframe",
  "hex",
  "if-addrs",
+ "image",
  "mdns-sd",
  "reqwest",
  "rfd",
@@ -4305,6 +4316,7 @@ version = "0.1.14"
 dependencies = [
  "anyhow",
  "async-trait",
+ "md-5",
  "streamit-core",
  "tokio",
  "tracing",

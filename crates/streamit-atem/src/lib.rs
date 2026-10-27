@@ -10,16 +10,18 @@ pub mod commands;
 pub mod packet;
 pub mod probe;
 pub mod state;
+pub mod still;
 
 use async_trait::async_trait;
 use commands::{Cfsp, Mpss, cpgi, cpvi, daut, mix_option};
 use packet::{LinkEvent, SendRequest, Timings, Transport, UdpTransport, run_link};
 use state::AtemState;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU16;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use streamit_core::config::AudioSourceId;
-use streamit_core::devices::{AudioInput, AudioMix, DeviceError, Result, StreamSwitcher, Switcher};
+use streamit_core::devices::{AudioInput, AudioMix, DeviceError, Result, Still, StreamSwitcher, Switcher};
 use tokio::sync::{mpsc, oneshot, watch};
 
 pub use packet::ATEM_PORT;
@@ -48,6 +50,10 @@ pub struct AtemClient {
     requests: mpsc::Sender<SendRequest>,
     /// (session, transition_updates) when the last auto was sent; see `wait_transition_done`.
     auto_mark: Mutex<Option<(u64, u64)>>,
+    /// Where transfer replies go while a transfer runs (one at a time: `transfer_turn`).
+    transfer: Arc<Mutex<Option<mpsc::UnboundedSender<commands::Decoded>>>>,
+    transfer_turn: tokio::sync::Mutex<()>,
+    next_transfer: AtomicU16,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -72,6 +78,8 @@ impl AtemClient {
     pub fn with_transport<T: Transport>(transport: T, timings: Timings) -> Arc<AtemClient> {
         let (tx, rx) = watch::channel(Snapshot::default());
         let (req_tx, req_rx) = mpsc::channel(32);
+        let transfer: Arc<Mutex<Option<mpsc::UnboundedSender<commands::Decoded>>>> = Arc::default();
+        let to_transfer = transfer.clone();
         let on_event = move |e: LinkEvent| match e {
             LinkEvent::Connected => tx.send_modify(|s| {
                 s.connected = true;
@@ -83,19 +91,41 @@ impl AtemClient {
                 s.connected = false;
                 s.state = AtemState::default();
             }),
-            LinkEvent::Commands(p) => tx.send_modify(|s| {
-                for cmd in commands::split_commands(&p) {
-                    if let Some(d) = commands::decode(&cmd) {
-                        if matches!(d, commands::Decoded::TransitionPosition { mix_effect: ME, .. }) {
-                            s.transition_updates += 1;
-                        }
-                        s.state.apply(&d);
+            LinkEvent::Commands(p) => {
+                let (moves, state): (Vec<_>, Vec<_>) = commands::split_commands(&p)
+                    .iter()
+                    .filter_map(commands::decode)
+                    .partition(commands::Decoded::is_transfer);
+                if !moves.is_empty()
+                    && let Some(t) = to_transfer.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+                {
+                    for d in moves {
+                        let _ = t.send(d);
                     }
                 }
-            }),
+                // A packet of transfer data alone changes nothing watchers care about.
+                if !state.is_empty() {
+                    tx.send_modify(|s| {
+                        for d in &state {
+                            if matches!(d, commands::Decoded::TransitionPosition { mix_effect: ME, .. }) {
+                                s.transition_updates += 1;
+                            }
+                            s.state.apply(d);
+                        }
+                    });
+                }
+            }
         };
         let task = tokio::spawn(run_link(transport, timings, req_rx, on_event));
-        Arc::new(AtemClient { shared: rx, requests: req_tx, auto_mark: Mutex::new(None), task })
+        Arc::new(AtemClient {
+            shared: rx,
+            requests: req_tx,
+            auto_mark: Mutex::new(None),
+            transfer,
+            transfer_turn: tokio::sync::Mutex::new(()),
+            next_transfer: AtomicU16::new(1),
+            task,
+        })
     }
 
     /// A copy of the current state, initialised or not.
@@ -180,6 +210,42 @@ impl Switcher for AtemClient {
         let s = self.shared.borrow();
         let len = s.state.stills.keys().next_back().map_or(0, |&i| usize::from(i) + 1);
         (0..len).map(|i| s.state.stills.get(&(i as u16)).cloned().flatten()).collect()
+    }
+
+    fn still_size(&self) -> Option<(u32, u32)> {
+        self.shared.borrow().state.video_mode.and_then(still::mode_size)
+    }
+
+    async fn download_still(&self, slot: u16) -> Result<Still> {
+        let (width, height) = self.size_for_stills()?;
+        let index = u8::try_from(slot).map_err(|_| DeviceError::Other(format!("no media slot {}", slot + 1)))?;
+        let raw = self.download(index).await?;
+        let yuv = still::decode_rle(&raw, (width * height * 4) as usize);
+        Ok(Still { width, height, rgba: still::yuv422_to_rgba(width, height, &yuv) })
+    }
+
+    async fn upload_still(&self, slot: u16, picture: Still, name: &str) -> Result<()> {
+        let (width, height) = self.size_for_stills()?;
+        if (picture.width, picture.height) != (width, height) {
+            return Err(DeviceError::Other(format!(
+                "the picture is {}x{}; the switcher's stills are {width}x{height}",
+                picture.width, picture.height
+            )));
+        }
+        let yuv = still::rgba_to_yuv422(width, height, &picture.rgba);
+        let hash: [u8; 16] = {
+            use md5::Digest;
+            md5::Md5::digest(&yuv).into()
+        };
+        let data = still::encode_rle(&yuv);
+        let size = yuv.len() as u32;
+        self.upload(slot, size, &data, name, &hash).await
+    }
+
+    async fn clear_still(&self, slot: u16) -> Result<()> {
+        self.read(|_| Ok(()))?;
+        let index = u8::try_from(slot).map_err(|_| DeviceError::Other(format!("no media slot {}", slot + 1)))?;
+        self.send(commands::cstl(index)).await
     }
 
     async fn program(&self) -> Result<u16> {
@@ -369,6 +435,108 @@ mod tests {
         atem.dump(fairlight);
         client.wait_initialised(Duration::from_secs(1)).await.unwrap();
         (atem, client)
+    }
+
+    /// The client's next command (acked), as (name, body).
+    async fn take(atem: &mut Atem) -> (String, Vec<u8>) {
+        let (id, payload) = atem.next_command().await;
+        atem.ack(id);
+        (String::from_utf8_lossy(&payload[4..8]).into_owned(), payload[8..].to_vec())
+    }
+
+    /// A 720p picture of one colour, and its RLE as the switcher would hold it.
+    fn flat() -> (Still, Vec<u8>) {
+        let rgba = [20u8, 120, 220, 255].repeat(1280 * 720);
+        let rle = still::encode_rle(&still::rgba_to_yuv422(1280, 720, &rgba));
+        (Still { width: 1280, height: 720, rgba }, rle)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_still_downloads_under_the_media_pool_lock() {
+        let (mut atem, client) = initialised(false).await;
+        atem.push(&frame(b"VidM", &[4, 0, 0, 0]));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(client.still_size(), Some((1280, 720)));
+        let c = client.clone();
+        let call = tokio::spawn(async move { c.download_still(2).await });
+        assert_eq!(take(&mut atem).await, ("LOCK".into(), vec![0, 0, 1, 0]));
+        atem.push(&frame(b"LKOB", &[0, 0, 0, 0]));
+        let (name, body) = take(&mut atem).await;
+        assert_eq!(name, "FTSU");
+        let id = [body[0], body[1]];
+        assert_eq!(body[6..10], [0, 2, 0, 0xf9]);
+        let (_, rle) = flat();
+        let (a, b) = rle.split_at(16);
+        for part in [a, b] {
+            let mut d = id.to_vec();
+            d.extend_from_slice(&(part.len() as u16).to_be_bytes());
+            d.extend_from_slice(part);
+            atem.push(&frame(b"FTDa", &d));
+            assert_eq!(take(&mut atem).await, ("FTUA".into(), vec![id[0], id[1], 2, 0]));
+        }
+        atem.push(&frame(b"FTDC", &[id[0], id[1], 0, 0]));
+        assert_eq!(take(&mut atem).await, ("LOCK".into(), vec![0, 0, 0, 0]), "unlocked after");
+        let got = call.await.unwrap().unwrap();
+        assert_eq!((got.width, got.height, got.rgba.len()), (1280, 720, 1280 * 720 * 4));
+        for (want, was) in [20u8, 120, 220, 255].iter().zip(&got.rgba[..4]) {
+            assert!(want.abs_diff(*was) <= 2, "{:?}", &got.rgba[..4]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_still_uploads_with_its_name_when_the_switcher_asks_for_chunks() {
+        let (mut atem, client) = initialised(false).await;
+        atem.push(&frame(b"VidM", &[4, 0, 0, 0]));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let (picture, rle) = flat();
+        let c = client.clone();
+        let call = tokio::spawn(async move { c.upload_still(3, picture, "Notices").await });
+        assert_eq!(take(&mut atem).await.0, "LOCK");
+        atem.push(&frame(b"LKOB", &[0, 0, 0, 0]));
+        let (name, body) = take(&mut atem).await;
+        assert_eq!(name, "FTSD");
+        let id = [body[0], body[1]];
+        assert_eq!(body[6..14], [0, 3, 0, 0x38, 0x40, 0, 0, 1], "slot 3, 1280x720x4 bytes, mode 1");
+        let mut more = id.to_vec();
+        more.extend_from_slice(&[0, 0, 0, 0, 3, 0xe8, 0, 10, 0, 0]);
+        atem.push(&frame(b"FTCD", &more));
+        let (name, body) = take(&mut atem).await;
+        assert_eq!(name, "FTFD");
+        assert_eq!(&body[2..9], b"Notices");
+        let (name, body) = take(&mut atem).await;
+        assert_eq!(name, "FTDa");
+        assert_eq!(body[4..], rle[..], "the whole RLE fits one chunk");
+        atem.push(&frame(b"FTDC", &[id[0], id[1], 0, 0]));
+        assert_eq!(take(&mut atem).await, ("LOCK".into(), vec![0, 0, 0, 0]));
+        assert_eq!(call.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_still_cannot_be_moved_while_another_client_holds_the_lock() {
+        let (mut atem, client) = initialised(false).await;
+        atem.push(&frame(b"VidM", &[4, 0, 0, 0]));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let c = client.clone();
+        let call = tokio::spawn(async move { c.download_still(0).await });
+        assert_eq!(take(&mut atem).await.0, "LOCK");
+        // No LKOB (the switcher keeps talking, so the link stays up): given up after the wait,
+        // and the lock request withdrawn.
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            atem.push(&frame(b"TrPs", &[0, 0, 0, 0, 0, 0, 0, 0]));
+        }
+        assert_eq!(take(&mut atem).await, ("LOCK".into(), vec![0, 0, 0, 0]));
+        let r = call.await.unwrap();
+        assert!(matches!(&r, Err(DeviceError::Other(m)) if m.contains("lock")), "{r:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clearing_a_slot_sends_cstl() {
+        let (mut atem, client) = initialised(false).await;
+        let c = client.clone();
+        let call = tokio::spawn(async move { c.clear_still(4).await });
+        assert_eq!(take(&mut atem).await, ("CSTL".into(), vec![4, 0, 0, 0]));
+        assert_eq!(call.await.unwrap(), Ok(()));
     }
 
     #[tokio::test(start_paused = true)]

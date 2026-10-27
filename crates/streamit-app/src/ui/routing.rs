@@ -5,6 +5,7 @@
 //! it. What the destinations show always comes from the VideoHub. Changing an ATEM input
 //! that is on program asks first. Right-clicking an ATEM input, a preset or a media pool
 //! slot sets up what StreamIt uses it for (see `setup`).
+pub(super) mod pool;
 mod setup;
 mod videohub;
 

@@ -238,6 +238,45 @@ pub enum Decoded {
         index: u16,
         name: Option<String>,
     },
+    /// The switcher's video mode (upstream `Enums.VideoMode`).
+    VideoMode(u8),
+    /// Our lock on a media store (0: the stills) is granted.
+    LockObtained(u16),
+    LockState {
+        index: u16,
+        locked: bool,
+    },
+    /// A chunk of a still being downloaded.
+    TransferData {
+        id: u16,
+        body: Vec<u8>,
+    },
+    TransferComplete(u16),
+    TransferError {
+        id: u16,
+        code: u8,
+    },
+    /// The switcher wants `chunk_count` more chunks of at most `chunk_size` bytes.
+    TransferContinue {
+        id: u16,
+        chunk_size: u16,
+        chunk_count: u16,
+    },
+}
+
+impl Decoded {
+    /// Part of a data transfer (or its lock): routed to the transfer under way, not state.
+    pub fn is_transfer(&self) -> bool {
+        matches!(
+            self,
+            Decoded::LockObtained(_)
+                | Decoded::LockState { .. }
+                | Decoded::TransferData { .. }
+                | Decoded::TransferComplete(_)
+                | Decoded::TransferError { .. }
+                | Decoded::TransferContinue { .. }
+        )
+    }
 }
 
 /// Decodes one command, or `None` for one StreamIt ignores (or one too short to read).
@@ -294,8 +333,89 @@ pub fn decode(cmd: &RawCommand<'_>) -> Option<Decoded> {
             supported_mix_options: r.u8(48)?,
             mix_option: r.u8(49)?,
         }),
+        // Upstream: src/commands/Settings/VideoMode.ts (`VideoModeUpdateCommand.deserialize`).
+        b"VidM" => Some(Decoded::VideoMode(r.u8(0)?)),
+        // Upstream: src/commands/DataTransfer/LockObtainedCommand.ts.
+        b"LKOB" => Some(Decoded::LockObtained(r.u16(0)?)),
+        // Upstream: src/commands/DataTransfer/LockStateCommand.ts (`LockStateUpdateCommand`).
+        b"LKST" => Some(Decoded::LockState { index: r.u16(0)?, locked: r.u8(2)? == 1 }),
+        // Upstream: src/commands/DataTransfer/DataTransferDataCommand.ts: id, size, then the data.
+        b"FTDa" => {
+            let size = usize::from(r.u16(2)?);
+            Some(Decoded::TransferData { id: r.u16(0)?, body: cmd.body.get(4..4 + size)?.to_vec() })
+        }
+        // Upstream: src/commands/DataTransfer/DataTransferCompleteCommand.ts.
+        b"FTDC" => Some(Decoded::TransferComplete(r.u16(0)?)),
+        // Upstream: src/commands/DataTransfer/DataTransferErrorCommand.ts.
+        b"FTDE" => Some(Decoded::TransferError { id: r.u16(0)?, code: r.u8(2)? }),
+        // Upstream: src/commands/DataTransfer/DataTransferUploadContinueCommand.ts.
+        b"FTCD" => Some(Decoded::TransferContinue { id: r.u16(0)?, chunk_size: r.u16(6)?, chunk_count: r.u16(8)? }),
         _ => None,
     }
+}
+
+// Upstream: src/commands/DataTransfer/LockStateCommand.ts (`LockStateCommand.serialize`).
+pub fn lock(store: u16, locked: bool) -> Vec<u8> {
+    let s = store.to_be_bytes();
+    frame(b"LOCK", &[s[0], s[1], u8::from(locked), 0])
+}
+
+// Upstream: src/commands/DataTransfer/DataTransferDownloadRequestCommand.ts; a still is
+// type 0x00f9 (src/dataTransfer/dataTransferDownloadStill.ts).
+pub fn ftsu(id: u16, store: u16, index: u16) -> Vec<u8> {
+    let mut b = [0u8; 12];
+    b[0..2].copy_from_slice(&id.to_be_bytes());
+    b[2..4].copy_from_slice(&store.to_be_bytes());
+    b[6..8].copy_from_slice(&index.to_be_bytes());
+    b[8..10].copy_from_slice(&0x00f9u16.to_be_bytes());
+    frame(b"FTSU", &b)
+}
+
+// Upstream: src/commands/DataTransfer/DataTransferUploadRequestCommand.ts; a still is mode 1
+// (src/dataTransfer/dataTransferUploadStill.ts). `size`: the length before RLE.
+pub fn ftsd(id: u16, store: u16, index: u16, size: u32) -> Vec<u8> {
+    let mut b = [0u8; 16];
+    b[0..2].copy_from_slice(&id.to_be_bytes());
+    b[2..4].copy_from_slice(&store.to_be_bytes());
+    b[6..8].copy_from_slice(&index.to_be_bytes());
+    b[8..12].copy_from_slice(&size.to_be_bytes());
+    b[12..14].copy_from_slice(&1u16.to_be_bytes());
+    frame(b"FTSD", &b)
+}
+
+// Upstream: src/commands/DataTransfer/DataTransferFileDescriptionCommand.ts: name in 64
+// bytes, description in 128, then the 16-byte MD5 of the data before RLE.
+pub fn ftfd(id: u16, name: &str, description: &str, hash: &[u8; 16]) -> Vec<u8> {
+    let mut b = [0u8; 212];
+    b[0..2].copy_from_slice(&id.to_be_bytes());
+    let put = |b: &mut [u8], s: &str| {
+        let n = s.len().min(b.len());
+        b[..n].copy_from_slice(&s.as_bytes()[..n]);
+    };
+    put(&mut b[2..66], name);
+    put(&mut b[66..194], description);
+    b[194..210].copy_from_slice(hash);
+    frame(b"FTFD", &b)
+}
+
+// Upstream: src/commands/DataTransfer/DataTransferAckCommand.ts.
+pub fn ftua(id: u16, index: u8) -> Vec<u8> {
+    let i = id.to_be_bytes();
+    frame(b"FTUA", &[i[0], i[1], index, 0])
+}
+
+// Upstream: src/commands/DataTransfer/DataTransferDataCommand.ts (`serialize`).
+pub fn ftda(id: u16, data: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(4 + data.len());
+    b.extend_from_slice(&id.to_be_bytes());
+    b.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    b.extend_from_slice(data);
+    frame(b"FTDa", &b)
+}
+
+// Upstream: src/commands/Media/MediaPoolClearStillCommand.ts.
+pub fn cstl(index: u8) -> Vec<u8> {
+    frame(b"CSTL", &[index, 0, 0, 0])
 }
 
 #[cfg(test)]
@@ -311,6 +431,38 @@ mod tests {
         let cmds = split_commands(b);
         assert_eq!(cmds.len(), 1);
         decode(&cmds[0])
+    }
+
+    #[test]
+    fn transfer_commands_follow_upstream_layouts() {
+        assert_eq!(lock(0, true), [0, 12, 0, 0, b'L', b'O', b'C', b'K', 0, 0, 1, 0]);
+        assert_eq!(ftsu(3, 0, 5)[8..], [0, 3, 0, 0, 0, 0, 0, 5, 0, 0xf9, 0, 0]);
+        let sd = ftsd(3, 0, 5, 1920 * 1080 * 4);
+        assert_eq!(sd[8..], [0, 3, 0, 0, 0, 0, 0, 5, 0, 0x7e, 0x90, 0, 0, 1, 0, 0]);
+        let fd = ftfd(3, "Notices", "", &[7; 16]);
+        assert_eq!(fd.len(), 8 + 212);
+        assert_eq!(&fd[10..17], b"Notices");
+        assert_eq!(fd[8 + 194..8 + 210], [7; 16]);
+        assert_eq!(ftua(3, 5)[8..], [0, 3, 5, 0]);
+        assert_eq!(ftda(3, &[9, 9])[8..], [0, 3, 0, 2, 9, 9]);
+        assert_eq!(cstl(4)[4..], [b'C', b'S', b'T', b'L', 4, 0, 0, 0]);
+    }
+
+    #[test]
+    fn transfer_replies_decode() {
+        assert_eq!(decode_bytes(&frame(b"LKOB", &[0, 0, 0, 0])), Some(Decoded::LockObtained(0)));
+        assert_eq!(decode_bytes(&frame(b"LKST", &[0, 0, 1, 0])), Some(Decoded::LockState { index: 0, locked: true }));
+        assert_eq!(
+            decode_bytes(&frame(b"FTDa", &[0, 3, 0, 2, 9, 8, 0, 0])),
+            Some(Decoded::TransferData { id: 3, body: vec![9, 8] })
+        );
+        assert_eq!(decode_bytes(&frame(b"FTDC", &[0, 3, 0, 0])), Some(Decoded::TransferComplete(3)));
+        assert_eq!(decode_bytes(&frame(b"FTDE", &[0, 3, 1, 0])), Some(Decoded::TransferError { id: 3, code: 1 }));
+        assert_eq!(
+            decode_bytes(&frame(b"FTCD", &[0, 3, 0, 0, 0, 0, 5, 0x6c, 0, 20, 0, 0])),
+            Some(Decoded::TransferContinue { id: 3, chunk_size: 1388, chunk_count: 20 })
+        );
+        assert_eq!(decode_bytes(&frame(b"VidM", &[11, 0, 0, 0])), Some(Decoded::VideoMode(11)));
     }
 
     #[test]

@@ -35,6 +35,8 @@ pub struct AtemState {
     pub fairlight: BTreeMap<(u16, i64), FairlightSource>,
     /// The media pool's still slots by 0-based index: the file name, `None` when empty.
     pub stills: BTreeMap<u16, Option<String>>,
+    /// The video mode (upstream `Enums.VideoMode`), which sets a still's size.
+    pub video_mode: Option<u8>,
 }
 
 impl AtemState {
@@ -65,6 +67,9 @@ impl AtemState {
             Decoded::MediaPoolStill { index, ref name } => {
                 self.stills.insert(index, name.clone());
             }
+            Decoded::VideoMode(m) => self.video_mode = Some(m),
+            // Transfers are routed to the one under way, not kept as state.
+            _ => {}
         }
     }
 

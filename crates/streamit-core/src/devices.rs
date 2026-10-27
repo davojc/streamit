@@ -32,6 +32,39 @@ pub trait Switcher: Send + Sync {
     fn stills(&self) -> Vec<Option<String>> {
         Vec::new()
     }
+    /// The size a still must be: the switcher's video format. `None` until it has said.
+    fn still_size(&self) -> Option<(u32, u32)> {
+        None
+    }
+    /// Downloads the still in media pool `slot` (from 0).
+    async fn download_still(&self, slot: u16) -> Result<Still> {
+        let _ = slot;
+        Err(DeviceError::Other("this switcher cannot send its stills".into()))
+    }
+    /// Puts `still` (already `still_size`) in media pool `slot` (from 0), named `name`.
+    async fn upload_still(&self, slot: u16, still: Still, name: &str) -> Result<()> {
+        let _ = (slot, still, name);
+        Err(DeviceError::Other("this switcher cannot take stills".into()))
+    }
+    /// Empties media pool `slot` (from 0).
+    async fn clear_still(&self, slot: u16) -> Result<()> {
+        let _ = slot;
+        Err(DeviceError::Other("this switcher cannot clear stills".into()))
+    }
+}
+
+/// A picture as 8-bit RGBA, row by row.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Still {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl std::fmt::Debug for Still {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Still({}x{})", self.width, self.height)
+    }
 }
 
 #[async_trait]

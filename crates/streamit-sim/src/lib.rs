@@ -54,11 +54,14 @@ pub struct SwitcherState {
     pub program: u16,
     pub preview: u16,
     pub mix: Option<Mix>,
+    /// Media pool slots changed in this simulation: a picture put in (with its name), or
+    /// `None` when cleared. Other slots keep their pretend stills.
+    pub pool: std::collections::BTreeMap<u16, Option<(String, streamit_core::devices::Still)>>,
 }
 
 impl SwitcherState {
     pub fn new(program: u16, preview: u16) -> Self {
-        Self { program, preview, mix: None }
+        Self { program, preview, mix: None, pool: Default::default() }
     }
 
     /// Applies a mix whose time has come: the target goes to program, the old
