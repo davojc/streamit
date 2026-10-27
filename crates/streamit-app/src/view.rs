@@ -1196,7 +1196,10 @@ mod tests {
         assert_eq!(v.public_at_text, "0:10");
         assert_eq!(v.ndi_text, "NDI counter sending 0:42 as “StreamIt Countdown”");
         c.ndi.off = true;
-        assert_eq!(countdown(&countdown_at(42), &c).unwrap().ndi_text, "NDI counter turned off (Settings › Playout & NDI counter)");
+        assert_eq!(
+            countdown(&countdown_at(42), &c).unwrap().ndi_text,
+            "NDI counter turned off (Settings › Playout & NDI counter)"
+        );
         c.ndi.off = false;
         assert!((v.progress - 0.86).abs() < 0.001, "{}", v.progress);
         assert!(!v.public);
