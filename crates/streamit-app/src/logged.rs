@@ -1,11 +1,16 @@
 //! Logging decorators for the device traits. Every action call is logged at `info` with
 //! its arguments and result (`warn` when it fails); read getters (program, route_of,
 //! status, signed_in, upcoming, check, health, life_cycle, live_details, audio_level,
-//! audio_input, chat_messages, position) are
-//! not logged, because the health poll calls them every 2 s. The countdown counter's
+//! audio_input, chat_messages, position, stills, input_names) are
+//! not logged, because the health poll calls them every 2 s. A downloaded still is logged by
+//! its size, not its pixels.
+//!
+//! Every trait method must be forwarded here, defaults included: one left out silently
+//! falls back to the trait's default (an empty list, or "cannot") on real hardware. The countdown counter's
 //! `show`, called ten times a second, is logged at `debug` (a failure still at `warn`). Arguments are numbers,
 //! file paths and broadcast ids only: no tokens or secrets pass through these traits.
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::path::Path;
 use std::sync::Arc;
@@ -13,8 +18,8 @@ use std::time::Duration;
 use streamit_core::config::AudioSourceId;
 use streamit_core::devices::{
     AudioInput, BroadcastCheck, BroadcastSummary, Broadcasts, ChatPage, Counter, Encoder, EncoderStatus, Fix, Health,
-    LabelKind, Lighting, LightingStatus, LiveDetails, Phase, Player, PlayerEvent, Result, Router, StreamSwitcher,
-    Switcher,
+    InputName, LabelKind, Lighting, LightingStatus, LiveDetails, Phase, Player, PlayerEvent, Result, Router, Still,
+    StreamSwitcher, Switcher,
 };
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -66,6 +71,32 @@ impl<T: Switcher + ?Sized> Switcher for Logged<T> {
     }
     async fn wait_transition_done(&self, timeout: Duration) -> Result<()> {
         done(self.device, format!("wait_transition_done({timeout:?})"), self.inner.wait_transition_done(timeout).await)
+    }
+    fn stills(&self) -> Vec<Option<String>> {
+        self.inner.stills()
+    }
+    fn still_size(&self) -> Option<(u32, u32)> {
+        self.inner.still_size()
+    }
+    async fn download_still(&self, slot: u16) -> Result<Still> {
+        let r = self.inner.download_still(slot).await;
+        let size = r.as_ref().map(|s| format!("{}x{}", s.width, s.height)).map_err(Clone::clone);
+        done(self.device, format!("download_still({slot})"), size)?;
+        r
+    }
+    async fn upload_still(&self, slot: u16, still: Still, name: &str) -> Result<()> {
+        let call = format!("upload_still({slot}, {}x{}, {name:?})", still.width, still.height);
+        done(self.device, call, self.inner.upload_still(slot, still, name).await)
+    }
+    async fn clear_still(&self, slot: u16) -> Result<()> {
+        done(self.device, format!("clear_still({slot})"), self.inner.clear_still(slot).await)
+    }
+    fn input_names(&self) -> BTreeMap<u16, InputName> {
+        self.inner.input_names()
+    }
+    async fn set_input_name(&self, input: u16, long: &str, short: &str) -> Result<()> {
+        let call = format!("set_input_name({input}, {long:?}, {short:?})");
+        done(self.device, call, self.inner.set_input_name(input, long, short).await)
     }
 }
 
@@ -239,6 +270,22 @@ mod tests {
     use std::sync::Mutex;
     use streamit_core::fakes::{Call, fake_devices};
     use tracing_subscriber::fmt::MakeWriter;
+
+    /// The wrapper must pass on the media pool and the input names, not fall back to the
+    /// trait's defaults (an empty pool: what a real ATEM showed).
+    #[tokio::test]
+    async fn a_wrapped_switcher_still_lists_its_stills_and_input_names() {
+        let sim = streamit_sim::SimHandle::new(&streamit_core::config::Config::default(), streamit_sim::Speed::X10);
+        let sw = Logged::wrap("Screens ATEM", Arc::new(sim.screens_switcher()));
+        assert!(sw.stills().iter().any(Option::is_some));
+        assert_eq!(sw.still_size(), Some((1920, 1080)));
+        assert_eq!(sw.download_still(0).await.map(|s| s.width).ok(), Some(1920));
+        assert!(!sw.input_names().is_empty());
+        sw.set_input_name(2, "Pulpit Cam", "PULP").await.unwrap();
+        assert_eq!(sw.input_names()[&2].long, "Pulpit Cam");
+        sw.clear_still(0).await.unwrap();
+        assert_eq!(sw.stills()[0], None);
+    }
 
     #[derive(Clone, Default)]
     struct Capture(Arc<Mutex<Vec<u8>>>);
