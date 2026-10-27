@@ -42,7 +42,6 @@ impl StreamItApp {
             Ask::PickAudio => {
                 self.tab = Tab::Settings;
                 self.section = Section::Timings;
-                self.scroll_to = Some(Section::Timings);
             }
         }
     }

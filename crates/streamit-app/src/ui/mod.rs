@@ -150,13 +150,8 @@ pub struct StreamItApp {
     sim_defaults: watch::Receiver<Vec<&'static str>>,
     switch_job: Pending<Result<(), SwitchRefused>>,
     restart_job: Pending<Result<(), SwitchRefused>>,
-    /// The Settings section last picked, and the one to scroll to on the next frame.
+    /// The Settings tab picked.
     section: Section,
-    scroll_to: Option<Section>,
-    /// The Settings sections' scroll position last frame, to notice scrolling.
-    settings_offset: f32,
-    /// When a side-menu item was last clicked (the menu stops following the scroll briefly).
-    settings_jumped: Option<Instant>,
     show_add_ip: bool,
     /// The mode the window title was last set for.
     titled: Option<Mode>,
@@ -274,9 +269,6 @@ impl StreamItApp {
             switch_job: Pending::default(),
             restart_job: Pending::default(),
             section: Section::default(),
-            scroll_to: None,
-            settings_offset: 0.0,
-            settings_jumped: None,
             show_add_ip: false,
             titled: None,
             config,
@@ -812,7 +804,6 @@ impl eframe::App for StreamItApp {
                 if theme::sim_banner(ui) {
                     self.tab = Tab::Settings;
                     self.section = Section::Equipment;
-                    self.scroll_to = Some(Section::Equipment);
                 }
             });
         }
@@ -829,7 +820,6 @@ impl eframe::App for StreamItApp {
         if equipment {
             self.tab = Tab::Settings;
             self.section = Section::Equipment;
-            self.scroll_to = Some(Section::Equipment);
         }
         self.defaults_prompt(ui, &snap);
         if let Some(n) = self.notice.clone() {
@@ -864,7 +854,7 @@ impl eframe::App for StreamItApp {
             .frame(egui::Frame::new().fill(theme::GROUND).inner_margin(Margin::symmetric(28, 24)))
             .show(ui, |ui| {
                 let viewport = ui.available_height();
-                // Settings scrolls its sections itself, so its side menu stays in view.
+                // Settings scrolls under its own tab row, so Save stays in view.
                 if self.tab == Tab::Settings {
                     return self.settings_tab(ui, &snap);
                 }
@@ -940,7 +930,6 @@ impl StreamItApp {
                     if theme::sized_button(ui, hint, theme::Kind::Primary, 36.0, 14.0, true).clicked() {
                         self.tab = Tab::Settings;
                         self.section = Section::Updates;
-                        self.scroll_to = Some(Section::Updates);
                     }
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {

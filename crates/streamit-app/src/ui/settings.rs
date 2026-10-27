@@ -1,7 +1,7 @@
-//! Screen 6: the Settings tab. A section list on the left; Equipment (the devices found
-//! on the network and their jobs, the restart note and the Simulation card), Inputs &
-//! routing, Timings & audio, YouTube, Playout & NDI counter, and Updates on the right; Save and
-//! Discard changes at the bottom.
+//! Screen 6: the Settings tab. Like Routing, a row of tabs, one per section: Profiles,
+//! Equipment (the devices found on the network and their jobs, the restart note and the
+//! Simulation card), Timings & audio, YouTube, Playout & NDI counter, and Updates. Save and
+//! Discard changes sit at the right of the tab row, so they are there on every tab.
 //!
 //! Every edit goes to the draft until Save. Save writes the shared config and the file
 //! (never when the file is not `writable`); timings and inputs apply at once, device
@@ -30,11 +30,10 @@ const RESTART_CARD: &str = "Changes to equipment take effect when StreamIt resta
 /// What Save means while simulating (Task 6's config rule).
 const SIM_SAVE_NOTE: &str = "You are in simulation. Save still writes your real settings: equipment changes take \
      effect when StreamIt restarts, and the simulation uses your changes next time you open simulation.";
-const NAV_W: f32 = 260.0;
 const GAP: f32 = 20.0;
 const FIELD_H: f32 = 40.0;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub(super) enum Section {
     #[default]
     Profiles,
@@ -195,138 +194,45 @@ fn note_box(ui: &mut Ui, s: &str, dot: Color32) {
         });
 }
 
-/// A section panel; scrolled into view when its nav entry was pressed.
-/// A Settings section's card. Returns where it was drawn, so the side menu can follow the
-/// scrolling.
-fn section(ui: &mut Ui, scroll: bool, add: impl FnOnce(&mut Ui)) -> egui::Rect {
-    let r = theme::panel()
-        .inner_margin(22)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add(ui);
-        })
-        .response;
-    if scroll {
-        r.scroll_to_me(Some(Align::TOP));
-    }
-    r.rect
-}
-
-/// How long after a click in the side menu the menu stops following the scrolling, so the
-/// jump's animation (or a short last section that cannot reach the top) does not move the
-/// highlight away from the section clicked.
-const JUMP_SETTLE: Duration = Duration::from_millis(800);
-/// How far below the top of the scrolled area a section's top may be and still count as the
-/// one being read.
-const IN_VIEW_SLACK: f32 = 80.0;
-
-/// The section being read: the last one whose top has reached the top of the view (give or
-/// take `IN_VIEW_SLACK`), else the first. Scrolled to the end (`at_end`), it is the last
-/// section, which may be too short ever to reach the top.
-pub(super) fn section_in_view(tops: &[(Section, f32)], view_top: f32, at_end: bool) -> Option<Section> {
-    if at_end {
-        return tops.last().map(|(s, _)| *s);
-    }
-    tops.iter().rev().find(|(_, top)| *top <= view_top + IN_VIEW_SLACK).or(tops.first()).map(|(s, _)| *s)
+/// A Settings section's card.
+fn section(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    theme::panel().inner_margin(22).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        add(ui);
+    });
 }
 
 impl StreamItApp {
-    /// The side menu stays put while the sections scroll beside it; it highlights the section
-    /// being read. (On a narrow window the menu sits above the sections and scrolls with them.)
+    /// The tab row (with Save and Discard at its right), then the picked section, scrolled on
+    /// its own.
     pub(super) fn settings_tab(&mut self, ui: &mut Ui, snap: &Snapshot) {
-        let w = ui.available_width();
-        if w < 900.0 {
-            egui::ScrollArea::vertical().id_salt("settings").auto_shrink([false, false]).show(ui, |ui| {
-                self.settings_nav(ui);
-                ui.add_space(GAP);
-                self.settings_main(ui, snap);
-            });
-            return;
-        }
-        let height = ui.available_height();
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = GAP;
-            ui.allocate_ui_with_layout(vec2(NAV_W, 0.0), Layout::top_down(Align::Min), |ui| {
-                ui.set_width(NAV_W);
-                self.settings_nav(ui);
-            });
-            let main_w = ui.available_width();
-            ui.allocate_ui_with_layout(vec2(main_w, height), Layout::top_down(Align::Min), |ui| {
-                let out = egui::ScrollArea::vertical()
-                    .id_salt("settings-main")
-                    .max_height(height)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.spacing_mut().item_spacing.y = GAP;
-                        self.settings_main(ui, snap)
-                    });
-                // Follow the scrolling: the menu lights the section being read.
-                let offset = out.state.clamped_offset().y;
-                let jumped = self.settings_jumped.is_some_and(|t| t.elapsed() < JUMP_SETTLE);
-                if (offset - self.settings_offset).abs() > 0.5
-                    && !jumped
-                    && let Some(s) = section_in_view(
-                        &out.inner,
-                        out.inner_rect.top(),
-                        offset >= out.content_size.y - out.inner_rect.height() - 1.0,
-                    )
-                {
-                    self.section = s;
-                }
-                self.settings_offset = offset;
-            });
-        });
-    }
-
-    fn settings_nav(&mut self, ui: &mut Ui) {
-        theme::panel().inner_margin(10).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 4.0;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Settings").font(theme::heading_font(30.0)));
+            ui.add_space(12.0);
             for (s, name) in SECTIONS {
-                let on = self.section == s;
-                let b = egui::Button::new(RichText::new(name).size(16.0).color(if on {
-                    Color32::WHITE
-                } else {
-                    theme::SOFT
-                }))
-                .fill(if on { theme::BUTTON } else { Color32::TRANSPARENT })
-                .stroke(if on { Stroke::new(1.0, theme::BUTTON_BORDER) } else { Stroke::NONE })
-                .corner_radius(8)
-                .min_size(vec2(ui.available_width(), 44.0));
-                let r = ui.scope(|ui| {
-                    ui.spacing_mut().button_padding = vec2(14.0, 0.0);
-                    ui.with_layout(Layout::top_down(Align::Min), |ui| ui.add(b)).inner
-                });
-                if r.inner.clicked() {
+                if theme::tab(ui, name, self.section == s, false).clicked() {
                     self.section = s;
-                    self.scroll_to = Some(s);
-                    self.settings_jumped = Some(std::time::Instant::now());
                 }
             }
+            self.save_bar(ui);
         });
-    }
-
-    /// Draws every section; returns each one's top, for the side menu.
-    fn settings_main(&mut self, ui: &mut Ui, snap: &Snapshot) -> Vec<(Section, f32)> {
-        let target = self.scroll_to.take();
+        ui.add_space(12.0);
         let simulating = *self.mode.borrow() == Mode::Simulation;
-        if simulating {
-            note_box(ui, SIM_SAVE_NOTE, theme::AMBER);
-        }
-        let mut tops = Vec::with_capacity(SECTIONS.len());
-        let mut add = |s: Section, r: egui::Rect| tops.push((s, r.top()));
-        add(Section::Profiles, section(ui, target == Some(Section::Profiles), |ui| self.profiles_section(ui, snap)));
-        add(
-            Section::Equipment,
-            section(ui, target == Some(Section::Equipment), |ui| self.equipment(ui, snap, simulating)),
-        );
-        add(Section::Timings, section(ui, target == Some(Section::Timings), |ui| self.timings(ui)));
-        add(Section::YouTube, section(ui, target == Some(Section::YouTube), |ui| self.youtube(ui, simulating)));
-        add(Section::Playout, section(ui, target == Some(Section::Playout), |ui| self.playout(ui)));
-        add(Section::Updates, section(ui, target == Some(Section::Updates), |ui| self.updates_section(ui, snap)));
-        self.save_bar(ui);
-        tops
+        egui::ScrollArea::vertical().id_salt(("settings", self.section)).auto_shrink([false, false]).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = GAP;
+            if simulating {
+                note_box(ui, SIM_SAVE_NOTE, theme::AMBER);
+            }
+            match self.section {
+                Section::Profiles => section(ui, |ui| self.profiles_section(ui, snap)),
+                Section::Equipment => section(ui, |ui| self.equipment(ui, snap, simulating)),
+                Section::Timings => section(ui, |ui| self.timings(ui)),
+                Section::YouTube => section(ui, |ui| self.youtube(ui, simulating)),
+                Section::Playout => section(ui, |ui| self.playout(ui)),
+                Section::Updates => section(ui, |ui| self.updates_section(ui, snap)),
+            }
+        });
     }
 
     // ---- Equipment
@@ -929,6 +835,7 @@ impl StreamItApp {
         d != saved
     }
 
+    /// Save, Discard changes and "Unsaved changes", at the right of the tab row.
     fn save_bar(&mut self, ui: &mut Ui) {
         let dirty = self.settings_dirty();
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1033,18 +940,6 @@ impl StreamItApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_menu_lights_the_section_being_read() {
-        let tops = [(Section::Equipment, 100.0), (Section::YouTube, 600.0), (Section::Timings, 1100.0)];
-        assert_eq!(section_in_view(&tops, 100.0, false), Some(Section::Equipment), "at the top");
-        assert_eq!(section_in_view(&tops, 560.0, false), Some(Section::YouTube), "nearly at YouTube's top");
-        assert_eq!(section_in_view(&tops, 900.0, false), Some(Section::YouTube), "part way through YouTube");
-        assert_eq!(section_in_view(&tops, 5000.0, false), Some(Section::Timings), "past the end");
-        assert_eq!(section_in_view(&tops, -50.0, false), Some(Section::Equipment), "above the first");
-        assert_eq!(section_in_view(&[], 0.0, false), None);
-        assert_eq!(section_in_view(&tops, 300.0, true), Some(Section::Timings), "scrolled to the end");
-    }
 
     #[test]
     fn device_changes_need_a_restart_but_timings_do_not() {
