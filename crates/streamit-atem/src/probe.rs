@@ -101,6 +101,18 @@ fn print_state(s: &Snapshot) {
         };
         println!("media player {} (input {}): {what}", p + 1, 3000 + 10 * (u16::from(*p) + 1));
     }
+    println!("still slots listed: {}, video mode: {:?}", st.stills.len(), st.video_mode);
+    for (i, name) in &st.stills {
+        if let Some(name) = name {
+            println!("  still {}: {name}", i + 1);
+        }
+    }
+    for (input, n) in st.input_names.iter().filter(|(i, _)| **i < 1000) {
+        let own = if n.default { " (its own default)" } else { "" };
+        println!("input {input}: {} [{}]{own}", n.long, n.short);
+    }
+    let dump: Vec<String> = s.dump.iter().map(|(name, n)| format!("{name}x{n}")).collect();
+    println!("commands at connect: {}", dump.join(" "));
     if st.fairlight.is_empty() {
         println!("fairlight: none reported (classic audio?)");
     }

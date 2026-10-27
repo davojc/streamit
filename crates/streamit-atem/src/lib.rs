@@ -43,6 +43,9 @@ pub struct Snapshot {
     /// Counts TrPs updates for M/E 0 in this session.
     pub transition_updates: u64,
     pub state: AtemState,
+    /// How many of each command the switcher sent before its state was complete, for the
+    /// log: it shows what the switcher reports and what it leaves out.
+    pub dump: std::collections::BTreeMap<String, u32>,
 }
 
 pub struct AtemClient {
@@ -86,16 +89,23 @@ impl AtemClient {
                 s.session += 1;
                 s.transition_updates = 0;
                 s.state = AtemState::default();
+                s.dump.clear();
             }),
             LinkEvent::Lost => tx.send_modify(|s| {
                 s.connected = false;
                 s.state = AtemState::default();
             }),
             LinkEvent::Commands(p) => {
-                let (moves, state): (Vec<_>, Vec<_>) = commands::split_commands(&p)
-                    .iter()
-                    .filter_map(commands::decode)
-                    .partition(commands::Decoded::is_transfer);
+                let raw = commands::split_commands(&p);
+                if !tx.borrow().state.initialised {
+                    tx.send_modify(|s| {
+                        for c in &raw {
+                            *s.dump.entry(String::from_utf8_lossy(&c.name).into_owned()).or_default() += 1;
+                        }
+                    });
+                }
+                let (moves, state): (Vec<_>, Vec<_>) =
+                    raw.iter().filter_map(commands::decode).partition(commands::Decoded::is_transfer);
                 if !moves.is_empty()
                     && let Some(t) = to_transfer.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
                 {
@@ -106,11 +116,15 @@ impl AtemClient {
                 // A packet of transfer data alone changes nothing watchers care about.
                 if !state.is_empty() {
                     tx.send_modify(|s| {
+                        let was = s.state.initialised;
                         for d in &state {
                             if matches!(d, commands::Decoded::TransitionPosition { mix_effect: ME, .. }) {
                                 s.transition_updates += 1;
                             }
                             s.state.apply(d);
+                        }
+                        if !was && s.state.initialised {
+                            log_dump(s);
                         }
                     });
                 }
@@ -176,6 +190,21 @@ impl AtemClient {
             })
         })
     }
+}
+
+/// Says what the switcher reported when it first connected.
+fn log_dump(s: &Snapshot) {
+    let st = &s.state;
+    let used = st.stills.values().filter(|n| n.is_some()).count();
+    let dump: Vec<String> = s.dump.iter().map(|(name, n)| format!("{name}x{n}")).collect();
+    tracing::info!(
+        still_slots = st.stills.len(),
+        stills_used = used,
+        input_names = st.input_names.len(),
+        video_mode = ?st.video_mode,
+        commands = %dump.join(" "),
+        "ATEM state received"
+    );
 }
 
 fn ready(s: &Snapshot) -> Result<()> {
