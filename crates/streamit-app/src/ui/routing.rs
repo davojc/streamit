@@ -2,9 +2,10 @@
 //! Screens ATEM, work the same way: VideoHub inputs run down both sides, the destinations
 //! (the MultiView's views, or an ATEM's inputs) sit in the middle with eight presets
 //! under them, and dropping an input on a destination routes the VideoHub output feeding
-//! it. What the destinations show always comes from the VideoHub. Changing an ATEM input
-//! that is on program asks first. Right-clicking an ATEM input, a preset or a media pool
-//! slot sets up what StreamIt uses it for (see `setup`).
+//! it. What the destinations show comes from the VideoHub, under an ATEM input's own name
+//! (see `names`). Changing an ATEM input that is on program asks first. Right-clicking an
+//! ATEM input, a preset or a media pool slot sets up what StreamIt uses it for (see `setup`).
+mod names;
 pub(super) mod pool;
 mod setup;
 mod videohub;
@@ -91,6 +92,8 @@ pub(super) struct RtUi {
     /// The cable run being edited (from the row's menu), and its text so far.
     vh_cable: Option<(LabelKind, u16)>,
     vh_cable_draft: String,
+    /// The ATEM input name being typed on its tile.
+    atem_naming: Option<names::Naming>,
 }
 
 impl RtUi {
@@ -122,6 +125,7 @@ impl Default for RtUi {
             vh_editing: None,
             vh_cable: None,
             vh_cable_draft: String::new(),
+            atem_naming: None,
         }
     }
 }
@@ -340,6 +344,9 @@ impl StreamItApp {
             self.dest_tile(ui, Rect::from_min_size(min, tile), i, snap);
         }
         ui.add_space(8.0);
+        if target.is_atem() {
+            self.names_from_hub_button(ui, snap, target);
+        }
         if let Some(w) = snap.last_warning.as_deref().filter(|w| w.starts_with(target.name())) {
             ui.label(RichText::new(w).size(14.0).color(theme::AMBER_SOFT));
         } else if let Some(n) = self.routes_ui.picked {
@@ -372,10 +379,14 @@ impl StreamItApp {
         }
         p.rect(rect, 6.0, fill, Stroke::new(2.0, col), egui::StrokeKind::Inside);
         let small_font = if target.is_atem() { 11.0 } else { 12.0 };
-        let where_ = if target == Target::MultiView {
-            format!("{} · MV in {}", target.dest_name(i).to_uppercase(), i + 1)
-        } else {
-            target.dest_name(i).to_uppercase()
+        let input = i as u16 + 1;
+        let own = target.is_atem().then(|| state.own_name(input)).flatten();
+        let where_ = match (target, own.and_then(|_| state.names.get(&input))) {
+            (Target::MultiView, _) => format!("{} · MV in {}", target.dest_name(i).to_uppercase(), i + 1),
+            (_, Some(n)) if !n.short.trim().is_empty() => {
+                format!("{} · {}", target.dest_name(i).to_uppercase(), n.short.trim())
+            }
+            _ => target.dest_name(i).to_uppercase(),
         };
         p.text(rect.left_top() + vec2(8.0, 6.0), Align2::LEFT_TOP, where_, theme::heading_font(small_font), col);
         if pgm || pvw {
@@ -393,13 +404,30 @@ impl StreamItApp {
         p.text(rect.right_bottom() - vec2(8.0, 5.0), Align2::RIGHT_BOTTOM, out, theme::mono(10.5), theme::DIM);
         if target.is_atem() {
             self.job_badges(ui, rect, target, i);
-            r.context_menu(|ui| self.input_menu(ui, target, i, snap.job.is_some()));
+            r.context_menu(|ui| {
+                self.input_menu(ui, target, i, snap.job.is_some());
+                ui.separator();
+                self.name_menu(ui, snap, target, input);
+            });
+            if r.double_clicked() && !state.names.is_empty() {
+                self.start_naming(snap, target, input);
+            }
         }
-        let (small, big) = match state.dest(i) {
-            _ if output == 0 => (String::new(), "Not from the router".to_string()),
-            Some(n) => (format!("INPUT {n}"), snap.routing.label(n)),
-            None => (String::new(), "Not known yet".to_string()),
+        let feed = if output == 0 { None } else { state.dest(i) };
+        // An ATEM's own name goes first, with the VideoHub input feeding it under it.
+        let (small, big, under) = match (own, feed) {
+            (Some(name), Some(n)) => {
+                let label = snap.routing.own_label(n).map(|l| format!(" {l}")).unwrap_or_default();
+                (String::new(), name.to_string(), format!("← VH {n}{label}"))
+            }
+            (Some(name), None) if output == 0 => (String::new(), name.to_string(), "Not from the router".into()),
+            (Some(name), None) => (String::new(), name.to_string(), String::new()),
+            (None, Some(n)) => (format!("INPUT {n}"), snap.routing.label(n), String::new()),
+            (None, None) if output == 0 => (String::new(), "Not from the router".to_string(), String::new()),
+            (None, None) => (String::new(), "Not known yet".to_string(), String::new()),
         };
+        let naming = target.is_atem() && self.naming_field(ui, rect, target, input);
+        let p = ui.painter();
         let big_size = if target.is_atem() { 17.0 } else { 24.0 };
         let mut job = egui::text::LayoutJob { halign: Align::Center, ..Default::default() };
         job.wrap.max_width = rect.width() - 16.0;
@@ -407,8 +435,13 @@ impl StreamItApp {
             job.append(&small, 0.0, egui::TextFormat::simple(theme::mono_bold(12.0), col));
             job.append("\n", 0.0, egui::TextFormat::simple(theme::mono_bold(5.0), col));
         }
-        let big_colour = if output == 0 { theme::DIM } else { theme::SCREEN_TEXT };
+        let big_colour = if output == 0 && own.is_none() { theme::DIM } else { theme::SCREEN_TEXT };
         job.append(&big, 0.0, egui::TextFormat::simple(theme::heading_font(big_size), big_colour));
+        if !under.is_empty() {
+            job.append("\n", 0.0, egui::TextFormat::simple(theme::mono_bold(5.0), col));
+            let under_colour = if output == 0 { theme::DIM } else { col };
+            job.append(&under, 0.0, egui::TextFormat::simple(theme::mono(11.0), under_colour));
+        }
         if is_locked {
             job.append("\nLocked while ", 0.0, egui::TextFormat::simple(theme::body_bold(11.0), theme::AMBER_SOFT));
             job.append(
@@ -418,9 +451,11 @@ impl StreamItApp {
             );
             job.append(" runs", 0.0, egui::TextFormat::simple(theme::body_bold(11.0), theme::AMBER_SOFT));
         }
-        let galley = p.layout_job(job);
-        let top = rect.center().y - galley.size().y / 2.0 + 4.0;
-        p.with_clip_rect(rect.shrink(4.0)).galley(egui::pos2(rect.center().x, top), galley, theme::SCREEN_TEXT);
+        if !naming {
+            let galley = p.layout_job(job);
+            let top = rect.center().y - galley.size().y / 2.0 + 4.0;
+            p.with_clip_rect(rect.shrink(4.0)).galley(egui::pos2(rect.center().x, top), galley, theme::SCREEN_TEXT);
+        }
 
         let dropped = r.dnd_release_payload::<InputDrag>().map(|d| d.0);
         let clicked = r.clicked().then_some(self.routes_ui.picked).flatten();

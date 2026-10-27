@@ -51,6 +51,38 @@ pub trait Switcher: Send + Sync {
         let _ = slot;
         Err(DeviceError::Other("this switcher cannot clear stills".into()))
     }
+    /// What the switcher calls each of its inputs, by input number, as last reported.
+    fn input_names(&self) -> std::collections::BTreeMap<u16, InputName> {
+        Default::default()
+    }
+    /// Renames `input` on the switcher: `long` on the multiview, `short` on its buttons.
+    async fn set_input_name(&self, input: u16, long: &str, short: &str) -> Result<()> {
+        let _ = (input, long, short);
+        Err(DeviceError::Other("this switcher cannot rename its inputs".into()))
+    }
+}
+
+/// What a switcher calls one of its inputs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputName {
+    /// Up to `INPUT_NAME_MAX` characters: shown on the multiview.
+    pub long: String,
+    /// Up to `SHORT_NAME_MAX` characters: shown on the switcher's buttons.
+    pub short: String,
+    /// Still the name the switcher came with ("Camera 3").
+    pub default: bool,
+}
+
+/// The longest input name an ATEM keeps.
+pub const INPUT_NAME_MAX: usize = 20;
+/// The longest short name an ATEM keeps.
+pub const SHORT_NAME_MAX: usize = 4;
+
+/// A short name made from a long one: the first word's first four letters or digits,
+/// upper case ("Pulpit Cam" is "PULP"); "" for a blank name.
+pub fn short_name(long: &str) -> String {
+    let word = long.split_whitespace().next().unwrap_or("");
+    word.chars().filter(|c| c.is_ascii_alphanumeric()).take(SHORT_NAME_MAX).collect::<String>().to_ascii_uppercase()
 }
 
 /// A picture as 8-bit RGBA, row by row.

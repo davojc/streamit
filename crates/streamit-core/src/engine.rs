@@ -19,8 +19,8 @@
 use crate::audio::LiveLevels;
 use crate::config::{AudioSourceId, Config};
 use crate::devices::{
-    self, AudioInput, BroadcastCheck, BroadcastSummary, ChatMessage, DeviceError, Devices, Fix, Health, LabelKind,
-    LightingStatus, LiveDetails, Phase,
+    self, AudioInput, BroadcastCheck, BroadcastSummary, ChatMessage, DeviceError, Devices, Fix, Health, InputName,
+    LabelKind, LightingStatus, LiveDetails, Phase, Switcher,
 };
 use crate::end::{EndOutcome, end_service};
 use crate::golive::{self, CountdownOutcome, CountdownReport, Readiness, Stage, Stage0Report, T0Error};
@@ -105,6 +105,14 @@ pub enum Command {
         kind: LabelKind,
         n: u16,
         text: String,
+    },
+    /// Rename ATEM input `input` (1-based) on `target`'s switcher: `long` for the
+    /// multiview, `short` for its buttons.
+    SetInputName {
+        target: Target,
+        input: u16,
+        long: String,
+        short: String,
     },
     /// What the VideoHub and the ATEMs report for routing, from the health poll.
     RoutingRead(Box<RoutingRead>),
@@ -943,6 +951,34 @@ impl Engine {
                     .in_current_span(),
                 );
             }
+            Command::SetInputName { target, input, long, short } => {
+                let (target, input) = (*target, *input);
+                let (long, short) = (long.trim().to_string(), short.trim().to_string());
+                let sw: Arc<dyn Switcher> = match target {
+                    Target::StreamAtem => self.d.stream.clone(),
+                    Target::ScreensAtem => self.d.screens.clone(),
+                    Target::MultiView => return self.ignore(&cmd, "the MultiView has no input names"),
+                };
+                if input == 0 {
+                    return self.ignore(&cmd, "inputs are numbered from 1");
+                }
+                info!(target = target.name(), input, long = %long, short = %short, "renaming an ATEM input");
+                let snap = self.snap.clone();
+                tokio::spawn(
+                    async move {
+                        match sw.set_input_name(input, &long, &short).await {
+                            Ok(()) => snap.send_modify(|s| {
+                                let name = InputName { long, short, default: false };
+                                s.routing.targets[target.index()].names.insert(input, name);
+                            }),
+                            Err(e) => {
+                                set_warning(&snap, format!("{}: could not rename input {input}: {e}", target.name()))
+                            }
+                        }
+                    }
+                    .in_current_span(),
+                );
+            }
             Command::FireLightingCue { list, cue } => {
                 let (list, cue) = (*list, cue.trim().to_string());
                 if list == 0 || cue.is_empty() {
@@ -1068,6 +1104,7 @@ impl Engine {
                         state.program = read.program;
                         state.preview = read.preview;
                         state.stills = read.stills;
+                        state.names = read.names;
                     }
                     if !labels.is_empty() {
                         s.routing.labels = labels;
@@ -2077,6 +2114,7 @@ fn routing_from(c: &Config) -> RoutingState {
             program: None,
             preview: None,
             stills: Vec::new(),
+            names: Default::default(),
         }),
     }
 }
@@ -3756,6 +3794,7 @@ mod tests {
             program: Some(program),
             preview: None,
             stills: vec![],
+            names: Default::default(),
         };
         Command::RoutingRead(Box::new(RoutingRead {
             labels: vec![],
@@ -3924,6 +3963,18 @@ mod tests {
         let s = until(&mut e, "a warning", |s| s.last_warning.as_deref().is_some_and(|w| w.contains("rename"))).await;
         assert!(s.last_warning.unwrap().contains("output 37"));
         assert_eq!(s.routing.own_output_label(37), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn renaming_an_atem_input_it_cannot_take_warns() {
+        let (d, _log, _h) = rig();
+        let mut e = Engine::spawn(d, rt_cfg());
+        // The fake switchers cannot rename: the refusal is a warning and nothing changes.
+        let long = "Pulpit Cam".to_string();
+        send(&e, Command::SetInputName { target: Target::ScreensAtem, input: 3, long, short: "PULP".into() }).await;
+        let s = until(&mut e, "a warning", |s| s.last_warning.as_deref().is_some_and(|w| w.contains("rename"))).await;
+        assert!(s.last_warning.unwrap().starts_with("Screens ATEM: could not rename input 3"));
+        assert!(s.routing.target(Target::ScreensAtem).names.is_empty());
     }
 
     // ---- lighting

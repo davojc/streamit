@@ -375,6 +375,7 @@ fn rt_snap() -> Snapshot {
         program: None,
         preview: None,
         stills: vec![],
+        names: Default::default(),
     };
     routing.targets[1] = TargetState {
         outputs: vec![1, 2, 3, 4, 0, 0, 0, 11],
@@ -387,6 +388,7 @@ fn rt_snap() -> Snapshot {
         program: Some(2),
         preview: Some(3),
         stills: vec![],
+        names: Default::default(),
     };
     Snapshot { routing, ..Snapshot::default() }
 }

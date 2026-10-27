@@ -2,8 +2,9 @@
 //! four views and the inputs of the two ATEMs. StreamIt controls none of them directly for
 //! this: changing what a destination shows is a VideoHub route to the output feeding it.
 //! Each target has eight presets that save the input on each destination and put them back.
-use crate::devices::LabelKind;
+use crate::devices::{InputName, LabelKind};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// What the VideoHub feeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -135,9 +136,16 @@ pub struct TargetState {
     pub preview: Option<u16>,
     /// An ATEM's media pool still slots from slot 1: each one's name, `None` when empty.
     pub stills: Vec<Option<String>>,
+    /// What the ATEM calls each of its inputs, by input number.
+    pub names: BTreeMap<u16, InputName>,
 }
 
 impl TargetState {
+    /// The ATEM's own name for `input`, unless it is still the one it came with.
+    pub fn own_name(&self, input: u16) -> Option<&str> {
+        self.names.get(&input).filter(|n| !n.default).map(|n| n.long.trim()).filter(|n| !n.is_empty())
+    }
+
     pub fn output(&self, i: usize) -> u16 {
         self.outputs.get(i).copied().unwrap_or(0)
     }
@@ -296,6 +304,7 @@ pub struct TargetRead {
     pub program: Option<u16>,
     pub preview: Option<u16>,
     pub stills: Vec<Option<String>>,
+    pub names: BTreeMap<u16, InputName>,
 }
 
 /// Everything one routing read found (the health poll sends these to the engine).
@@ -346,6 +355,7 @@ mod tests {
             program: Some(program),
             preview: None,
             stills: vec![],
+            names: Default::default(),
         }
     }
 

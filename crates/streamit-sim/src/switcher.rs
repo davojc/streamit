@@ -1,10 +1,11 @@
 //! Pretend ATEM switchers and VideoHub router.
 use crate::{Fault, Mix, PendingRoute, SimHandle, SimWorld, SwitcherState};
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use std::time::Duration;
 use streamit_core::config::AudioSourceId;
 use streamit_core::devices::{
-    AudioInput, AudioMix, DeviceError, LabelKind, Result, Router, Still, StreamSwitcher, Switcher,
+    AudioInput, AudioMix, DeviceError, InputName, LabelKind, Result, Router, Still, StreamSwitcher, Switcher,
 };
 use streamit_core::engine::DeviceKind;
 use tokio::time::Instant;
@@ -18,6 +19,9 @@ fn pretend_still(slot: u16) -> Still {
     let c = [(40 + slot * 53 % 180) as u8, (60 + slot * 97 % 160) as u8, (90 + slot * 31 % 150) as u8, 255];
     Still { width, height, rgba: c.repeat((width * height) as usize) }
 }
+
+/// The pretend switchers' inputs, each with a name.
+const INPUTS: u16 = 8;
 
 /// A pretend mix and a pretend route both take this long at 1x.
 pub(crate) const PRETEND_DELAY: Duration = Duration::from_secs(1);
@@ -86,6 +90,30 @@ impl Switcher for SimSwitcher {
 
     fn still_size(&self) -> Option<(u32, u32)> {
         Some(STILL_SIZE)
+    }
+
+    fn input_names(&self) -> BTreeMap<u16, InputName> {
+        let mut w = self.sim.lock();
+        let renamed = &w.switcher_mut(self.which).names;
+        (1..=INPUTS)
+            .map(|n| {
+                let name = match renamed.get(&n) {
+                    Some((long, short)) => InputName { long: long.clone(), short: short.clone(), default: false },
+                    None => InputName { long: format!("Camera {n}"), short: format!("CAM{n}"), default: true },
+                };
+                (n, name)
+            })
+            .collect()
+    }
+
+    async fn set_input_name(&self, input: u16, long: &str, short: &str) -> Result<()> {
+        if !(1..=INPUTS).contains(&input) {
+            return Err(DeviceError::Refused(format!("no input {input} on this atem")));
+        }
+        let (long, short) = (long.to_string(), short.to_string());
+        self.state(|s| {
+            s.names.insert(input, (long, short));
+        })
     }
 
     async fn download_still(&self, slot: u16) -> Result<Still> {

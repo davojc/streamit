@@ -749,8 +749,9 @@ pub fn youtube_panel(s: &Snapshot) -> YouTubePanel {
     YouTubePanel { tone, headline, detail, visibility, viewers: s.live.as_ref().and_then(|l| l.viewers) }
 }
 
-/// What an ATEM input is called on the Service screens: the video playing into it, the
-/// media player's still, or the VideoHub input that feeds it.
+/// What an ATEM input is called on the Service screens and in the pickers: the video
+/// playing into it, the media player's still, the ATEM's own name for it, or the VideoHub
+/// input that feeds it.
 pub fn atem_input_name(s: &Snapshot, c: &Config, target: Target, input: u16) -> String {
     let video_input = match target {
         Target::StreamAtem => c.stream_atem.decklink_input,
@@ -765,6 +766,9 @@ pub fn atem_input_name(s: &Snapshot, c: &Config, target: Target, input: u16) -> 
         return "Holding still".into();
     }
     let t = s.routing.target(target);
+    if let Some(name) = t.own_name(input) {
+        return name.to_string();
+    }
     let fed = input.checked_sub(1).map(usize::from).filter(|&i| i < t.outputs.len() && t.output(i) != 0);
     match fed.and_then(|i| t.dest(i)) {
         Some(hub_input) => s.routing.label(hub_input),
@@ -1550,6 +1554,21 @@ mod tests {
         s.playing = Some(0);
         assert_eq!(atem_input_name(&s, &c, Target::StreamAtem, c.stream_atem.decklink_input), "Video: Mission update");
         assert_eq!(atem_sees(&Snapshot::default(), &c, Target::ScreensAtem), (None, None));
+    }
+
+    #[test]
+    fn an_atem_inputs_own_name_comes_before_the_videohubs() {
+        use streamit_core::devices::InputName;
+        let c = Config::default();
+        let mut s = Snapshot::default();
+        s.routing.labels = vec!["Camera 1 Wide".into(), "Camera 2 Pulpit".into()];
+        let t = s.routing.target_mut(Target::ScreensAtem);
+        t.outputs = vec![5, 6];
+        t.dests = vec![Some(1), Some(2)];
+        t.names.insert(1, InputName { long: "Wide Cam".into(), short: "WIDE".into(), default: false });
+        t.names.insert(2, InputName { long: "Camera 2".into(), short: "CAM2".into(), default: true });
+        assert_eq!(atem_input_name(&s, &c, Target::ScreensAtem, 1), "Wide Cam");
+        assert_eq!(atem_input_name(&s, &c, Target::ScreensAtem, 2), "Camera 2 Pulpit", "the ATEM's own default name");
     }
 
     #[test]

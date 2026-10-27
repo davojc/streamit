@@ -725,14 +725,24 @@ impl Probes {
             for &out in &outputs {
                 dests.push(if out == 0 { None } else { d.hub.route_of(out).await.ok().filter(|&i| i != 0) });
             }
-            let (program, preview, stills) = match t {
-                Target::MultiView => (None, None, Vec::new()),
-                Target::StreamAtem => (d.stream.program().await.ok(), d.stream.preview().await.ok(), d.stream.stills()),
-                Target::ScreensAtem => {
-                    (d.screens.program().await.ok(), d.screens.preview().await.ok(), d.screens.stills())
-                }
+            let read = match t {
+                Target::MultiView => TargetRead::default(),
+                Target::StreamAtem => TargetRead {
+                    program: d.stream.program().await.ok(),
+                    preview: d.stream.preview().await.ok(),
+                    stills: d.stream.stills(),
+                    names: d.stream.input_names(),
+                    ..TargetRead::default()
+                },
+                Target::ScreensAtem => TargetRead {
+                    program: d.screens.program().await.ok(),
+                    preview: d.screens.preview().await.ok(),
+                    stills: d.screens.stills(),
+                    names: d.screens.input_names(),
+                    ..TargetRead::default()
+                },
             };
-            reads[t.index()] = TargetRead { outputs, dests, program, preview, stills };
+            reads[t.index()] = TargetRead { outputs, dests, ..read };
         }
         let inputs = d.hub.input_labels().await.unwrap_or_default();
         let routes = d.hub.routing_table().await.unwrap_or_default();

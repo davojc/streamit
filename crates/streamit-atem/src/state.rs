@@ -2,6 +2,7 @@
 use crate::commands::{Decoded, decode, split_commands};
 use std::collections::BTreeMap;
 use streamit_core::config::AudioSourceId;
+use streamit_core::devices::InputName;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MediaPlayer {
@@ -37,6 +38,8 @@ pub struct AtemState {
     pub stills: BTreeMap<u16, Option<String>>,
     /// The video mode (upstream `Enums.VideoMode`), which sets a still's size.
     pub video_mode: Option<u8>,
+    /// What each input is called, by input number.
+    pub input_names: BTreeMap<u16, InputName>,
 }
 
 impl AtemState {
@@ -68,6 +71,9 @@ impl AtemState {
                 self.stills.insert(index, name.clone());
             }
             Decoded::VideoMode(m) => self.video_mode = Some(m),
+            Decoded::InputName { input, ref long, ref short, default } => {
+                self.input_names.insert(input, InputName { long: long.clone(), short: short.clone(), default });
+            }
             // Transfers are routed to the one under way, not kept as state.
             _ => {}
         }

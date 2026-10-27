@@ -21,7 +21,7 @@ use std::sync::atomic::AtomicU16;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use streamit_core::config::AudioSourceId;
-use streamit_core::devices::{AudioInput, AudioMix, DeviceError, Result, Still, StreamSwitcher, Switcher};
+use streamit_core::devices::{AudioInput, AudioMix, DeviceError, InputName, Result, Still, StreamSwitcher, Switcher};
 use tokio::sync::{mpsc, oneshot, watch};
 
 pub use packet::ATEM_PORT;
@@ -240,6 +240,21 @@ impl Switcher for AtemClient {
         let data = still::encode_rle(&yuv);
         let size = yuv.len() as u32;
         self.upload(slot, size, &data, name, &hash).await
+    }
+
+    fn input_names(&self) -> std::collections::BTreeMap<u16, InputName> {
+        self.shared.borrow().state.input_names.clone()
+    }
+
+    async fn set_input_name(&self, input: u16, long: &str, short: &str) -> Result<()> {
+        self.read(|s| {
+            if s.input_names.is_empty() || s.input_names.contains_key(&input) {
+                Ok(())
+            } else {
+                Err(DeviceError::Refused(format!("no input {input} on this atem")))
+            }
+        })?;
+        self.send(commands::cinl(input, long, short)).await
     }
 
     async fn clear_still(&self, slot: u16) -> Result<()> {

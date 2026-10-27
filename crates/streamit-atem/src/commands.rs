@@ -240,6 +240,13 @@ pub enum Decoded {
     },
     /// The switcher's video mode (upstream `Enums.VideoMode`).
     VideoMode(u8),
+    /// What input `input` is called, and whether that is the switcher's own name for it.
+    InputName {
+        input: u16,
+        long: String,
+        short: String,
+        default: bool,
+    },
     /// Our lock on a media store (0: the stills) is granted.
     LockObtained(u16),
     LockState {
@@ -335,6 +342,15 @@ pub fn decode(cmd: &RawCommand<'_>) -> Option<Decoded> {
         }),
         // Upstream: src/commands/Settings/VideoMode.ts (`VideoModeUpdateCommand.deserialize`).
         b"VidM" => Some(Decoded::VideoMode(r.u8(0)?)),
+        // Upstream: src/commands/Inputs/InputPropertiesCommand.ts (`InputPropertiesUpdateCommand.deserialize`):
+        // the input, its long name in 20 bytes from 2, its short name in 4 from 22, then
+        // whether both are the switcher's own at 26.
+        b"InPr" => Some(Decoded::InputName {
+            input: r.u16(0)?,
+            long: c_string(cmd.body.get(2..22)?),
+            short: c_string(cmd.body.get(22..26)?),
+            default: r.u8(26)? == 1,
+        }),
         // Upstream: src/commands/DataTransfer/LockObtainedCommand.ts.
         b"LKOB" => Some(Decoded::LockObtained(r.u16(0)?)),
         // Upstream: src/commands/DataTransfer/LockStateCommand.ts (`LockStateUpdateCommand`).
@@ -411,6 +427,33 @@ pub fn ftda(id: u16, data: &[u8]) -> Vec<u8> {
     b.extend_from_slice(&(data.len() as u16).to_be_bytes());
     b.extend_from_slice(data);
     frame(b"FTDa", &b)
+}
+
+/// Text up to its first NUL.
+fn c_string(raw: &[u8]) -> String {
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    String::from_utf8_lossy(&raw[..end]).trim().to_string()
+}
+
+/// Copies `s` into `b`, cut short at a character boundary to fit.
+fn put_text(b: &mut [u8], s: &str) {
+    let mut n = s.len().min(b.len());
+    while !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    b[..n].copy_from_slice(&s.as_bytes()[..n]);
+}
+
+// Upstream: src/commands/Inputs/InputPropertiesCommand.ts (`InputPropertiesCommand.serialize`):
+// the mask (1 long name, 2 short name), the input at 2, the long name in 20 bytes from 4,
+// the short name in 4 from 24.
+pub fn cinl(input: u16, long: &str, short: &str) -> Vec<u8> {
+    let mut b = [0u8; 32];
+    b[0] = 1 | 2;
+    b[2..4].copy_from_slice(&input.to_be_bytes());
+    put_text(&mut b[4..24], long);
+    put_text(&mut b[24..28], short);
+    frame(b"CInL", &b)
 }
 
 // Upstream: src/commands/Media/MediaPoolClearStillCommand.ts.
@@ -640,6 +683,39 @@ mod tests {
                 handle_position: 694,
             })
         );
+    }
+
+    #[test]
+    fn decode_inpr_names_an_input() {
+        let mut body = vec![0, 3];
+        let mut long = [0u8; 20];
+        long[..10].copy_from_slice(b"Pulpit Cam");
+        body.extend(long);
+        body.extend(b"PULP");
+        body.extend([0, 0]);
+        body.extend([0; 10]);
+        assert_eq!(
+            decode_bytes(&frame(b"InPr", &body)),
+            Some(Decoded::InputName { input: 3, long: "Pulpit Cam".into(), short: "PULP".into(), default: false })
+        );
+        body[26] = 1;
+        assert!(matches!(decode_bytes(&frame(b"InPr", &body)), Some(Decoded::InputName { default: true, .. })));
+    }
+
+    #[test]
+    fn cinl_sets_both_names() {
+        let f = cinl(3, "Pulpit Cam", "PULP");
+        let b = &f[8..];
+        assert_eq!(&f[4..8], b"CInL");
+        assert_eq!(b.len(), 32);
+        assert_eq!((b[0], &b[2..4]), (3, &[0u8, 3][..]));
+        assert_eq!(&b[4..14], b"Pulpit Cam");
+        assert_eq!(b[14], 0);
+        assert_eq!(&b[24..28], b"PULP");
+        // Too long: cut to the field, never past a character.
+        let f = cinl(1, "Überlange Kamera Nummer eins", "ÜBER");
+        assert_eq!(c_string(&f[8 + 4..8 + 24]), "Überlange Kamera Nu");
+        assert_eq!(c_string(&f[8 + 24..8 + 28]), "ÜBE");
     }
 
     #[test]

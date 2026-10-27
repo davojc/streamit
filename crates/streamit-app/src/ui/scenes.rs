@@ -201,7 +201,7 @@ impl StreamItApp {
                 },
             );
             ui.label(
-                RichText::new("Names come from what the VideoHub feeds each input (Routing tab).")
+                RichText::new("Names are the ATEM's own, or what the VideoHub feeds each input (Routing tab).")
                     .size(13.0)
                     .color(theme::MUTED),
             );
