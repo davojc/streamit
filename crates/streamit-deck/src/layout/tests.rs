@@ -295,7 +295,12 @@ fn video_keys_play_once_the_countdown_starts_and_test_before() {
 fn a_test_play_shows_on_its_key_and_stop_stops_it() {
     let mut s = with_cues(2, Stage::Idle);
     assert_eq!(cmd(Page::Videos, 15, &s), None);
-    s.test = Some(TestPlay { cue: s.cues[1].0.clone(), position: Duration::ZERO, duration: Duration::ZERO });
+    s.test = Some(TestPlay {
+        cue: s.cues[1].0.clone(),
+        to: streamit_core::rollin::TestTo::BOTH,
+        position: Duration::ZERO,
+        duration: Duration::ZERO,
+    });
     let l = appearance(Page::Videos, 9, &s, true);
     assert_eq!((l.text.as_str(), l.bg), ("TEST\nVideo 1", AMBER));
     assert_eq!(appearance(Page::Videos, 8, &s, true).bg, BLUE);

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use streamit_core::config::Config;
 use streamit_core::engine::{Command, Snapshot};
-use streamit_core::rollin::{Destination, MAX_CUES};
+use streamit_core::rollin::{Destination, MAX_CUES, TestTo};
 use tokio::runtime::Handle;
 
 const ROW_H: f32 = 84.0;
@@ -145,6 +145,23 @@ pub(super) fn countdown_text(which: Countdown, c: &Config, length: &str) -> Stri
     }
 }
 
+/// The name a countdown's test play goes by.
+pub(super) fn countdown_name(which: Countdown) -> &'static str {
+    match which {
+        Countdown::Opening => "Opening countdown",
+        Countdown::Closing => "Closing countdown",
+    }
+}
+
+/// Where a countdown is tested until changed: where it plays in the service.
+pub(super) fn countdown_plays_to(which: Countdown, c: &Config) -> TestTo {
+    let p = &c.playout;
+    match which {
+        Countdown::Opening => TestTo { hall: true, online: p.countdown_to_stream },
+        Countdown::Closing => TestTo { hall: p.closing_to_hall, online: p.closing_to_stream },
+    }
+}
+
 /// A rounded box with a time or a name in it, standing in for a video's picture.
 fn thumb(ui: &mut Ui, size: egui::Vec2, text: &str, font: egui::FontId, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
@@ -170,8 +187,8 @@ impl StreamItApp {
             ui,
             ASIDE_W,
             |app, ui| {
-                app.countdown_panel(ui, Countdown::Opening, config, engine, &lengths);
-                app.countdown_panel(ui, Countdown::Closing, config, engine, &lengths);
+                app.countdown_panel(ui, snap, Countdown::Opening, config, engine, &lengths);
+                app.countdown_panel(ui, snap, Countdown::Closing, config, engine, &lengths);
                 app.list_panel(ui, snap, engine, locked, &lengths);
             },
             |app, ui| {
@@ -189,6 +206,7 @@ impl StreamItApp {
     fn countdown_panel(
         &mut self,
         ui: &mut Ui,
+        snap: &Snapshot,
         which: Countdown,
         config: &Config,
         engine: &Config,
@@ -225,6 +243,7 @@ impl StreamItApp {
                         );
                     }
                     ui.horizontal_wrapped(|ui| self.countdown_switches(ui, which, config));
+                    ui.horizontal_wrapped(|ui| self.countdown_test(ui, snap, which, config, engine));
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let job = match which {
@@ -299,6 +318,42 @@ impl StreamItApp {
         }
     }
 
+    /// "Test on" the hall screens and online, and Test (or Stop while it plays).
+    fn countdown_test(&mut self, ui: &mut Ui, snap: &Snapshot, which: Countdown, config: &Config, engine: &Config) {
+        let k = which as usize;
+        let mut to = self.countdown_test_to[k].unwrap_or_else(|| countdown_plays_to(which, config));
+        let testing = snap.test.as_ref().is_some_and(|t| t.cue.name == countdown_name(which));
+        ui.label(RichText::new("Test on").size(14.0).color(theme::MUTED));
+        let mut changed = ui.add_enabled(!testing, egui::Checkbox::new(&mut to.hall, "Hall screens")).changed();
+        changed |= ui
+            .add_enabled(!testing, egui::Checkbox::new(&mut to.online, "Online"))
+            .on_hover_text(
+                "Routed to Stream ATEM input 8: see it on the multiview and hear it on input 8's meter. It is \
+                 never put on the stream.",
+            )
+            .changed();
+        if changed {
+            self.countdown_test_to[k] = Some(to);
+        }
+        if testing {
+            if theme::sized_button(ui, "Stop", Kind::WarnOutline, 34.0, 14.0, true).clicked() {
+                self.send(Command::StopVideo);
+            }
+            let text = view::test_left(snap).map_or("Testing".into(), |l| format!("Testing · {l} left"));
+            chip(ui, &text, theme::AMBER_SOFT, theme::AMBER_BORDER);
+            return;
+        }
+        let block = view::test_block(snap, engine, to);
+        let r = theme::sized_button(ui, "Test", Kind::Plain, 34.0, 14.0, block.is_none());
+        let r = match &block {
+            Some(why) => r.on_disabled_hover_text(why.as_str()),
+            None => r.on_hover_text("Play it now where ticked, to check it before the service"),
+        };
+        if r.clicked() {
+            self.send(Command::TestCountdown { closing: which == Countdown::Closing, to });
+        }
+    }
+
     fn list_panel(
         &mut self,
         ui: &mut Ui,
@@ -360,7 +415,7 @@ impl StreamItApp {
             }
             let rows = view::cue_rows(&self.cues, lengths);
             let n = rows.len();
-            let block = view::test_block(snap, engine);
+            let block = view::test_block(snap, engine, TestTo::BOTH);
             for (i, row) in rows.iter().enumerate() {
                 let state = snap.cues.get(i).filter(|(c, _)| *c == self.cues[i]).map(|(_, s)| s);
                 let test = if snap.test.as_ref().is_some_and(|t| t.cue == self.cues[i]) {
@@ -499,8 +554,13 @@ impl StreamItApp {
             |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 10.0;
+                let where_ = match (t.to.hall, t.to.online) {
+                    (true, true) => "TEST PLAY · HALL AND INPUT 8, NOT ON THE STREAM",
+                    (true, false) => "TEST PLAY · HALL ONLY",
+                    _ => "TEST PLAY · INPUT 8 ONLY, NOT ON THE STREAM",
+                };
                 ui.label(
-                    RichText::new("TEST PLAY · HALL, NOT ONLINE")
+                    RichText::new(where_)
                         .font(theme::label_font(13.0))
                         .color(theme::AMBER_SOFT)
                         .extra_letter_spacing(1.5),
@@ -530,36 +590,42 @@ impl StreamItApp {
                         ui.add(egui::Label::new(RichText::new(after).size(14.0).color(theme::MUTED)).wrap());
                     });
                 };
-                place(
-                    ui,
-                    "Hall screens",
-                    format!(
-                        "Screens ATEM cut to input {}, as for a Hall video in the service.",
-                        c.screens_atem.decklink_input
-                    ),
-                    "The hall goes back to what it showed when the test stops.",
-                );
-                place(
-                    ui,
-                    &format!("Stream ATEM input {}", c.stream_atem.decklink_input),
-                    format!(
-                        "Routed to the DeckLink but not put on program. See it in input {0}’s window on the \
-                         multiview and its sound on input {0}’s audio meter.",
-                        c.stream_atem.decklink_input
-                    ),
-                    "Its router route goes back when the test stops.",
-                );
+                if t.to.hall {
+                    place(
+                        ui,
+                        "Hall screens",
+                        format!(
+                            "Screens ATEM cut to input {}, as for a Hall video in the service.",
+                            c.screens_atem.decklink_input
+                        ),
+                        "The hall goes back to what it showed when the test stops.",
+                    );
+                }
+                if t.to.online {
+                    place(
+                        ui,
+                        &format!("Stream ATEM input {}", c.stream_atem.decklink_input),
+                        format!(
+                            "Routed to the DeckLink but not put on program. See it in input {0}’s window on the \
+                             multiview and its sound on input {0}’s audio meter.",
+                            c.stream_atem.decklink_input
+                        ),
+                        "Its router route goes back when the test stops.",
+                    );
+                }
                 ui.separator();
-                let (tone, text) = if view::test_on_stream(snap, c) {
-                    (theme::RED, "Input 8 is on the stream: take it off program".to_string())
-                } else {
-                    (theme::GREEN, "Not on the stream: input 8 is not on program".to_string())
-                };
-                ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-                    ui.painter().circle_filled(r.center(), 5.0, tone);
-                    ui.label(RichText::new(text).size(15.0));
-                });
+                if t.to.online {
+                    let (tone, text) = if view::test_on_stream(snap, c) {
+                        (theme::RED, "Input 8 is on the stream: take it off program".to_string())
+                    } else {
+                        (theme::GREEN, "Not on the stream: input 8 is not on program".to_string())
+                    };
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                        ui.painter().circle_filled(r.center(), 5.0, tone);
+                        ui.label(RichText::new(text).size(15.0));
+                    });
+                }
                 ui.horizontal(|ui| {
                     let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
                     ui.painter().circle_filled(r.center(), 5.0, theme::GREEN);

@@ -25,7 +25,7 @@ use crate::devices::{
 use crate::end::{EndOutcome, end_service};
 use crate::golive::{self, CountdownOutcome, CountdownReport, Readiness, Stage, Stage0Report, T0Error};
 use crate::recovery::{self, Assessment, Offer};
-use crate::rollin::{self, Cue, CueList, CueState, RollinOutcome, RollinReport};
+use crate::rollin::{self, Cue, CueList, CueState, Destination, RollinOutcome, RollinReport, TestTo};
 use crate::routing::{Preset, RoutingRead, RoutingState, Target, TargetState, locked};
 use crate::scenes::{self, MAX_SCENES, Scene};
 use crate::steps::{self, Step, StepGroup, StepId, StepMark};
@@ -71,6 +71,11 @@ pub enum Command {
     /// Test play a video: in the hall and on Stream ATEM input 8, not on the stream.
     /// Refused while a sequence runs and from the countdown until the service ends.
     TestVideo(Cue),
+    /// Test play the opening (or, `closing`, the closing) countdown video, where `to` says.
+    TestCountdown {
+        closing: bool,
+        to: TestTo,
+    },
     /// Stops the playing video, or the test play.
     StopVideo,
     UnmuteMics,
@@ -261,6 +266,8 @@ pub struct VideoProgress {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TestPlay {
     pub cue: Cue,
+    /// Where it shows.
+    pub to: TestTo,
     pub position: Duration,
     pub duration: Duration,
 }
@@ -713,15 +720,30 @@ impl Engine {
                 self.start_video(i);
             }
             Command::TestVideo(cue) => {
-                if let Some(why) = self.busy() {
-                    set_warning(&self.snap, format!("Test play waits: {why}"));
+                if let Some(why) = self.test_refused() {
                     return self.ignore(&cmd, &why);
                 }
-                if matches!(self.stage(), Stage::Countdown { .. } | Stage::Live | Stage::Ending { .. }) {
-                    set_warning(&self.snap, "Test play is off from the countdown until the service ends".into());
-                    return self.ignore(&cmd, "the service is under way");
+                self.start_test(cue.clone(), TestTo::BOTH);
+            }
+            Command::TestCountdown { closing, to } => {
+                if let Some(why) = self.test_refused() {
+                    return self.ignore(&cmd, &why);
                 }
-                self.start_test(cue.clone());
+                let p = &self.config().playout;
+                let (name, path) = if *closing {
+                    ("Closing countdown", p.closing_file.clone())
+                } else {
+                    ("Opening countdown", p.countdown_file.clone())
+                };
+                let cue = Cue {
+                    path,
+                    name: name.into(),
+                    destination: Destination::HallAndOnline,
+                    gain_db: 0.0,
+                    return_input: None,
+                    scene: None,
+                };
+                self.start_test(cue, *to);
             }
             Command::StopVideo => match &self.running {
                 Some(Running { job: Job::Video { stop, .. } | Job::Test { stop }, .. }) => stop.cancel(),
@@ -1373,9 +1395,22 @@ impl Engine {
         }
     }
 
-    fn start_test(&mut self, cue: Cue) {
+    /// Why a test play cannot start now (and says so on screen), or `None`.
+    fn test_refused(&self) -> Option<String> {
+        if let Some(why) = self.busy() {
+            set_warning(&self.snap, format!("Test play waits: {why}"));
+            return Some(why);
+        }
+        if matches!(self.stage(), Stage::Countdown { .. } | Stage::Live | Stage::Ending { .. }) {
+            set_warning(&self.snap, "Test play is off from the countdown until the service ends".into());
+            return Some("the service is under way".into());
+        }
+        None
+    }
+
+    fn start_test(&mut self, cue: Cue, to: TestTo) {
         self.set(|s| {
-            s.test = Some(TestPlay { cue: cue.clone(), position: Duration::ZERO, duration: Duration::ZERO });
+            s.test = Some(TestPlay { cue: cue.clone(), to, position: Duration::ZERO, duration: Duration::ZERO });
             log(s, format!("Test play · {} · started", cue.name));
         });
         let stop = CancellationToken::new();
@@ -1390,7 +1425,7 @@ impl Engine {
                         }
                     })
                 };
-                let outcome = rollin::test_play(&d, &c, &cue, st, report).await;
+                let outcome = rollin::test_play(&d, &c, &cue, to, st, report).await;
                 Done::Tested { name: cue.name, outcome }
             }
             .in_current_span(),
@@ -2450,6 +2485,22 @@ mod tests {
         assert!(!log.calls().iter().any(|c| matches!(c, Call::StreamSetPreview(_) | Call::StreamAuto)));
         assert_eq!(h.screens.program().await.unwrap(), 1);
         assert_eq!(h.hub.route_of(OUT).await.unwrap(), CAM8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_closing_countdown_tests_where_asked() {
+        let (d, log, h) = rig();
+        let mut e = Engine::spawn(d, cfg(vec![]));
+        let to = TestTo { hall: true, online: false };
+        send(&e, Command::TestCountdown { closing: true, to }).await;
+        let s = until(&mut e, "test playing", |s| s.test.as_ref().is_some_and(|t| t.duration > Duration::ZERO)).await;
+        let t = s.test.unwrap();
+        assert_eq!((t.cue.name.as_str(), t.to), ("Closing countdown", to));
+        assert!(log.calls().contains(&Call::PlayerLoad(PathBuf::from("closing.mp4"), 0.0)), "{:?}", log.calls());
+        h.player.emit(PlayerEvent::Ended);
+        let s = until(&mut e, "test ended", |s| s.test.is_none() && s.job.is_none()).await;
+        assert!(s.activity.iter().any(|a| a.text == "Test play · Closing countdown · ended"), "{:?}", s.activity);
+        assert!(!log.calls().iter().any(|c| matches!(c, Call::HubRoute { .. })), "hall only: {:?}", log.calls());
     }
 
     #[tokio::test(start_paused = true)]

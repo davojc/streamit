@@ -228,6 +228,9 @@ pub struct StreamItApp {
     /// The Videos tab's "Change…" for the countdown video: saved as soon as it is picked.
     countdown_pick_job: Pending<Option<PathBuf>>,
     closing_pick_job: Pending<Option<PathBuf>>,
+    /// Where the opening and closing countdowns are tested, once changed from where each
+    /// one plays.
+    countdown_test_to: [Option<streamit_core::rollin::TestTo>; 2],
     /// The video selected on the Videos tab.
     selected: usize,
     lengths: videos::Lengths,
@@ -321,6 +324,7 @@ impl StreamItApp {
             add_files_job: Pending::default(),
             countdown_pick_job: Pending::default(),
             closing_pick_job: Pending::default(),
+            countdown_test_to: [None; 2],
             selected: 0,
             lengths: videos::Lengths::default(),
             updates: updates::Updates::default(),

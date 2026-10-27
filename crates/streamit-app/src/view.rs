@@ -9,7 +9,7 @@ use streamit_core::devices::{AudioInput, AudioMix, EncoderStatus, Health};
 use streamit_core::engine::{DeviceHealth, DeviceKind, FlashKey, Snapshot};
 use streamit_core::golive::{Readiness, Stage};
 use streamit_core::recovery::Offer;
-use streamit_core::rollin::{Cue, CueState, Destination};
+use streamit_core::rollin::{Cue, CueState, Destination, TestTo};
 use streamit_core::routing::Target;
 use streamit_core::steps::{self, StepGroup, StepId, StepMark};
 use streamit_sim::{Fault, Input8Source, PlayerView, Speed};
@@ -951,12 +951,19 @@ pub fn closing_playing(s: &Snapshot) -> bool {
 
 /// Why a test play cannot start now, or `None` when it can. `c` is the config the
 /// engine runs with (the simulation's own, with its router numbers filled in).
-pub fn test_block(s: &Snapshot, c: &Config) -> Option<String> {
+/// Why a test play to `to` cannot start now, or `None` when it can.
+pub fn test_block(s: &Snapshot, c: &Config, to: TestTo) -> Option<String> {
     if matches!(s.stage, Stage::Countdown { .. } | Stage::Live | Stage::Ending { .. }) {
         return Some("Test play is off from the countdown until the service ends".into());
     }
     if let Some(job) = s.job {
         return Some(format!("Waits until {job} ends"));
+    }
+    if !to.hall && !to.online {
+        return Some("Tick the hall screens, online or both".into());
+    }
+    if !to.online {
+        return None;
     }
     if c.videohub.input8_output == 0 || c.videohub.decklink_input == 0 {
         return Some(
@@ -988,19 +995,23 @@ mod tests {
     fn test_play_says_why_it_cannot_start() {
         let mut c = Config::default();
         let mut s = Snapshot::default();
-        assert!(test_block(&s, &c).unwrap().contains("Routing › Config"), "router numbers unset");
+        assert!(test_block(&s, &c, TestTo::BOTH).unwrap().contains("Routing › Config"), "router numbers unset");
         c.videohub.input8_output = 11;
         c.videohub.decklink_input = 39;
-        assert_eq!(test_block(&s, &c), None);
+        assert_eq!(test_block(&s, &c, TestTo::BOTH), None);
         s.routing.target_mut(Target::StreamAtem).program = Some(8);
-        assert_eq!(test_block(&s, &c).as_deref(), Some("Stream ATEM input 8 is on the stream"));
+        assert_eq!(test_block(&s, &c, TestTo::BOTH).as_deref(), Some("Stream ATEM input 8 is on the stream"));
+        let hall = TestTo { hall: true, online: false };
+        assert_eq!(test_block(&s, &c, hall), None, "input 8 does not matter in the hall");
+        assert!(test_block(&s, &c, TestTo { hall: false, online: false }).is_some());
         s.job = Some("a test play");
-        assert_eq!(test_block(&s, &c).as_deref(), Some("Waits until a test play ends"));
+        assert_eq!(test_block(&s, &c, TestTo::BOTH).as_deref(), Some("Waits until a test play ends"));
         s.stage = Stage::Live;
-        assert!(test_block(&s, &c).unwrap().starts_with("Test play is off"));
+        assert!(test_block(&s, &c, TestTo::BOTH).unwrap().starts_with("Test play is off"));
         assert_eq!(test_left(&s), None);
         s.test = Some(streamit_core::engine::TestPlay {
             cue: cue_at("Hymn", "hymn.mp4", 0.0),
+            to: TestTo::BOTH,
             position: Duration::from_millis(126_200),
             duration: Duration::from_secs(228),
         });
