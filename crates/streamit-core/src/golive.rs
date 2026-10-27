@@ -522,7 +522,7 @@ pub async fn countdown(
 }
 
 /// Input 8's sound, which carries the countdown video's when it goes to the stream.
-fn countdown_audio(c: &Config) -> AudioSourceId {
+pub(crate) fn countdown_audio(c: &Config) -> AudioSourceId {
     AudioSourceId { input: c.stream_atem.decklink_input, source: crate::rollin::STEREO_SOURCE }
 }
 
@@ -530,7 +530,7 @@ fn countdown_audio(c: &Config) -> AudioSourceId {
 /// for a video, then its sound on and the stream cut to it. The opening still stays on
 /// preview, so one Auto returns to it. `Ok` holds input 8's route before; on `Err`
 /// nothing is left changed (as far as it could be put back).
-async fn stream_to_countdown(d: &Devices, c: &Config) -> std::result::Result<u16, String> {
+pub(crate) async fn stream_to_countdown(d: &Devices, c: &Config) -> std::result::Result<u16, String> {
     let (sa, hub) = (&c.stream_atem, &c.videohub);
     if hub.input8_output == 0 || hub.decklink_input == 0 {
         return Err("VideoHub not configured".into());

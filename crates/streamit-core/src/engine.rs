@@ -222,6 +222,9 @@ pub struct Snapshot {
     /// Going public has started this service, by the countdown or by hand. The end of the
     /// service clears it.
     pub public_started: bool,
+    /// The countdown is turned off (Videos page): Start countdown is not offered. Follows
+    /// the settings as each command arrives (the equipment reads arrive every second).
+    pub countdown_off: bool,
 }
 
 impl Snapshot {
@@ -294,6 +297,7 @@ impl Default for Snapshot {
             active_scene: None,
             steps: Vec::new(),
             public_started: false,
+            countdown_off: false,
         }
     }
 }
@@ -638,6 +642,8 @@ impl Engine {
     // ---- commands ----
 
     fn handle(&mut self, cmd: Command) {
+        let off = !self.config.read().unwrap_or_else(|e| e.into_inner()).playout.countdown_on;
+        self.snap.send_if_modified(|s| std::mem::replace(&mut s.countdown_off, off) != off);
         match &cmd {
             Command::Prepare => {
                 if let Some(why) = self.busy() {
@@ -655,6 +661,9 @@ impl Engine {
                 let before = self.stage();
                 if matches!(before, Stage::Live | Stage::Ending { .. }) {
                     return self.ignore(&cmd, "the service is live or ending");
+                }
+                if !self.config().playout.countdown_on {
+                    return self.ignore(&cmd, "the countdown is turned off (Videos page)");
                 }
                 self.start_countdown(before);
             }
@@ -2206,6 +2215,18 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn the_countdown_turned_off_does_not_start() {
+        let (d, log, _h) = rig();
+        let c = cfg(vec![]);
+        c.write().unwrap().playout.countdown_on = false;
+        let e = Engine::spawn(d, c);
+        send(&e, Command::Countdown).await;
+        sleep(MS(500)).await;
+        assert_eq!(count(&log, |c| matches!(c, Call::PlayerLoad(..))), 0, "{:?}", log.calls());
+        assert!(!matches!(snap(&e).stage, Stage::Countdown { .. }));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn prepare_while_live_ignored() {
         let (d, log, h) = rig();
         // YouTube live and the stream on a live input: startup assesses Live.
@@ -2349,9 +2370,14 @@ mod tests {
         );
         send(&e, Command::EndService).await;
         let s = until(&mut e, "Ending", |s| matches!(s.stage, Stage::Ending { .. })).await;
-        assert!(matches!(marks(&s, StepGroup::End)[2], StepMark::Now(_)), "{:?}", marks(&s, StepGroup::End));
+        assert!(matches!(marks(&s, StepGroup::End)[3], StepMark::Now(_)), "{:?}", marks(&s, StepGroup::End));
         let s = until(&mut e, "Ended", |s| s.stage == Stage::Ended && s.job.is_none()).await;
-        assert!(all_done(&s, StepGroup::End), "{:?}", marks(&s, StepGroup::End));
+        // No closing countdown: its step is never reached (the screens leave it out).
+        let m = marks(&s, StepGroup::End);
+        assert!(
+            m.iter().enumerate().all(|(i, m)| matches!((i, m), (0, StepMark::Todo) | (_, StepMark::Done(_)))),
+            "{m:?}"
+        );
         assert!(all_done(&s, StepGroup::Prepare), "the earlier stages keep their marks");
         // The next service starts every step again.
         send(&e, Command::Prepare).await;

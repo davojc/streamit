@@ -1,5 +1,6 @@
-//! Screen 5: the Videos tab. The countdown video, the roll-in videos in playing order
-//! (each on a Stream Deck key), and the settings of the selected one.
+//! Screen 5: the Videos tab. The opening and closing countdowns (each can be turned off),
+//! the roll-in videos in playing order (each on a Stream Deck key), and the settings of
+//! the selected one.
 use super::StreamItApp;
 use crate::theme::{self, Kind};
 use crate::view::{self, ClipLength, CueRow};
@@ -113,6 +114,37 @@ fn chip(ui: &mut Ui, text: &str, color: Color32, border: Color32) {
     ui.painter().galley(rect.min + vec2(9.0, 4.0), galley, color);
 }
 
+/// A settings change, saved at once.
+type Change = Box<dyn Fn(&mut Config)>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Countdown {
+    Opening,
+    Closing,
+}
+
+/// What a countdown does, under its name. `length`: its video's length ("4:30").
+pub(super) fn countdown_text(which: Countdown, c: &Config, length: &str) -> String {
+    let p = &c.playout;
+    match which {
+        Countdown::Opening if !p.countdown_on => {
+            "Off: there is no countdown; Start service now starts the service.".into()
+        }
+        Countdown::Opening if p.countdown_to_stream => {
+            format!("{length} · plays to the hall and online before the service. When it ends, the service goes live.")
+        }
+        Countdown::Opening => format!(
+            "{length} · plays to the hall before the service; online sees the “starting soon” still. When it ends, \
+             the service goes live."
+        ),
+        Countdown::Closing if !p.closing_plays() => "Off: End Service goes straight to the closing still.".into(),
+        Countdown::Closing => format!(
+            "{length} · plays at End Service, before the closing still: {}. Pressing End Service again skips it.",
+            view::closing_where(c).to_lowercase()
+        ),
+    }
+}
+
 /// A rounded box with a time or a name in it, standing in for a video's picture.
 fn thumb(ui: &mut Ui, size: egui::Vec2, text: &str, font: egui::FontId, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
@@ -121,30 +153,25 @@ fn thumb(ui: &mut Ui, size: egui::Vec2, text: &str, font: egui::FontId, color: C
 }
 
 impl StreamItApp {
-    /// `running`: in simulation, the config it opened with (its countdown video is the
-    /// one it plays).
+    /// `running`: in simulation, the config it opened with (its countdown videos are the
+    /// ones it plays).
     pub(super) fn videos_tab(&mut self, ui: &mut Ui, snap: &Snapshot, config: &Config, running: Option<&Config>) {
-        let countdown = running.unwrap_or(config).playout.countdown_file.clone();
-        let online = if running.unwrap_or(config).playout.countdown_to_stream {
-            "plays to the hall and online before the service."
-        } else {
-            "plays to the hall before the service. Online sees the “starting soon” still."
-        };
-        let note = view::sim_next_time_note(&countdown, &config.playout.countdown_file);
+        let engine = running.unwrap_or(config);
         let lengths = {
-            let paths = self.cues.iter().map(|c| c.path.as_path()).chain([countdown.as_path()]);
+            let (opening, closing) = (&engine.playout.countdown_file, &engine.playout.closing_file);
+            let paths = self.cues.iter().map(|c| c.path.as_path()).chain([opening.as_path(), closing.as_path()]);
             self.lengths.ask(&self.rt, &self.ctx, paths)
         };
         if !self.cues.is_empty() {
             self.selected = self.selected.min(self.cues.len() - 1);
         }
         let locked = snap.playing.is_some();
-        let engine = running.unwrap_or(config);
         self.columns(
             ui,
             ASIDE_W,
             |app, ui| {
-                app.countdown_panel(ui, &countdown, online, note, &lengths);
+                app.countdown_panel(ui, Countdown::Opening, config, engine, &lengths);
+                app.countdown_panel(ui, Countdown::Closing, config, engine, &lengths);
                 app.list_panel(ui, snap, engine, locked, &lengths);
             },
             |app, ui| {
@@ -156,33 +183,40 @@ impl StreamItApp {
         );
     }
 
-    /// `online`: where it plays. `note`: the saved countdown video differs from the one
-    /// the simulation plays.
+    /// The opening or closing countdown: its video, whether it is used and where it plays.
+    /// The switches save straight away. `engine`: the config the engine runs with (in
+    /// simulation, the one it opened with, whose video it plays).
     fn countdown_panel(
         &mut self,
         ui: &mut Ui,
-        file: &Path,
-        online: &str,
-        note: Option<&str>,
+        which: Countdown,
+        config: &Config,
+        engine: &Config,
         lengths: &HashMap<PathBuf, ClipLength>,
     ) {
+        let p = &config.playout;
+        let (title, file, saved, on) = match which {
+            Countdown::Opening => {
+                ("Opening countdown", &engine.playout.countdown_file, &p.countdown_file, p.countdown_on)
+            }
+            Countdown::Closing => ("Closing countdown", &engine.playout.closing_file, &p.closing_file, p.closing_on),
+        };
+        let note = view::sim_next_time_note(file, saved);
         let length = view::length_text(lengths.get(file).copied());
+        let about = countdown_text(which, config, &length);
         theme::panel().inner_margin(20).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 18.0;
-                thumb(ui, vec2(160.0, 90.0), &length, theme::heading_font(22.0), theme::SCREEN_TEXT);
+                let shown = if on { theme::SCREEN_TEXT } else { theme::DIM };
+                thumb(ui, vec2(160.0, 90.0), if on { &length } else { "Off" }, theme::heading_font(22.0), shown);
                 ui.vertical(|ui| {
                     ui.set_width((ui.available_width() - 150.0).max(200.0));
-                    theme::lbl(ui, "Countdown video");
+                    theme::lbl(ui, title);
                     ui.add(
                         egui::Label::new(RichText::new(view::file_name(file)).font(theme::body_bold(19.0))).truncate(),
                     );
-                    ui.label(
-                        RichText::new(format!("{length} · {online} When it ends, the service goes live."))
-                            .size(15.0)
-                            .color(theme::SOFT),
-                    );
+                    ui.label(RichText::new(about).size(15.0).color(theme::SOFT));
                     if let Some(n) = note {
                         ui.label(
                             RichText::new(format!("The simulation plays this one; the new choice {n}."))
@@ -190,10 +224,15 @@ impl StreamItApp {
                                 .color(theme::AMBER_SOFT),
                         );
                     }
+                    ui.horizontal_wrapped(|ui| self.countdown_switches(ui, which, config));
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if theme::button_enabled(ui, !self.countdown_pick_job.running, "Change…", Kind::Plain).clicked() {
-                        self.countdown_pick_job.start(&self.rt, &self.ctx, async {
+                    let job = match which {
+                        Countdown::Opening => &mut self.countdown_pick_job,
+                        Countdown::Closing => &mut self.closing_pick_job,
+                    };
+                    if theme::button_enabled(ui, !job.running, "Change…", Kind::Plain).clicked() {
+                        job.start(&self.rt, &self.ctx, async {
                             rfd::AsyncFileDialog::new()
                                 .add_filter("Video", &["mp4", "mov", "m4v", "mkv"])
                                 .pick_file()
@@ -204,6 +243,60 @@ impl StreamItApp {
                 });
             });
         });
+    }
+
+    /// "Use it" and where it plays; each change is saved at once.
+    fn countdown_switches(&mut self, ui: &mut Ui, which: Countdown, config: &Config) {
+        let p = &config.playout;
+        let mut changed: Option<Change> = None;
+        match which {
+            Countdown::Opening => {
+                let (mut on, mut online) = (p.countdown_on, p.countdown_to_stream);
+                if ui
+                    .checkbox(&mut on, "Use it")
+                    .on_hover_text("Off: the service starts with Start service now.")
+                    .changed()
+                {
+                    changed = Some(Box::new(move |c| c.playout.countdown_on = on));
+                }
+                if ui
+                    .add_enabled(on, egui::Checkbox::new(&mut online, "Goes online too"))
+                    .on_hover_text(
+                        "Off: online sees the opening still, in silence, until the service starts. On: the countdown \
+                         is routed to Stream ATEM input 8 by the VideoHub, as a video is, with its sound.",
+                    )
+                    .changed()
+                {
+                    changed = Some(Box::new(move |c| c.playout.countdown_to_stream = online));
+                }
+            }
+            Countdown::Closing => {
+                let (mut on, mut hall, mut online) = (p.closing_on, p.closing_to_hall, p.closing_to_stream);
+                if ui
+                    .checkbox(&mut on, "Use it")
+                    .on_hover_text("Off: End Service goes straight to the closing still.")
+                    .changed()
+                {
+                    changed = Some(Box::new(move |c| c.playout.closing_on = on));
+                }
+                if ui.add_enabled(on, egui::Checkbox::new(&mut hall, "Hall screens")).changed() {
+                    changed = Some(Box::new(move |c| c.playout.closing_to_hall = hall));
+                }
+                if ui
+                    .add_enabled(on, egui::Checkbox::new(&mut online, "Online"))
+                    .on_hover_text(
+                        "The stream audio fades down, then the VideoHub routes the video to Stream ATEM input 8, \
+                         with its sound.",
+                    )
+                    .changed()
+                {
+                    changed = Some(Box::new(move |c| c.playout.closing_to_stream = online));
+                }
+            }
+        }
+        if let Some(change) = changed {
+            self.save_setup(change);
+        }
     }
 
     fn list_panel(
@@ -646,5 +739,22 @@ impl StreamItApp {
         if changed {
             self.cues_dirty_at = Some(Instant::now());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_countdown_says_what_it_does() {
+        let mut c = Config::default();
+        assert!(countdown_text(Countdown::Opening, &c, "4:30").starts_with("4:30 · plays to the hall before"));
+        assert!(countdown_text(Countdown::Closing, &c, "1:00").starts_with("Off:"), "closing is off by default");
+        c.playout.closing_on = true;
+        c.playout.closing_to_stream = false;
+        assert!(countdown_text(Countdown::Closing, &c, "1:00").contains("hall screens only"));
+        c.playout.countdown_on = false;
+        assert!(countdown_text(Countdown::Opening, &c, "4:30").starts_with("Off:"));
     }
 }

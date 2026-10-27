@@ -15,7 +15,6 @@ use crate::theme::{self, Kind};
 use crate::view::{self, Tone};
 use eframe::egui::{self, Align, Color32, Layout, Margin, RichText, Shape, Stroke, Ui, vec2};
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 use streamit_core::config::{AudioSourceId, Config, OscFraming, ShownAudio};
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
@@ -769,7 +768,6 @@ impl StreamItApp {
         heading(ui, "Playout & NDI counter");
         ui.add_space(8.0);
         let c = &mut self.draft;
-        let (rt, ctx, job) = (&self.rt, &self.ctx, &mut self.countdown_job);
         ui.columns(3, |col| {
             field(&mut col[0], "DeckLink device", |ui| number(ui, &mut c.playout.decklink_device, "Device "));
             field(&mut col[1], "Video mode", |ui| {
@@ -779,38 +777,10 @@ impl StreamItApp {
                 text(ui, &mut c.ndi.source_name, "");
             });
         });
-        field(ui, "Countdown video", |ui| {
-            ui.horizontal(|ui| {
-                let mut s = c.playout.countdown_file.display().to_string();
-                let w = (ui.available_width() - 140.0).max(200.0);
-                if ui
-                    .add_sized([w, FIELD_H], egui::TextEdit::singleline(&mut s).align(egui::Align2::LEFT_CENTER))
-                    .changed()
-                {
-                    c.playout.countdown_file = PathBuf::from(s);
-                }
-                if theme::button_enabled(ui, !job.running, "Browse…", Kind::Plain).clicked() {
-                    job.start(rt, ctx, async {
-                        rfd::AsyncFileDialog::new()
-                            .add_filter("Video", &["mp4", "mov", "m4v", "mkv"])
-                            .pick_file()
-                            .await
-                            .map(|f| f.path().to_path_buf())
-                    });
-                }
-            });
-        });
-        ui.checkbox(
-            &mut c.playout.countdown_to_stream,
-            "The countdown video goes online too (Stream ATEM input 8, with its sound)",
-        );
         ui.label(
-            RichText::new(
-                "Off: online sees the opening still, in silence, until the service starts. On: the countdown is \
-                 routed to input 8 by the VideoHub, as a video is.",
-            )
-            .size(14.0)
-            .color(theme::MUTED),
+            RichText::new("The opening and closing countdowns are set on the Videos page.")
+                .size(14.0)
+                .color(theme::MUTED),
         );
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -954,7 +924,7 @@ mod tests {
         c.youtube.stream_id = Some("s".into());
         assert!(device_settings(&a) != device_settings(&c));
         let mut d = a.clone();
-        d.playout.countdown_file = PathBuf::from("other.mp4");
+        d.playout.countdown_file = std::path::PathBuf::from("other.mp4");
         assert!(device_settings(&a) == device_settings(&d), "the countdown file is read live");
     }
 

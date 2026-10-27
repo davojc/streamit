@@ -180,7 +180,7 @@ pub const RECOVER_FIRST: &str = "Recover first";
 
 /// Mirrors the engine: Start service now runs from Idle or Prepared when nothing else
 /// runs (the countdown has its own button); End Service starts when nothing runs, stops
-/// a video first, and a second press during End Service skips the closing hold. Before
+/// a video first, and a second press during End Service skips the closing countdown or hold. Before
 /// the service, a pending Recover comes first (S6), and from Idle Start service now asks
 /// for a confirm: the encoder is not streaming yet.
 pub fn more_menu(s: &Snapshot) -> MoreMenu {
@@ -225,6 +225,12 @@ pub fn next_step(s: &Snapshot) -> NextStep {
 /// The next step's heading and explanation.
 pub fn next_step_text(s: &Snapshot, c: &Config) -> (&'static str, String) {
     match next_step(s) {
+        NextStep::Countdown if s.countdown_off => (
+            "Start the service",
+            "The countdown is turned off (Videos page). Start service now cuts the stream to the camera and \
+             goes public."
+                .to_string(),
+        ),
         NextStep::Countdown => (
             "Start the countdown",
             format!(
@@ -864,8 +870,10 @@ pub fn step_heading(g: StepGroup) -> &'static str {
 pub fn step_rows(s: &Snapshot, c: &Config, g: StepGroup) -> Vec<StepRow> {
     steps::of_group(&s.steps, g)
         .into_iter()
-        // The stream step only when the countdown goes online too.
+        // The stream step only when the countdown goes online too; the closing countdown's
+        // only when it plays.
         .filter(|st| st.id != StepId::StreamCountdown || c.playout.countdown_to_stream)
+        .filter(|st| st.id != StepId::ClosingVideo || c.playout.closing_plays())
         .map(|st| {
             let (tone, detail, time) = match st.mark {
                 StepMark::Todo => (Tone::Grey, todo_detail(st.id, c), None),
@@ -906,6 +914,7 @@ fn todo_detail(id: StepId, c: &Config) -> Option<String> {
         StepId::HallCountdown => format!("Screens ATEM input {}", c.screens_atem.decklink_input),
         StepId::StreamCountdown => format!("Stream ATEM input {}, with its sound", c.stream_atem.decklink_input),
         StepId::YouTubePublic => format!("At {} left", fmt_mmss(c.timings.go_public_offset)),
+        StepId::ClosingVideo => closing_where(c).into(),
         StepId::ClosingHold => format!("{}, can be skipped", fmt_mmss(c.timings.closing_hold)),
         _ => return None,
     })
@@ -914,9 +923,26 @@ fn todo_detail(id: StepId, c: &Config) -> Option<String> {
 fn now_detail(id: StepId, s: &Snapshot) -> Option<String> {
     match (id, &s.stage) {
         (StepId::CountdownVideo, Stage::Countdown { remaining, .. }) => Some(format!("{} left", fmt_mmss(*remaining))),
-        (StepId::ClosingHold, Stage::Ending { remaining }) => Some(format!("{} left", fmt_mmss(*remaining))),
+        (StepId::ClosingVideo | StepId::ClosingHold, Stage::Ending { remaining }) => {
+            Some(format!("{} left", fmt_mmss(*remaining)))
+        }
         _ => None,
     }
+}
+
+/// Where the closing countdown plays.
+pub fn closing_where(c: &Config) -> &'static str {
+    match (c.playout.closing_to_hall, c.playout.closing_to_stream) {
+        (true, true) => "Hall screens and online, with its sound",
+        (true, false) => "Hall screens only",
+        (false, true) => "Online only, with its sound",
+        (false, false) => "Nowhere: pick the hall, online or both",
+    }
+}
+
+/// End Service is playing the closing countdown (before the closing still and the hold).
+pub fn closing_playing(s: &Snapshot) -> bool {
+    s.steps.iter().any(|st| st.id == StepId::ClosingVideo && matches!(st.mark, StepMark::Now(_)))
 }
 
 /// Why a test play cannot start now, or `None` when it can. `c` is the config the
@@ -1570,5 +1596,38 @@ mod tests {
         let rows = step_rows(&s, &c, StepGroup::Countdown);
         assert_eq!((rows[1].tone, rows[1].detail.as_deref()), (Tone::Red, Some("no signal")));
         assert_eq!(steps_tone(&rows), Tone::Red);
+    }
+
+    #[test]
+    fn the_closing_countdown_step_shows_only_when_it_plays() {
+        let mut s = Snapshot::default();
+        steps::reset(&mut s.steps, StepGroup::End);
+        let mut c = Config::default();
+        let labels = |c: &Config| step_rows(&s, c, StepGroup::End).into_iter().map(|r| r.label).collect::<Vec<_>>();
+        assert!(!labels(&c).contains(&"Closing countdown playing"), "off by default");
+        c.playout.closing_on = true;
+        assert_eq!(labels(&c)[0], "Closing countdown playing");
+        c.playout.closing_to_hall = false;
+        c.playout.closing_to_stream = false;
+        assert!(!labels(&c).contains(&"Closing countdown playing"), "going nowhere");
+    }
+
+    #[test]
+    fn the_ending_screen_knows_the_closing_countdown_is_playing() {
+        let mut s = Snapshot::default();
+        steps::reset(&mut s.steps, StepGroup::End);
+        assert!(!closing_playing(&s));
+        steps::mark(&mut s.steps, StepId::ClosingVideo, StepMark::Now(None));
+        assert!(closing_playing(&s));
+        steps::mark(&mut s.steps, StepId::ClosingVideo, StepMark::done());
+        assert!(!closing_playing(&s));
+    }
+
+    #[test]
+    fn with_the_countdown_off_the_next_step_is_starting_the_service() {
+        let mut s = Snapshot { stage: Stage::Prepared(Readiness::Ready), ..Snapshot::default() };
+        assert_eq!(next_step_text(&s, &Config::default()).0, "Start the countdown");
+        s.countdown_off = true;
+        assert_eq!(next_step_text(&s, &Config::default()).0, "Start the service");
     }
 }

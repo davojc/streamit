@@ -174,10 +174,26 @@ impl Default for Timings {
 pub struct PlayoutConfig {
     pub decklink_device: u32,
     pub video_mode: String,
+    /// Off: there is no countdown; the service starts with Start service now.
+    pub countdown_on: bool,
     pub countdown_file: PathBuf,
     /// The countdown video also goes online: routed to Stream ATEM input 8 and put on
     /// program with its sound. Off: online sees the opening still until T-0.
     pub countdown_to_stream: bool,
+    /// The closing countdown plays at End Service, before the closing still.
+    pub closing_on: bool,
+    pub closing_file: PathBuf,
+    /// Where it plays: the hall screens, and online (input 8 with its sound, the stream
+    /// audio faded down first).
+    pub closing_to_hall: bool,
+    pub closing_to_stream: bool,
+}
+
+impl PlayoutConfig {
+    /// End Service plays the closing countdown: turned on and going somewhere.
+    pub fn closing_plays(&self) -> bool {
+        self.closing_on && (self.closing_to_hall || self.closing_to_stream)
+    }
 }
 
 impl Default for PlayoutConfig {
@@ -185,8 +201,13 @@ impl Default for PlayoutConfig {
         Self {
             decklink_device: 0,
             video_mode: "1080p2997".into(),
+            countdown_on: true,
             countdown_file: PathBuf::from("countdown.mp4"),
             countdown_to_stream: false,
+            closing_on: false,
+            closing_file: PathBuf::from("closing.mp4"),
+            closing_to_hall: true,
+            closing_to_stream: true,
         }
     }
 }

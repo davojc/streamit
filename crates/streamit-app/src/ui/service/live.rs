@@ -287,13 +287,25 @@ impl StreamItApp {
                 theme::panel().inner_margin(28).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     theme::lbl(ui, "Ending the service");
-                    ui.label(RichText::new("Closing still on air").font(theme::heading_font(44.0)));
+                    let video = view::closing_playing(snap);
+                    let (title, then, skip) = if video {
+                        (
+                            "Closing countdown",
+                            "Then the closing still and its hold, then YouTube ends and the Web Presenter stops.",
+                            "Skip the closing countdown",
+                        )
+                    } else {
+                        (
+                            "Closing still on air",
+                            "Then YouTube ends and the Web Presenter stops.",
+                            "Skip the closing hold",
+                        )
+                    };
+                    ui.label(RichText::new(title).font(theme::heading_font(44.0)));
                     ui.label(RichText::new(view::fmt_mmss(remaining)).font(theme::mono_bold(72.0)));
-                    ui.label(
-                        RichText::new("Then YouTube ends and the Web Presenter stops.").size(17.0).color(theme::SOFT),
-                    );
+                    ui.label(RichText::new(then).size(17.0).color(theme::SOFT));
                     ui.add_space(12.0);
-                    if theme::sized_button(ui, "Skip the closing hold", Kind::WarnOutline, 60.0, 19.0, true).clicked() {
+                    if theme::sized_button(ui, skip, Kind::WarnOutline, 60.0, 19.0, true).clicked() {
                         app.send(Command::EndService);
                     }
                 });

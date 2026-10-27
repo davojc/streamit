@@ -178,6 +178,14 @@ fn prepared_offers_the_countdown_and_start_now_at_once() {
 }
 
 #[test]
+fn with_the_countdown_off_its_key_is_blank_and_does_nothing() {
+    let s = Snapshot { stage: Stage::Prepared(Readiness::Ready), countdown_off: true, ..Snapshot::default() };
+    assert_eq!(cmd(Page::Service, 9, &s), None);
+    assert_eq!(appearance(Page::Service, 9, &s, true).text, "");
+    assert_eq!(cmd(Page::Service, 11, &s), Some(Command::GoLive));
+}
+
+#[test]
 fn abandon_asks_first_while_prepared_or_counting_down_and_youtube_is_private() {
     for stage in [Stage::Prepared(Readiness::Ready), CD] {
         let s = Snapshot { stage, ..Snapshot::default() };

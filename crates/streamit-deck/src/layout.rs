@@ -313,7 +313,7 @@ fn service_press(key: u8, snap: &Snapshot) -> Option<Press> {
         },
         ServiceStep::Prepared => match key {
             PREPARE => cmd(Command::Prepare),
-            COUNTDOWN => cmd(Command::Countdown),
+            COUNTDOWN if !snap.countdown_off => cmd(Command::Countdown),
             START_NOW => cmd(Command::GoLive),
             RECOVER if offered(snap, Offer::Recover) => cmd(Command::Recover),
             ABANDON if snap.can_abandon() => Some(Press::Ask(Asked::Abandon)),
@@ -543,6 +543,7 @@ fn service_look(key: u8, snap: &Snapshot, phase: bool) -> KeyLook {
         },
         ServiceStep::Prepared => match key {
             PREPARE => look("PREPARE\nAGAIN", SLATE, WHITE),
+            COUNTDOWN if snap.countdown_off => blank(),
             COUNTDOWN => look("START\nCOUNT\nDOWN", AMBER, BLACK),
             START_NOW => start_now(snap),
             RECOVER => recover(snap),

@@ -225,9 +225,9 @@ pub struct StreamItApp {
     streams_status: String,
     /// File dialogs run on the runtime (they would block the window); results land here.
     add_files_job: Pending<Vec<PathBuf>>,
-    countdown_job: Pending<Option<PathBuf>>,
     /// The Videos tab's "Change…" for the countdown video: saved as soon as it is picked.
     countdown_pick_job: Pending<Option<PathBuf>>,
+    closing_pick_job: Pending<Option<PathBuf>>,
     /// The video selected on the Videos tab.
     selected: usize,
     lengths: videos::Lengths,
@@ -317,8 +317,8 @@ impl StreamItApp {
             streams_job: Pending::default(),
             streams_status: String::new(),
             add_files_job: Pending::default(),
-            countdown_job: Pending::default(),
             countdown_pick_job: Pending::default(),
+            closing_pick_job: Pending::default(),
             selected: 0,
             lengths: videos::Lengths::default(),
             updates: updates::Updates::default(),
@@ -451,11 +451,11 @@ impl StreamItApp {
                 Err(e) => self.streams_status = format!("Could not list streams: {e}"),
             }
         }
-        if let Some(f) = self.countdown_job.take().flatten() {
-            self.draft.playout.countdown_file = f;
-        }
         if let Some(f) = self.countdown_pick_job.take().flatten() {
-            self.save_countdown(f);
+            self.save_setup(move |c| c.playout.countdown_file = f.clone());
+        }
+        if let Some(f) = self.closing_pick_job.take().flatten() {
+            self.save_setup(move |c| c.playout.closing_file = f.clone());
         }
     }
 
@@ -619,27 +619,8 @@ impl StreamItApp {
             return;
         }
         if let Err(e) = c.save(&self.file.path) {
-            warn!("saving the routing setup: {e:#}");
-            self.notice = Some(format!("Could not save the routing setup: {e:#}"));
-        }
-    }
-
-    /// Writes the countdown video choice to the shared settings and the file, leaving the
-    /// Settings tab's unsaved edits alone.
-    fn save_countdown(&mut self, file: PathBuf) {
-        let c = {
-            let mut shared = self.config.write().unwrap_or_else(|e| e.into_inner());
-            shared.playout.countdown_file = file.clone();
-            shared.clone()
-        };
-        self.draft.playout.countdown_file = file;
-        if !self.file.writable {
-            self.notice = Some("Not saved: the settings file could not be backed up (see the log).".into());
-            return;
-        }
-        if let Err(e) = c.save(&self.file.path) {
-            warn!("saving the countdown video: {e:#}");
-            self.notice = Some(format!("Could not save the countdown video: {e:#}"));
+            warn!("saving the settings: {e:#}");
+            self.notice = Some(format!("Could not save the settings: {e:#}"));
         }
     }
 }

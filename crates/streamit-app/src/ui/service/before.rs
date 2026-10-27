@@ -72,6 +72,12 @@ impl StreamItApp {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 let busy = snap.job.is_some();
                 match step {
+                    view::NextStep::Countdown if snap.countdown_off => {
+                        if theme::big_button(ui, "Start service now", Kind::Warn, !busy).clicked() {
+                            self.send(Command::GoLive);
+                        }
+                        self.abandon_button(ui, snap);
+                    }
                     view::NextStep::Countdown => {
                         if theme::big_button(ui, "Start countdown", Kind::Warn, !busy).clicked() {
                             self.send(Command::Countdown);
