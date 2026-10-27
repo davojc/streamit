@@ -1,5 +1,6 @@
 //! StreamIt configuration: device addresses, input numbers and timings.
 
+use crate::devices::LabelKind;
 use crate::routing::{RoutingConfig, Target};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -115,6 +116,42 @@ pub struct VideoHubConfig {
     /// An unused (black) input. A VideoHub output always shows some input, so
     /// disconnecting an output routes this one to it.
     pub blank_input: u16,
+    /// The cable into each input and out of each output, to tell them apart: kept only in
+    /// StreamIt (the VideoHub never sees it).
+    pub input_cables: Vec<CableRun>,
+    pub output_cables: Vec<CableRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CableRun {
+    pub n: u16,
+    pub run: String,
+}
+
+impl VideoHubConfig {
+    fn cables_mut(&mut self, kind: LabelKind) -> &mut Vec<CableRun> {
+        match kind {
+            LabelKind::Input => &mut self.input_cables,
+            LabelKind::Output => &mut self.output_cables,
+        }
+    }
+
+    /// Input or output `n`'s cable run, if one is noted.
+    pub fn cable(&self, kind: LabelKind, n: u16) -> Option<&str> {
+        let cables = if kind == LabelKind::Input { &self.input_cables } else { &self.output_cables };
+        cables.iter().find(|c| c.n == n).map(|c| c.run.as_str())
+    }
+
+    /// Notes input or output `n`'s cable run (trimmed); blank removes it.
+    pub fn set_cable(&mut self, kind: LabelKind, n: u16, run: &str) {
+        let run = run.replace(['\r', '\n'], " ").trim().to_string();
+        let cables = self.cables_mut(kind);
+        cables.retain(|c| c.n != n);
+        if !run.is_empty() {
+            cables.push(CableRun { n, run });
+            cables.sort_by_key(|c| c.n);
+        }
+    }
 }
 
 impl Default for VideoHubConfig {
@@ -126,6 +163,8 @@ impl Default for VideoHubConfig {
             settle: Duration::from_millis(1500),
             fallback_normal_input: 0,
             blank_input: 0,
+            input_cables: Vec::new(),
+            output_cables: Vec::new(),
         }
     }
 }
@@ -631,5 +670,21 @@ mod tests {
         let msg = format!("{:#}", Config::load(&path).unwrap_err());
         assert!(!msg.contains("GOCSPX"), "{msg}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cable_runs_are_kept_per_input_and_output_and_survive_a_save() {
+        let mut c = Config::default();
+        c.videohub.set_cable(LabelKind::Input, 5, "  C-104 · stage left box 2 ");
+        c.videohub.set_cable(LabelKind::Output, 5, "to the balcony");
+        c.videohub.set_cable(LabelKind::Input, 2, "C-105");
+        assert_eq!(c.videohub.cable(LabelKind::Input, 5), Some("C-104 · stage left box 2"));
+        assert_eq!(c.videohub.cable(LabelKind::Output, 5), Some("to the balcony"));
+        assert_eq!(c.videohub.input_cables.iter().map(|r| r.n).collect::<Vec<_>>(), [2, 5], "in number order");
+        let back: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.videohub, c.videohub);
+        c.videohub.set_cable(LabelKind::Input, 5, "  ");
+        assert_eq!(c.videohub.cable(LabelKind::Input, 5), None, "blank removes it");
+        assert_eq!(c.videohub.cable(LabelKind::Output, 5), Some("to the balcony"));
     }
 }

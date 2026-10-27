@@ -87,6 +87,9 @@ pub(super) struct RtUi {
     vh_pick: Option<videohub::Pick>,
     /// The VideoHub name being edited (after a double-click).
     vh_editing: Option<(LabelKind, u16)>,
+    /// The cable run being edited (from the row's menu), and its text so far.
+    vh_cable: Option<(LabelKind, u16)>,
+    vh_cable_draft: String,
 }
 
 impl RtUi {
@@ -116,6 +119,8 @@ impl Default for RtUi {
             recall: None,
             vh_pick: None,
             vh_editing: None,
+            vh_cable: None,
+            vh_cable_draft: String::new(),
         }
     }
 }

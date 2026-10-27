@@ -2,7 +2,8 @@
 //! column each. Clicking an input shows the outputs it feeds (with a line to each);
 //! clicking an output shows its input. Dragging an input onto an output routes it.
 //! Double-clicking a name edits it in place; it goes to the VideoHub on Enter (or a click
-//! away) and Escape puts it back. A VideoHub output always shows some input, so
+//! away) and Escape puts it back. A row's menu notes its cable run, shown under its name and
+//! kept only in StreamIt. A VideoHub output always shows some input, so
 //! disconnecting one routes the input marked as blank to it.
 use super::super::StreamItApp;
 use super::{CLEAR_W, InputDrag, cleared_label, colour, label_to_send, port_count, setup};
@@ -14,6 +15,8 @@ use streamit_core::routing::RoutingState;
 use tracing::info;
 
 const ROW_H: f32 = 30.0;
+/// A row with its cable run under its name.
+const CABLE_ROW_H: f32 = 42.0;
 const ROW_GAP: f32 = 4.0;
 /// The gap between the columns, where the lines run.
 const LINK_W: f32 = 140.0;
@@ -69,7 +72,10 @@ pub(in crate::ui) fn feeds_text(count: usize) -> String {
 impl StreamItApp {
     pub(super) fn videohub_page(&mut self, ui: &mut Ui, snap: &Snapshot) {
         let routing = &snap.routing;
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) && self.routes_ui.vh_editing.is_none() {
+        if ui.input(|i| i.key_pressed(egui::Key::Escape))
+            && self.routes_ui.vh_editing.is_none()
+            && self.routes_ui.vh_cable.is_none()
+        {
             self.routes_ui.vh_pick = None;
         }
         let lit = lit(routing, self.routes_ui.vh_pick);
@@ -81,7 +87,8 @@ impl StreamItApp {
                      onto an output to route it. Double-click a name to rename it (Enter sends it to the VideoHub, \
                      Escape puts it back); × clears it to its number. Right-click an input to mark it as the \
                      video source or the blank input; right-click an output to disconnect it (it then shows the \
-                     blank input).",
+                     blank input). Right-click either to note its cable run, shown under its name and kept only \
+                     in StreamIt.",
                 )
                 .color(theme::SOFT),
             );
@@ -133,7 +140,8 @@ impl StreamItApp {
 
     fn input_row(&mut self, ui: &mut Ui, snap: &Snapshot, n: u16, lit: &Lit) -> Rect {
         let routing = &snap.routing;
-        let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click_and_drag());
+        let cable = self.cable_of(LabelKind::Input, n);
+        let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), row_h(&cable)), Sense::click_and_drag());
         let picked = self.routes_ui.vh_pick == Some(Pick::Input(n));
         let shown = lit.inputs.contains(&n);
         let (source, blank) = {
@@ -159,6 +167,7 @@ impl StreamItApp {
             setup::badge(ui, egui::pos2(name_right + 4.0, rect.center().y - 8.0), "BLANK", BLANK);
         }
         let name = Rect::from_min_max(rect.min + vec2(NUM_W + 8.0, 3.0), egui::pos2(name_right, rect.bottom() - 3.0));
+        let name = self.cable_cell(ui, LabelKind::Input, n, &cable, name);
         self.name_cell(ui, routing, LabelKind::Input, n, name);
         self.clear_button(ui, routing, LabelKind::Input, n, rect);
         if r.drag_started() {
@@ -187,6 +196,7 @@ impl StreamItApp {
                 self.save_setup(move |c| c.videohub.blank_input = mark);
                 ui.close();
             }
+            self.cable_menu_item(ui, LabelKind::Input, n, &cable);
         });
         self.pick_or_edit(&r, Pick::Input(n), LabelKind::Input, n, routing);
         rect
@@ -194,7 +204,8 @@ impl StreamItApp {
 
     fn output_row(&mut self, ui: &mut Ui, snap: &Snapshot, o: u16, lit: &Lit) -> Rect {
         let routing = &snap.routing;
-        let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+        let cable = self.cable_of(LabelKind::Output, o);
+        let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), row_h(&cable)), Sense::click());
         let picked = self.routes_ui.vh_pick == Some(Pick::Output(o));
         let shown = lit.outputs.contains(&o);
         let dropping = r.dnd_hover_payload::<InputDrag>().is_some();
@@ -210,7 +221,7 @@ impl StreamItApp {
             ui.painter().text(b.center(), Align2::CENTER_CENTER, t.dest_key(i), theme::mono_bold(10.0), Color32::BLACK);
         }
         // Its input, after the ×.
-        let src_rect = Rect::from_min_size(rect.min + vec2(CLEAR_W + 4.0, 0.0), vec2(SRC_W, ROW_H));
+        let src_rect = Rect::from_min_size(rect.min + vec2(CLEAR_W + 4.0, 0.0), vec2(SRC_W, rect.height()));
         let blank = self.config.read().unwrap_or_else(|e| e.into_inner()).videohub.blank_input;
         let (src, src_colour) = match routing.route(o) {
             Some(n) if n == blank => ("— disconnected".to_string(), theme::DIM),
@@ -230,8 +241,15 @@ impl StreamItApp {
             egui::pos2(src_rect.right() + 6.0, rect.top() + 3.0),
             egui::pos2(x - 6.0, rect.bottom() - 3.0),
         );
+        let name = self.cable_cell(ui, LabelKind::Output, o, &cable, name);
         self.name_cell(ui, routing, LabelKind::Output, o, name);
-        self.clear_button(ui, routing, LabelKind::Output, o, Rect::from_min_size(rect.min, vec2(CLEAR_W, ROW_H)));
+        self.clear_button(
+            ui,
+            routing,
+            LabelKind::Output,
+            o,
+            Rect::from_min_size(rect.min, vec2(CLEAR_W, rect.height())),
+        );
         if let Some(d) = r.dnd_release_payload::<InputDrag>() {
             self.route_output(snap, o, d.0);
         }
@@ -254,6 +272,7 @@ impl StreamItApp {
                 self.route_output(snap, o, b);
                 ui.close();
             }
+            self.cable_menu_item(ui, LabelKind::Output, o, &cable);
         });
         self.pick_or_edit(&r, Pick::Output(o), LabelKind::Output, o, routing);
         rect
@@ -345,6 +364,94 @@ impl StreamItApp {
     }
 }
 
+/// A row's cable run, as shown under its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::ui) enum Cable {
+    None,
+    Noted(String),
+    Editing,
+}
+
+/// Taller with a cable run (or its field) under the name.
+fn row_h(cable: &Cable) -> f32 {
+    if *cable == Cable::None { ROW_H } else { CABLE_ROW_H }
+}
+
+impl StreamItApp {
+    fn cable_of(&self, kind: LabelKind, n: u16) -> Cable {
+        if self.routes_ui.vh_cable == Some((kind, n)) {
+            return Cable::Editing;
+        }
+        let c = self.config.read().unwrap_or_else(|e| e.into_inner());
+        c.videohub.cable(kind, n).map_or(Cable::None, |r| Cable::Noted(r.to_string()))
+    }
+
+    fn cable_menu_item(&mut self, ui: &mut Ui, kind: LabelKind, n: u16, cable: &Cable) {
+        let text = if matches!(cable, Cable::Noted(_)) { "Edit the cable run…" } else { "Cable run…" };
+        if ui
+            .button(text)
+            .on_hover_text("Which cable this is, to tell it apart. Kept in StreamIt only, not on the VideoHub.")
+            .clicked()
+        {
+            self.routes_ui.vh_cable_draft = match cable {
+                Cable::Noted(r) => r.clone(),
+                _ => String::new(),
+            };
+            self.routes_ui.vh_cable = Some((kind, n));
+            ui.close();
+        }
+    }
+
+    /// Draws the cable run (or its field) on the row's second line; returns the room left
+    /// for the name above it. Enter (or a click away) saves the field, Escape leaves it as
+    /// it was; saving it blank removes the cable run.
+    fn cable_cell(&mut self, ui: &mut Ui, kind: LabelKind, n: u16, cable: &Cable, name: Rect) -> Rect {
+        if *cable == Cable::None {
+            return name;
+        }
+        let split = name.top() + 21.0;
+        let line = Rect::from_min_max(egui::pos2(name.left(), split), name.max);
+        match cable {
+            Cable::Noted(run) => {
+                let text = format!("Cable: {run}");
+                let g = ui.painter().layout_no_wrap(text, egui::FontId::proportional(12.0), theme::MUTED);
+                ui.painter().with_clip_rect(line).galley(
+                    egui::pos2(line.left(), line.center().y - g.size().y / 2.0),
+                    g,
+                    theme::MUTED,
+                );
+            }
+            Cable::Editing => {
+                let mut text = std::mem::take(&mut self.routes_ui.vh_cable_draft);
+                let r = ui.put(
+                    line,
+                    egui::TextEdit::singleline(&mut text)
+                        .id(egui::Id::unique(("vh-cable", kind == LabelKind::Output, n)))
+                        .hint_text("Cable run, e.g. C-104 · stage left box 2")
+                        .font(egui::FontId::proportional(12.0))
+                        .margin(vec2(6.0, 0.0))
+                        .desired_width(f32::INFINITY)
+                        .char_limit(60),
+                );
+                if !r.has_focus() && !r.lost_focus() {
+                    r.request_focus();
+                }
+                if r.lost_focus() {
+                    self.routes_ui.vh_cable = None;
+                    if !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        info!(?kind, n, run = %text, "VideoHub: cable run noted");
+                        self.save_setup(move |c| c.videohub.set_cable(kind, n, &text));
+                    }
+                } else {
+                    self.routes_ui.vh_cable_draft = text;
+                }
+            }
+            Cable::None => {}
+        }
+        Rect::from_min_max(name.min, egui::pos2(name.right(), split))
+    }
+}
+
 fn label_of(routing: &RoutingState, kind: LabelKind, n: u16) -> String {
     n.checked_sub(1).and_then(|i| routing.labels_of(kind).get(usize::from(i))).cloned().unwrap_or_default()
 }
@@ -404,6 +511,13 @@ mod tests {
         assert_eq!(disconnect_input(&routing(), 1, 0), None, "no blank input marked");
         assert_eq!(disconnect_input(&routing(), 5, 5), None, "already shows it");
         assert_eq!(disconnect_input(&routing(), 3, 9), Some(9), "an output whose input is unknown");
+    }
+
+    #[test]
+    fn a_row_with_a_cable_run_is_taller() {
+        assert_eq!(row_h(&Cable::None), ROW_H);
+        assert_eq!(row_h(&Cable::Noted("C-104".into())), CABLE_ROW_H);
+        assert_eq!(row_h(&Cable::Editing), CABLE_ROW_H);
     }
 
     #[test]
