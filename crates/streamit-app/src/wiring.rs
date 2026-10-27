@@ -440,6 +440,8 @@ pub struct Probes {
     counter: Arc<Late<dyn Counter>>,
     /// A lighting console is set up, so its health is polled.
     lighting: bool,
+    /// The NDI counter is on, so its health is polled.
+    ndi: bool,
     /// A MultiView 4 is set up: its client (or why there is none).
     multiview: Option<Result<Arc<MultiView>, String>>,
 }
@@ -550,7 +552,8 @@ pub async fn build(c: &Config) -> Wired {
         .multiview_device
         .is_set()
         .then(|| socket_addr(&c.multiview_device.address, MULTIVIEW_PORT).map(MultiView::connect));
-    let probes = Probes { devices: devices.clone(), player, counter, lighting: c.lighting.is_set(), multiview };
+    let probes =
+        Probes { devices: devices.clone(), player, counter, lighting: c.lighting.is_set(), ndi: !c.ndi.off, multiview };
     // Stand-ins never come up, so only wait for the devices that were really built.
     let real: Vec<DeviceKind> = NETWORK.iter().copied().filter(|k| !stand_ins.contains(k)).collect();
     probes.wait_ready(&real, c.videohub.input8_output, STARTUP_WAIT).await;
@@ -576,20 +579,45 @@ fn youtube(c: &Config) -> Result<Arc<dyn Broadcasts>, String> {
     Ok(Arc::new(streamit_youtube::YouTubeClient::new(base, auth, y.stream_id.clone())))
 }
 
+/// The counter when the NDI counter is turned off: the countdown's updates go nowhere.
+struct NoCounter;
+
+#[async_trait]
+impl Counter for NoCounter {
+    async fn show(&self, _remaining: Duration) -> devices::Result<()> {
+        Ok(())
+    }
+    async fn clear(&self) -> devices::Result<()> {
+        Ok(())
+    }
+}
+
+/// The counter for a turned-off NDI counter: installed at once, and quiet.
+fn counter_off() -> Arc<Late<dyn Counter>> {
+    let counter: Arc<Late<dyn Counter>> = Late::new("the NDI counter is turned off (Settings › Playout & NDI counter)");
+    counter.install(Arc::new(NoCounter));
+    counter
+}
+
 #[cfg(feature = "gst")]
 async fn playout(c: &Config) -> (Arc<Late<dyn Player>>, Arc<Late<dyn Counter>>, Vec<AbortHandle>) {
     // A PC without GStreamer: down for this run, not retried (installing it needs a restart).
     if let Err(e) = streamit_playout::available() {
         warn!("DeckLink player and NDI counter: {e}");
         // The whole reason (where StreamIt looked, or which build is installed) shows on both.
-        return (Late::new(e.clone()), Late::new(e), Vec::new());
+        let counter = if c.ndi.off { counter_off() } else { Late::new(e.clone()) };
+        return (Late::new(e), counter, Vec::new());
     }
     let player: Arc<Late<dyn Player>> = Late::new("DeckLink player starting");
-    let counter: Arc<Late<dyn Counter>> = Late::new("NDI counter starting");
     let pc = c.playout.clone();
     let p = keep_building(player.clone(), "DeckLink player", move || {
         streamit_playout::GstPlayer::new(&pc, streamit_playout::SinkKind::DeckLink).map(|p| p as Arc<dyn Player>)
     });
+    if c.ndi.off {
+        info!("NDI counter: turned off");
+        return (player, counter_off(), p.await.into_iter().collect());
+    }
+    let counter: Arc<Late<dyn Counter>> = Late::new("NDI counter starting");
     let nc = c.ndi.clone();
     let n = keep_building(counter.clone(), "NDI counter", move || {
         streamit_playout::NdiCounter::new(&nc).map(|n| n as Arc<dyn Counter>)
@@ -599,9 +627,10 @@ async fn playout(c: &Config) -> (Arc<Late<dyn Player>>, Arc<Late<dyn Counter>>, 
 }
 
 #[cfg(not(feature = "gst"))]
-async fn playout(_c: &Config) -> (Arc<Late<dyn Player>>, Arc<Late<dyn Counter>>, Vec<AbortHandle>) {
+async fn playout(c: &Config) -> (Arc<Late<dyn Player>>, Arc<Late<dyn Counter>>, Vec<AbortHandle>) {
     warn!("DeckLink player and NDI counter: {NO_GST}");
-    (Late::new(NO_GST), Late::new(NO_GST), Vec::new())
+    let counter = if c.ndi.off { counter_off() } else { Late::new(NO_GST) };
+    (Late::new(NO_GST), counter, Vec::new())
 }
 
 // ---- health ----
@@ -654,12 +683,12 @@ impl Probes {
         counter.install(devices.counter.clone());
         // The pretend console is always there. Simulation never touches the network, so
         // a real MultiView is not checked.
-        Probes { devices, player, counter, lighting: true, multiview: None }
+        Probes { devices, player, counter, lighting: true, ndi: true, multiview: None }
     }
 
     #[cfg(test)]
     fn new(devices: Devices, player: Arc<Late<dyn Player>>, counter: Arc<Late<dyn Counter>>) -> Probes {
-        Probes { devices, player, counter, lighting: false, multiview: None }
+        Probes { devices, player, counter, lighting: false, ndi: true, multiview: None }
     }
 
     /// One read for one device: program() for the ATEMs, route_of(input-8 output, or 1)
@@ -765,8 +794,10 @@ impl Probes {
             (DeviceKind::WebPresenter, encoder),
             (DeviceKind::YouTube, yt),
             (DeviceKind::DeckLink, self.player.health()),
-            (DeviceKind::Ndi, self.counter.health()),
         ];
+        if self.ndi {
+            out.push((DeviceKind::Ndi, self.counter.health()));
+        }
         if self.lighting {
             out.push((DeviceKind::Lighting, self.check(DeviceKind::Lighting, hub_output).await));
         }
@@ -993,6 +1024,16 @@ mod tests {
         // The stand-ins answer like unplugged devices.
         assert!(matches!(w.devices.yt.signed_in().await, Err(DeviceError::Disconnected(_))));
         assert_eq!(w.devices.stream.media_player_input(1), 3010);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turned_off_ndi_counter_is_not_polled_and_takes_the_countdown_quietly() {
+        let mut c = Config::default();
+        c.ndi.off = true;
+        let w = build(&c).await;
+        assert!(!w.health.iter().any(|(k, _)| *k == DeviceKind::Ndi), "{:?}", w.health);
+        assert!(w.devices.counter.show(Duration::from_secs(30)).await.is_ok());
+        assert!(w.devices.counter.clear().await.is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread")]

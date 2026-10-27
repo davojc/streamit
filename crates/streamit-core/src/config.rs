@@ -257,11 +257,14 @@ pub struct NdiConfig {
     pub source_name: String,
     pub fg: [u8; 3],
     pub bg: [u8; 3],
+    /// The NDI counter is turned off: StreamIt sends no NDI feed and does not need NDI
+    /// installed. The countdown runs the same without it.
+    pub off: bool,
 }
 
 impl Default for NdiConfig {
     fn default() -> Self {
-        Self { source_name: "StreamIt Countdown".into(), fg: [255, 214, 0], bg: [0, 0, 0] }
+        Self { source_name: "StreamIt Countdown".into(), fg: [255, 214, 0], bg: [0, 0, 0], off: false }
     }
 }
 

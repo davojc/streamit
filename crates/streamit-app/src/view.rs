@@ -84,12 +84,15 @@ pub const ALL_KINDS: [DeviceKind; 10] = [
     DeviceKind::MultiView,
 ];
 
-/// The devices to list: all of them, but the lighting console and the MultiView only when
-/// they are set up (their health is then reported).
+/// The devices to list: all of them, but the lighting console, the MultiView and the NDI
+/// counter only when they are set up and on (their health is then reported).
 pub fn shown_kinds(s: &Snapshot) -> Vec<DeviceKind> {
     ALL_KINDS
         .into_iter()
-        .filter(|k| !matches!(k, DeviceKind::Lighting | DeviceKind::MultiView) || s.device_status.contains_key(k))
+        .filter(|k| {
+            !matches!(k, DeviceKind::Lighting | DeviceKind::MultiView | DeviceKind::Ndi)
+                || s.device_status.contains_key(k)
+        })
         .collect()
 }
 
@@ -358,7 +361,11 @@ pub fn countdown(s: &Snapshot, c: &Config) -> Option<CountdownView> {
             .unwrap_or_else(|| c.playout.countdown_file.display().to_string()),
         public_at_text: fmt_mmss(c.timings.go_public_offset),
         public,
-        ndi_text: format!("NDI counter sending {text} as “{}”", c.ndi.source_name),
+        ndi_text: if c.ndi.off {
+            "NDI counter turned off (Settings › Playout & NDI counter)".into()
+        } else {
+            format!("NDI counter sending {text} as “{}”", c.ndi.source_name)
+        },
         ndi_ok: matches!(s.device_status.get(&DeviceKind::Ndi), Some(DeviceHealth::Ok)),
         progress,
         // A public countdown has nothing to retry, whatever an older offer says.
@@ -1188,6 +1195,9 @@ mod tests {
         assert_eq!(v.file_name, "Countdown – Autumn.mp4");
         assert_eq!(v.public_at_text, "0:10");
         assert_eq!(v.ndi_text, "NDI counter sending 0:42 as “StreamIt Countdown”");
+        c.ndi.off = true;
+        assert_eq!(countdown(&countdown_at(42), &c).unwrap().ndi_text, "NDI counter turned off (Settings › Playout & NDI counter)");
+        c.ndi.off = false;
         assert!((v.progress - 0.86).abs() < 0.001, "{}", v.progress);
         assert!(!v.public);
         // Only during the countdown stage, even though countdown_total lingers.

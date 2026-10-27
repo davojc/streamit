@@ -768,6 +768,18 @@ impl StreamItApp {
         heading(ui, "Playout & NDI counter");
         ui.add_space(8.0);
         let c = &mut self.draft;
+        let mut on = !c.ndi.off;
+        if ui
+            .checkbox(&mut on, "Use the NDI counter")
+            .on_hover_text(
+                "Off: StreamIt sends no NDI countdown feed and does not need NDI installed. The countdown runs \
+                 the same. Applies when StreamIt restarts.",
+            )
+            .changed()
+        {
+            c.ndi.off = !on;
+        }
+        ui.add_space(6.0);
         ui.columns(3, |col| {
             field(&mut col[0], "DeckLink device", |ui| number(ui, &mut c.playout.decklink_device, "Device "));
             field(&mut col[1], "Video mode", |ui| {
