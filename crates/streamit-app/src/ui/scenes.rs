@@ -111,6 +111,8 @@ impl StreamItApp {
                         // The name and what it does select the scene; the buttons stay buttons.
                         let text = ui.allocate_ui_with_layout(vec2(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
                             ui.spacing_mut().item_spacing.y = 6.0;
+                            // Selectable text would take the click before the row sees it.
+                            ui.style_mut().interaction.selectable_labels = false;
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::Label::new(RichText::new(&s.name).font(theme::body_bold(17.0))).truncate(),

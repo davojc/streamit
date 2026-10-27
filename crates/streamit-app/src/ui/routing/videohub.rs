@@ -16,7 +16,7 @@ use tracing::info;
 
 const ROW_H: f32 = 30.0;
 /// A row with its cable run under its name.
-const CABLE_ROW_H: f32 = 42.0;
+const CABLE_ROW_H: f32 = 50.0;
 const ROW_GAP: f32 = 4.0;
 /// The gap between the columns, where the lines run.
 const LINK_W: f32 = 140.0;
@@ -261,16 +261,17 @@ impl StreamItApp {
                 (_, None) => "It already shows the blank input.".to_string(),
                 (b, Some(_)) => format!("Routes the blank input ({b}) to it."),
             };
-            if let Some(b) = ui
-                .add_enabled(to.is_some(), egui::Button::new("Disconnect"))
-                .on_hover_text(hint)
-                .clicked()
-                .then_some(to)
-                .flatten()
-            {
+            let r = ui.add_enabled(to.is_some(), egui::Button::new("Disconnect"));
+            if let Some(b) = to.filter(|_| r.clicked()) {
                 info!(output = o, blank = b, "VideoHub: disconnecting an output");
                 self.route_output(snap, o, b);
                 ui.close();
+            }
+            if to.is_some() {
+                r.on_hover_text(hint);
+            } else {
+                // A hover tip on a greyed-out item is easy to miss: say why under it.
+                ui.label(RichText::new(hint).size(12.0).color(theme::MUTED));
             }
             self.cable_menu_item(ui, LabelKind::Output, o, &cable);
         });

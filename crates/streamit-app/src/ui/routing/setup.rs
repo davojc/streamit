@@ -13,8 +13,8 @@ use streamit_core::golive::Stage;
 use streamit_core::routing::Target;
 use tracing::info;
 
-/// Media pool slots shown on an ATEM page: two rows of eight.
-pub(in crate::ui) const POOL_SHOWN: usize = 16;
+/// Media pool slots shown on an ATEM page before it lists its own (most have 20 or more).
+const POOL_SHOWN: usize = 16;
 const POOL_COLS: usize = 8;
 /// A slot's number line and name line, around its picture.
 const POOL_SLOT_TEXT_H: f32 = 48.0;
@@ -58,6 +58,11 @@ pub(in crate::ui) fn toggled(list: &[u16], n: u16, on: bool) -> Vec<u16> {
         v.sort_unstable();
     }
     v
+}
+
+/// How many still slots to show: as many as the ATEM lists.
+pub(in crate::ui) fn pool_slots(listed: usize) -> usize {
+    if listed == 0 { POOL_SHOWN } else { listed }
 }
 
 /// The opening and closing stills marked on `target` (0-based slots), if any.
@@ -221,7 +226,7 @@ impl StreamItApp {
         }
     }
 
-    /// The ATEM's media pool, slots 1-16, with the opening and closing stills marked.
+    /// The ATEM's media pool, every still slot it lists, with the opening and closing stills marked.
     pub(super) fn media_pool(&mut self, ui: &mut Ui, snap: &Snapshot, target: Target) {
         let c = self.config.read().unwrap_or_else(|e| e.into_inner()).clone();
         let stills = &snap.routing.target(target).stills;
@@ -235,7 +240,7 @@ impl StreamItApp {
         theme::panel().inner_margin(20).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                theme::lbl(ui, "Media pool · slots 1–16");
+                theme::lbl(ui, &format!("Media pool stills · slots 1–{}", pool_slots(stills.len())));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let mark = |s: Option<u16>| s.map_or("not set".to_string(), |s| format!("slot {}", s + 1));
                     ui.label(RichText::new(format!("closing {}", mark(closing))).size(14.0).color(CLOSING));
@@ -275,11 +280,15 @@ impl StreamItApp {
             ui.add_space(8.0);
             let gap = 8.0;
             let w = (ui.available_width() - gap * (POOL_COLS as f32 - 1.0)) / POOL_COLS as f32;
-            for row in 0..POOL_SHOWN / POOL_COLS {
+            let slots = pool_slots(stills.len());
+            for row in 0..slots.div_ceil(POOL_COLS) {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
                     for col in 0..POOL_COLS {
                         let slot = (row * POOL_COLS + col) as u16;
+                        if usize::from(slot) >= slots {
+                            break;
+                        }
                         let name = stills.get(usize::from(slot)).cloned().flatten();
                         let marks = (opening == Some(slot), closing == Some(slot));
                         self.pool_slot(ui, target, slot, name, w, marks, busy);

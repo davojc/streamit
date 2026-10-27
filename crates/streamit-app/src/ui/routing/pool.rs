@@ -129,7 +129,7 @@ impl StreamItApp {
         if self.pool.fetch.running || self.pool.action.running || under_way(stage) {
             return;
         }
-        let next = stills.iter().take(super::setup::POOL_SHOWN).enumerate().find_map(|(i, name)| {
+        let next = stills.iter().enumerate().find_map(|(i, name)| {
             let slot = i as u16;
             let name = name.as_ref()?;
             let stale = self.pool.thumbs.get(&(target, slot)).is_none_or(|(had, _)| had.as_ref() != Some(name));
