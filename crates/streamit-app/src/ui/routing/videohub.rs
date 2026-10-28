@@ -199,6 +199,7 @@ impl StreamItApp {
             self.cable_menu_item(ui, LabelKind::Input, n, &cable);
         });
         self.pick_or_edit(&r, Pick::Input(n), LabelKind::Input, n, routing);
+        end_row(ui, rect);
         rect
     }
 
@@ -276,6 +277,7 @@ impl StreamItApp {
             self.cable_menu_item(ui, LabelKind::Output, o, &cable);
         });
         self.pick_or_edit(&r, Pick::Output(o), LabelKind::Output, o, routing);
+        end_row(ui, rect);
         rect
     }
 
@@ -469,6 +471,13 @@ fn number(ui: &Ui, right_center: egui::Pos2, n: u16) {
 }
 
 /// A row's box: blue when picked or lit by the pick, green while an input is dragged over it.
+/// Puts the next row under this one. The name field and × are `put` inside the row,
+/// and each `put` moves the layout on to just under itself: after the × (centred, 20
+/// high) the next row would start inside this one and cover its cable run.
+fn end_row(ui: &mut Ui, row: Rect) {
+    ui.advance_cursor_after_rect(row);
+}
+
 fn row_frame(ui: &Ui, rect: Rect, picked: bool, shown: bool, dropping: bool) {
     let (fill, border, width) = if dropping {
         (Color32::from_rgb(0x13, 0x25, 0x1C), theme::GREEN, 2.0)
@@ -488,6 +497,20 @@ mod tests {
 
     fn routing() -> RoutingState {
         RoutingState { routes: vec![1, 2, 0, 1, 5], ..RoutingState::default() }
+    }
+
+    #[test]
+    fn the_next_row_starts_under_the_whole_row_not_under_its_clear_button() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            ui.spacing_mut().item_spacing.y = ROW_GAP;
+            let (row, _) = ui.allocate_exact_size(vec2(200.0, CABLE_ROW_H), Sense::click());
+            let button = |ui: &mut Ui| ui.allocate_exact_size(vec2(20.0, 20.0), Sense::click()).1;
+            ui.put(Rect::from_center_size(row.center(), vec2(20.0, 20.0)), button);
+            end_row(ui, row);
+            assert_eq!(ui.cursor().min.y, row.bottom() + ROW_GAP);
+        });
+        out.textures_delta.clear();
     }
 
     #[test]
