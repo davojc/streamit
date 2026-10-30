@@ -115,6 +115,9 @@ impl<T: StreamSwitcher + ?Sized> StreamSwitcher for Logged<T> {
     async fn audio_level(&self, src: AudioSourceId) -> Result<f32> {
         self.inner.audio_level(src).await
     }
+    fn audio_sources(&self) -> Vec<AudioSourceId> {
+        self.inner.audio_sources()
+    }
     async fn audio_input(&self, src: AudioSourceId) -> Result<AudioInput> {
         self.inner.audio_input(src).await
     }

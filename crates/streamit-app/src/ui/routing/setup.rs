@@ -24,6 +24,7 @@ const MEDIA_PLAYERS: u8 = 4;
 pub(in crate::ui) const GO_LIVE: Color32 = Color32::from_rgb(255, 154, 160);
 pub(in crate::ui) const SAFE: Color32 = Color32::from_rgb(127, 240, 176);
 pub(in crate::ui) const MEDIA: Color32 = Color32::from_rgb(212, 198, 255);
+pub(in crate::ui) const EMERGENCY: Color32 = Color32::from_rgb(255, 120, 112);
 const OPENING: Color32 = Color32::from_rgb(143, 211, 255);
 const CLOSING: Color32 = Color32::from_rgb(228, 168, 255);
 pub(in crate::ui) const DEFAULT_STAR: Color32 = Color32::from_rgb(255, 210, 122);
@@ -42,6 +43,9 @@ pub(in crate::ui) fn input_jobs(c: &Config, target: Target, i: usize) -> Vec<(&'
             }
             if c.stream_atem.decklink_input == n {
                 jobs.push(("MEDIA", MEDIA));
+            }
+            if c.stream_atem.emergency_input == Some(n) {
+                jobs.push(("EMERGENCY AUDIO", EMERGENCY));
             }
         }
         Target::ScreensAtem if c.screens_atem.decklink_input == n => jobs.push(("VIDEOS", MEDIA)),
@@ -136,7 +140,7 @@ impl StreamItApp {
     }
 
     /// The right-click menu of ATEM input `i`: its jobs.
-    pub(super) fn input_menu(&mut self, ui: &mut Ui, target: Target, i: usize, busy: bool) {
+    pub(super) fn input_menu(&mut self, ui: &mut Ui, target: Target, i: usize, busy: bool, emergency_on: bool) {
         let n = i as u16 + 1;
         let c = self.config.read().unwrap_or_else(|e| e.into_inner()).clone();
         ui.label(RichText::new(format!("{} input {n}", target.name()).to_uppercase()).size(11.0).color(theme::MUTED));
@@ -177,6 +181,24 @@ impl StreamItApp {
                 if r.clicked() {
                     info!(input = n, "Stream ATEM: Media input marked");
                     self.save_setup(move |c| c.set_media_input(n));
+                    ui.close();
+                }
+                let marked = c.stream_atem.emergency_input == Some(n);
+                let text = if marked { "Unmark Emergency audio" } else { "Mark as Emergency audio" };
+                let r = ui.add_enabled(!emergency_on, egui::Button::new(text));
+                let r = if emergency_on {
+                    r.on_disabled_hover_text("Not while emergency audio is on")
+                } else {
+                    r.on_hover_text(match c.stream_atem.emergency_input {
+                        Some(e) => format!(
+                            "This camera's own audio can stand in for the stream audio in an emergency. Now: input {e}"
+                        ),
+                        None => "This camera's own audio can stand in for the stream audio in an emergency".into(),
+                    })
+                };
+                if r.clicked() {
+                    info!(input = n, marked = !marked, "Stream ATEM: Emergency audio input changed");
+                    self.save_setup(move |c| c.stream_atem.emergency_input = (!marked).then_some(n));
                     ui.close();
                 }
             }
@@ -505,8 +527,10 @@ mod tests {
         c.stream_atem.default_live_input = 2;
         c.stream_atem.decklink_input = 8;
         c.screens_atem.decklink_input = 4;
+        c.stream_atem.emergency_input = Some(3);
         let names = |t, i| input_jobs(&c, t, i).into_iter().map(|(n, _)| n).collect::<Vec<_>>();
         assert_eq!(names(Target::StreamAtem, 1), vec!["GO LIVE", "SAFE"]);
+        assert_eq!(names(Target::StreamAtem, 2), vec!["GO LIVE", "EMERGENCY AUDIO"]);
         assert_eq!(names(Target::StreamAtem, 7), vec!["MEDIA"]);
         assert!(names(Target::StreamAtem, 4).is_empty());
         assert_eq!(names(Target::ScreensAtem, 3), vec!["VIDEOS"]);

@@ -106,6 +106,10 @@ pub trait StreamSwitcher: Switcher {
     async fn audio_level(&self, src: AudioSourceId) -> Result<f32>;
     async fn set_audio_level(&self, src: AudioSourceId, db: f32) -> Result<()>;
     async fn set_audio_on(&self, src: AudioSourceId, on: bool) -> Result<()>;
+    /// Every Fairlight source the switcher has reported, in order.
+    fn audio_sources(&self) -> Vec<AudioSourceId> {
+        Vec::new()
+    }
     /// An audio input's mix state and fader, for the Live screen.
     async fn audio_input(&self, src: AudioSourceId) -> Result<AudioInput> {
         let _ = src;

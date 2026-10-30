@@ -12,6 +12,8 @@ enum Ask {
     Nothing,
     AudioUp,
     PickAudio,
+    /// Emergency audio on (`true`) or back to normal.
+    Emergency(bool),
 }
 
 impl StreamItApp {
@@ -25,7 +27,7 @@ impl StreamItApp {
                     let a = match i {
                         0 => youtube_panel(col, snap),
                         1 => atem_panel(col, snap, c, Target::StreamAtem, "Online sees"),
-                        2 => audio_panel(col, snap),
+                        2 => audio_panel(col, snap, c),
                         _ => atem_panel(col, snap, c, Target::ScreensAtem, "Hall screens"),
                     };
                     if a != Ask::Nothing {
@@ -39,6 +41,7 @@ impl StreamItApp {
         match ask {
             Ask::Nothing => {}
             Ask::AudioUp => self.send(Command::UnmuteMics),
+            Ask::Emergency(on) => self.send(Command::EmergencyAudio(on)),
             Ask::PickAudio => {
                 self.tab = Tab::Settings;
                 self.section = Section::Timings;
@@ -128,9 +131,33 @@ fn atem_panel(ui: &mut Ui, snap: &Snapshot, c: &Config, target: Target, label: &
     })
 }
 
+/// The emergency audio button, when a Stream ATEM input is marked for it: switching to
+/// that camera's audio, or, while on, a red line and the way back.
+fn emergency_button(ui: &mut Ui, snap: &Snapshot, c: &Config) -> Option<Ask> {
+    let input = c.stream_atem.emergency_input?;
+    let atem = snap.routing.target(Target::StreamAtem);
+    let name = atem.own_name(input).map_or_else(|| format!("Input {input}"), str::to_string);
+    let free = snap.job.is_none();
+    let wait = |r: egui::Response| match snap.job {
+        Some(job) => r.on_disabled_hover_text(format!("When {job} finishes")),
+        None => r,
+    };
+    if snap.emergency_audio {
+        ui.label(theme::lbl_text(&format!("Emergency audio on · {name}"), theme::RED_TEXT));
+        let r = theme::sized_button(ui, "Back to normal audio", Kind::Plain, 36.0, 15.0, free);
+        wait(r).clicked().then_some(Ask::Emergency(false))
+    } else {
+        let r = theme::sized_button(ui, &format!("Emergency audio: {name}"), Kind::DangerOutline, 36.0, 15.0, free);
+        wait(r.on_hover_text("Switch the stream to this camera's own audio, and the stream audio sources off"))
+            .clicked()
+            .then_some(Ask::Emergency(true))
+    }
+}
+
 /// The stream audio (up, or down for a video) and the audio inputs Settings picks.
-fn audio_panel(ui: &mut Ui, snap: &Snapshot) -> Ask {
-    status_panel(ui, "Stream audio", "Stream ATEM", Tone::Grey, |ui| {
+fn audio_panel(ui: &mut Ui, snap: &Snapshot, c: &Config) -> Ask {
+    let tone = if snap.emergency_audio { Tone::Red } else { Tone::Grey };
+    status_panel(ui, "Stream audio", "Stream ATEM", tone, |ui| {
         let mut ask = Ask::Nothing;
         let bar = view::mic_bar(snap);
         let (color, text_color) = match bar.tone {
@@ -149,6 +176,9 @@ fn audio_panel(ui: &mut Ui, snap: &Snapshot) -> Ask {
         });
         if snap.mics_ducked && theme::sized_button(ui, "Stream audio up", Kind::Warn, 36.0, 15.0, true).clicked() {
             ask = Ask::AudioUp;
+        }
+        if let Some(a) = emergency_button(ui, snap, c) {
+            ask = a;
         }
         if snap.audio.is_empty() {
             if ui.link(RichText::new("Choose inputs to show here").size(13.0)).clicked() {

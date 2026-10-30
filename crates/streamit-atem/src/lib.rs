@@ -402,6 +402,11 @@ impl StreamSwitcher for AtemClient {
         };
         Ok(AudioInput { mix, fader_db: f.fader_gain as f32 / 100.0 })
     }
+
+    fn audio_sources(&self) -> Vec<AudioSourceId> {
+        let s = self.shared.borrow();
+        s.state.fairlight.keys().map(|&(input, source)| AudioSourceId { input, source }).collect()
+    }
 }
 
 #[cfg(test)]

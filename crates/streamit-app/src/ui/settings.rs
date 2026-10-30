@@ -14,9 +14,12 @@ use crate::session::{Mode, SwitchRefused};
 use crate::theme::{self, Kind};
 use crate::view::{self, Tone};
 use eframe::egui::{self, Align, Color32, Layout, Margin, RichText, Shape, Stroke, Ui, vec2};
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::time::Duration;
+use streamit_core::audio::source_name;
 use streamit_core::config::{AudioSourceId, Config, OscFraming, ShownAudio};
+use streamit_core::devices::InputName;
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
 use streamit_core::routing::Target;
 use streamit_youtube::{API_BASE, Auth, StreamSummary, YouTubeClient};
@@ -177,6 +180,44 @@ fn sub(ui: &mut Ui, s: &str) {
     ui.label(RichText::new(s).size(15.0).color(theme::SOFT));
 }
 
+/// A Stream ATEM audio source, picked from those the ATEM reports and named as it names
+/// them. One it does not report stays, in amber; with no ATEM, only the saved one shows.
+fn audio_pick(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    src: &mut AudioSourceId,
+    reported: &[AudioSourceId],
+    names: &BTreeMap<u16, InputName>,
+    width: f32,
+) {
+    let missing = !reported.is_empty() && !reported.contains(src);
+    let name = source_name(*src, names);
+    let shown = if missing {
+        RichText::new(format!("{name} · not on the ATEM")).color(theme::AMBER)
+    } else {
+        RichText::new(name)
+    };
+    egui::ComboBox::from_id_salt(id).selected_text(shown).width(width).show_ui(ui, |ui| {
+        let mut all = reported.to_vec();
+        if !all.contains(src) {
+            all.push(*src);
+        }
+        for s in all {
+            ui.selectable_value(src, s, source_name(s, names));
+        }
+    });
+}
+
+/// The first reported source not in `used` (else the first reported, else XLR 1), for a new row.
+fn first_unused(reported: &[AudioSourceId], used: &[AudioSourceId]) -> AudioSourceId {
+    reported
+        .iter()
+        .find(|s| !used.contains(s))
+        .or(reported.first())
+        .copied()
+        .unwrap_or(AudioSourceId { input: 1001, source: -65280 })
+}
+
 /// A rounded box with a dot and a sentence: the restart note.
 fn note_box(ui: &mut Ui, s: &str, dot: Color32) {
     egui::Frame::new()
@@ -226,7 +267,7 @@ impl StreamItApp {
             match self.section {
                 Section::Profiles => section(ui, |ui| self.profiles_section(ui, snap)),
                 Section::Equipment => section(ui, |ui| self.equipment(ui, snap, simulating)),
-                Section::Timings => section(ui, |ui| self.timings(ui)),
+                Section::Timings => section(ui, |ui| self.timings(ui, snap)),
                 Section::YouTube => section(ui, |ui| self.youtube(ui, simulating)),
                 Section::Playout => section(ui, |ui| self.playout(ui)),
                 Section::Updates => section(ui, |ui| self.updates_section(ui, snap)),
@@ -594,7 +635,7 @@ impl StreamItApp {
 
     // ---- Timings & audio
 
-    fn timings(&mut self, ui: &mut Ui) {
+    fn timings(&mut self, ui: &mut Ui, snap: &Snapshot) {
         heading(ui, "Timings & audio");
         ui.add_space(8.0);
         let c = &mut self.draft;
@@ -614,12 +655,12 @@ impl StreamItApp {
             });
         });
         ui.add_space(6.0);
-        theme::lbl(ui, "Stream audio sources (Fairlight input / source)");
+        theme::lbl(ui, "Stream audio sources (faded at Prepare, for videos and at End)");
+        let atem = snap.routing.target(Target::StreamAtem);
         let mut remove = None;
         for (i, m) in c.stream_atem.mic_sources.iter_mut().enumerate() {
             ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut m.input).prefix("Input "));
-                ui.add(egui::DragValue::new(&mut m.source).prefix("Source "));
+                audio_pick(ui, ("mic", i), m, &atem.audio_sources, &atem.names, 300.0);
                 if ui.button("Remove").clicked() {
                     remove = Some(i);
                 }
@@ -629,21 +670,18 @@ impl StreamItApp {
             c.stream_atem.mic_sources.remove(i);
         }
         if ui.button("Add stream audio source").clicked() {
-            c.stream_atem.mic_sources.push(AudioSourceId { input: 1001, source: -65280 });
+            let src = first_unused(&atem.audio_sources, &c.stream_atem.mic_sources);
+            c.stream_atem.mic_sources.push(src);
         }
         ui.add_space(12.0);
         theme::lbl(ui, "Audio inputs shown on the Service screens");
-        sub(
-            ui,
-            "Each one shows whether it is on, off or following video (AFV) on the Stream ATEM,              with its fader. Use the Fairlight input and source numbers, as above.",
-        );
+        sub(ui, "Each one shows whether it is on, off or following video (AFV) on the Stream ATEM, with its fader.");
         let mut remove = None;
         let shown = &mut c.stream_atem.shown_audio;
         for (i, a) in shown.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut a.name).hint_text("Name, e.g. Band mix").desired_width(220.0));
-                ui.add(egui::DragValue::new(&mut a.source.input).prefix("Input "));
-                ui.add(egui::DragValue::new(&mut a.source.source).prefix("Source "));
+                audio_pick(ui, ("shown", i), &mut a.source, &atem.audio_sources, &atem.names, 260.0);
                 if ui.button("Remove").clicked() {
                     remove = Some(i);
                 }
@@ -653,8 +691,8 @@ impl StreamItApp {
             shown.remove(i);
         }
         if ui.button("Add an audio input to show").clicked() {
-            let input = shown.last().map_or(1001, |a| a.source.input + 1);
-            shown.push(ShownAudio { name: String::new(), source: AudioSourceId { input, source: -65280 } });
+            let used: Vec<AudioSourceId> = shown.iter().map(|a| a.source).collect();
+            shown.push(ShownAudio { name: String::new(), source: first_unused(&atem.audio_sources, &used) });
         }
     }
 

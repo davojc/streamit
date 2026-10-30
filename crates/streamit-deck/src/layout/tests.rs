@@ -381,6 +381,7 @@ fn rt_snap() -> Snapshot {
         preview: None,
         stills: vec![],
         names: Default::default(),
+        audio_sources: Vec::new(),
     };
     routing.targets[1] = TargetState {
         outputs: vec![1, 2, 3, 4, 0, 0, 0, 11],
@@ -394,6 +395,7 @@ fn rt_snap() -> Snapshot {
         preview: Some(3),
         stills: vec![],
         names: Default::default(),
+        audio_sources: Vec::new(),
     };
     Snapshot { routing, ..Snapshot::default() }
 }

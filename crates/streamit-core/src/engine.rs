@@ -16,7 +16,7 @@
 //! Always accepted, whatever runs: Stop Countdown and Stop Video and Unmute (they act on
 //! the running job), Go Public and End Broadcast (each its own short task), Select
 //! Broadcast, Fix, Refresh and device health. Every ignored command is logged at `info`.
-use crate::audio::LiveLevels;
+use crate::audio::{self, LiveLevels};
 use crate::config::{AudioSourceId, Config};
 use crate::devices::{
     self, AudioInput, BroadcastCheck, BroadcastSummary, ChatMessage, DeviceError, Devices, Fix, Health, InputName,
@@ -79,6 +79,9 @@ pub enum Command {
     /// Stops the playing video, or the test play.
     StopVideo,
     UnmuteMics,
+    /// Hand the stream audio to the emergency camera's own audio (`true`), or back to the
+    /// stream audio sources. Refused while a sequence runs or when no input is marked.
+    EmergencyAudio(bool),
     Recover,
     SelectBroadcast(String),
     FixBroadcast(Fix),
@@ -190,6 +193,8 @@ pub struct Snapshot {
     pub cues: Vec<(Cue, CueState)>,
     pub playing: Option<usize>,
     pub mics_ducked: bool,
+    /// The emergency camera's audio stands in for the stream audio sources.
+    pub emergency_audio: bool,
     pub offers: Vec<Offer>,
     pub device_status: BTreeMap<DeviceKind, DeviceHealth>,
     pub last_warning: Option<String>,
@@ -288,6 +293,7 @@ impl Default for Snapshot {
             cues: Vec::new(),
             playing: None,
             mics_ducked: false,
+            emergency_audio: false,
             offers: Vec::new(),
             device_status: BTreeMap::new(),
             last_warning: None,
@@ -356,6 +362,7 @@ enum Job {
     GoLive(GoLiveStart),
     Recover,
     Abandon,
+    EmergencyAudio,
 }
 
 impl Job {
@@ -369,6 +376,7 @@ impl Job {
             Job::GoLive(_) => "Go Live",
             Job::Recover => "Recover",
             Job::Abandon => "Abandon",
+            Job::EmergencyAudio => "Emergency audio",
         }
     }
 }
@@ -419,6 +427,12 @@ enum Done {
     },
     /// The encoder's stop.
     Abandoned(devices::Result<()>),
+    /// The hand-over to (`on`) or from the emergency camera: whether it took, and why not.
+    Emergency {
+        on: bool,
+        switched: bool,
+        error: Option<String>,
+    },
 }
 
 struct Refreshed {
@@ -487,6 +501,8 @@ pub struct Engine {
     not_receiving_since: Option<tokio::time::Instant>,
     /// The playing video went to its own scene; when it ends, go back to the one before.
     video_scene: Option<VideoScene>,
+    /// Emergency audio is on: sequences fade the camera in place of the stream audio sources.
+    emergency: bool,
 }
 
 /// A video's scene, and the scene that was on before it.
@@ -545,6 +561,7 @@ impl Engine {
             simulation,
             not_receiving_since: None,
             video_scene: None,
+            emergency: false,
         };
         tokio::spawn(engine.run(rx, aux_rx).in_current_span());
         EngineHandle { tx, rx: srx }
@@ -590,8 +607,11 @@ impl Engine {
 
     // ---- helpers ----
 
+    /// The config a sequence runs with: while emergency audio is on, the camera is its
+    /// only stream audio source.
     fn config(&self) -> Config {
-        read(&self.config)
+        let c = read(&self.config);
+        if self.emergency { c.with_emergency_audio() } else { c }
     }
 
     fn set(&self, f: impl FnOnce(&mut Snapshot)) {
@@ -754,6 +774,20 @@ impl Engine {
                 Some(Running { job: Job::Video { unmute, .. }, .. }) => unmute.notify_one(),
                 _ => self.ignore(&cmd, "no video is playing"),
             },
+            &Command::EmergencyAudio(on) => {
+                if let Some(why) = self.busy() {
+                    return self.ignore(&cmd, &why);
+                }
+                if on == self.emergency {
+                    return self.ignore(&cmd, if on { "emergency audio is already on" } else { "it is already off" });
+                }
+                let Some(camera) = self.config.read().unwrap_or_else(|e| e.into_inner()).stream_atem.emergency_source()
+                else {
+                    let msg = "Emergency audio: no Stream ATEM input is marked for it (Routing)";
+                    return set_warning(&self.snap, msg.into());
+                };
+                self.start_emergency(camera, on);
+            }
             Command::Abandon => {
                 let (public, can) = {
                     let s = self.snap.borrow();
@@ -1134,6 +1168,7 @@ impl Engine {
                         state.preview = read.preview;
                         state.stills = read.stills;
                         state.names = read.names;
+                        state.audio_sources = read.audio_sources;
                     }
                     if !labels.is_empty() {
                         s.routing.labels = labels;
@@ -1580,6 +1615,26 @@ impl Engine {
         }
     }
 
+    /// Hands the stream audio to `camera` (`on`) or back, keeping the levels it reads.
+    fn start_emergency(&mut self, camera: AudioSourceId, on: bool) {
+        let (d, c, levels) = (self.d.clone(), read(&self.config), self.levels.clone());
+        let file = self.levels_file.clone();
+        info!(on, input = camera.input, "emergency audio");
+        let handle = tokio::spawn(
+            async move {
+                let sa = &c.stream_atem;
+                let mut l = lock(&levels).clone();
+                let down = audio::down_threshold(sa.duck_db);
+                let (switched, r) =
+                    audio::hand_over(&*d.stream, &sa.mic_sources, camera, on, &mut l, down, sa.fade).await;
+                store_levels(&levels, l, file.as_deref());
+                Done::Emergency { on, switched, error: r.err().map(|e| e.to_string()) }
+            }
+            .in_current_span(),
+        );
+        self.begin(Job::EmergencyAudio, handle);
+    }
+
     fn start_recover(&mut self) {
         let (d, c, snap, levels, bid) =
             (self.d.clone(), self.config(), self.snap.clone(), self.levels.clone(), self.selected());
@@ -1620,6 +1675,20 @@ impl Engine {
             Ok(Done::Tested { name, outcome }) => self.finish_test(&name, outcome),
             Ok(Done::WentLive { result, public, start }) => self.finish_golive(result, public, start),
             Ok(Done::Abandoned(r)) => self.finish_abandon(r),
+            Ok(Done::Emergency { on, switched, error }) => {
+                if switched {
+                    self.emergency = on;
+                }
+                let now = self.emergency;
+                self.set(|s| {
+                    s.emergency_audio = now;
+                    log(s, if now { "Emergency audio on".into() } else { "Back to normal audio".into() });
+                });
+                if let Some(e) = error {
+                    let what = if on { "switch to emergency audio" } else { "go back to normal audio" };
+                    set_warning(&self.snap, format!("Could not {what} cleanly: {e}"));
+                }
+            }
             Ok(Done::Recovered { ok, assessment }) => {
                 if ok {
                     self.set(|s| {
@@ -2157,6 +2226,7 @@ fn routing_from(c: &Config) -> RoutingState {
             preview: None,
             stills: Vec::new(),
             names: Default::default(),
+            audio_sources: Vec::new(),
         }),
     }
 }
@@ -2336,6 +2406,54 @@ mod tests {
         sleep(MS(600)).await;
         assert_eq!(snap(&e).flash, None);
         assert_eq!(count(&log, |c| matches!(c, Call::PlayerLoad(..))), 1);
+    }
+
+    const EMERGENCY_CAM: AudioSourceId = AudioSourceId { input: 3, source: -65280 };
+
+    /// The last level set on `src`.
+    fn d_level(log: &CallLog, src: AudioSourceId) -> Option<f32> {
+        log.calls().iter().rev().find_map(|c| match c {
+            Call::StreamSetAudioLevel(m, db) if *m == src => Some(*db),
+            _ => None,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn emergency_audio_hands_the_stream_audio_to_the_camera_for_videos_too() {
+        let (d, log, _h) = rig();
+        let c = cfg(vec![cue("a", Destination::HallAndOnline)]);
+        c.write().unwrap().stream_atem.emergency_input = Some(3);
+        let mut e = Engine::spawn(d, c);
+        send(&e, Command::EmergencyAudio(true)).await;
+        until(&mut e, "emergency audio", |s| s.emergency_audio && s.job.is_none()).await;
+        assert!(log.calls().contains(&Call::StreamSetAudioOn(EMERGENCY_CAM, true)));
+        assert!(log.calls().contains(&Call::StreamSetAudioLevel(MIC, audio::FLOOR_DB)), "the mics went down");
+        let before = log.calls().len();
+        // A video now ducks the camera, not the mics.
+        send(&e, Command::PlayCue(0)).await;
+        until_call(&log, Call::PlayerPlay).await;
+        sleep(MS(1500)).await;
+        assert_eq!(d_level(&log, EMERGENCY_CAM), Some(audio::FLOOR_DB), "the camera was ducked");
+        let since = &log.calls()[before..];
+        assert!(!since.iter().any(|c| matches!(c, Call::StreamSetAudioLevel(m, _) if *m == MIC)), "{since:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn emergency_audio_needs_a_marked_input_and_goes_back_to_normal() {
+        let (d, log, _h) = rig();
+        let c = cfg(vec![]);
+        let mut e = Engine::spawn(d, c.clone());
+        send(&e, Command::EmergencyAudio(true)).await;
+        let s = until(&mut e, "a warning", |s| s.last_warning.is_some()).await;
+        assert!(s.last_warning.unwrap().contains("no Stream ATEM input is marked"), "{:?}", snap(&e));
+        assert!(!snap(&e).emergency_audio);
+        c.write().unwrap().stream_atem.emergency_input = Some(3);
+        send(&e, Command::EmergencyAudio(true)).await;
+        until(&mut e, "emergency audio", |s| s.emergency_audio && s.job.is_none()).await;
+        send(&e, Command::EmergencyAudio(false)).await;
+        until(&mut e, "normal audio", |s| !s.emergency_audio && s.job.is_none()).await;
+        assert_eq!(log.calls().last(), Some(&Call::StreamSetAudioOn(EMERGENCY_CAM, false)));
+        assert_eq!(d_level(&log, MIC), Some(-3.0), "the mics came back to their level");
     }
 
     #[tokio::test(start_paused = true)]
@@ -3853,6 +3971,7 @@ mod tests {
             preview: None,
             stills: vec![],
             names: Default::default(),
+            audio_sources: Vec::new(),
         };
         Command::RoutingRead(Box::new(RoutingRead {
             labels: vec![],

@@ -1,8 +1,8 @@
 use crate::config::{AudioSourceId, write_atomic};
-use crate::devices::{Result, StreamSwitcher};
+use crate::devices::{InputName, Result, StreamSwitcher};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::Duration;
 
@@ -89,6 +89,82 @@ pub async fn all_down(sw: &dyn StreamSwitcher, srcs: &[AudioSourceId], down: f32
         }
     }
     true
+}
+
+/// What to call a Fairlight source: a camera input by the ATEM's name for it ("2 · Pulpit
+/// Cam"), an audio-only input by its socket ("XLR 1"), with "(stereo)", "(L)" or "(R)"
+/// for which part of it.
+pub fn source_name(src: AudioSourceId, names: &BTreeMap<u16, InputName>) -> String {
+    let n = src.input;
+    let part = match src.source {
+        -65280 => "stereo".to_string(),
+        -256 => "L".to_string(),
+        -255 => "R".to_string(),
+        s => format!("source {s}"),
+    };
+    let socket = |first: u16, what: &str| format!("{what} {}", n - first + 1);
+    let name = match n {
+        1..=999 => {
+            let own = names.get(&n).map(|i| i.long.trim()).filter(|l| !l.is_empty());
+            let name = own.map_or_else(|| format!("{n} · Input {n}"), |l| format!("{n} · {l}"));
+            // A camera's own audio is stereo: only a split pair needs saying.
+            return if src.source == -65280 { name } else { format!("{name} ({part})") };
+        }
+        1001..=1099 => socket(1001, "XLR"),
+        1101..=1199 => socket(1101, "AES"),
+        1201 => "RCA".into(),
+        1202..=1299 => socket(1201, "RCA"),
+        1301..=1399 => socket(1301, "Mic"),
+        1401..=1499 => socket(1401, "MADI"),
+        1501..=1599 => socket(1501, "TRS"),
+        _ => format!("Audio input {n}"),
+    };
+    format!("{name} ({part})")
+}
+
+/// Hands the stream audio over between the usual sources and the emergency camera:
+/// to the camera when `to_camera`, back to `mics` when not. The camera is switched on
+/// first, at the floor, and off last. When the side giving the audio away is already
+/// down (before T-0, during a video, after End) only the switch happens, and the
+/// sequences bring the other side up in its place; otherwise the two cross-fade, the
+/// one coming up going to its live level. Returns whether the switch took (the camera's
+/// audio went on, or the fade back and its switching off both worked) and any error.
+pub async fn hand_over(
+    sw: &dyn StreamSwitcher,
+    mics: &[AudioSourceId],
+    camera: AudioSourceId,
+    to_camera: bool,
+    levels: &mut LiveLevels,
+    down: f32,
+    over: Duration,
+) -> (bool, Result<()>) {
+    let cam = [camera];
+    let (from, to): (&[AudioSourceId], &[AudioSourceId]) = if to_camera { (mics, &cam) } else { (&cam, mics) };
+    // Keep the levels the operator set on both sides; a failed read keeps the saved ones.
+    let _ = levels.recapture(sw, from, down).await;
+    let _ = levels.recapture(sw, to, down).await;
+    let up = !all_down(sw, from, down).await;
+    if to_camera {
+        if let Err(e) = sw.set_audio_level(camera, FLOOR_DB).await {
+            return (false, Err(e));
+        }
+        if let Err(e) = sw.set_audio_on(camera, true).await {
+            return (false, Err(e));
+        }
+    }
+    if up {
+        let (a, b) = tokio::join!(fade(sw, from, Target::Floor, over), fade(sw, to, Target::Live(levels), over));
+        if let Err(e) = a.and(b) {
+            return (to_camera, Err(e));
+        }
+    } else if !to_camera {
+        // The camera may have been left a little up: make sure it is silent before it goes.
+        let _ = sw.set_audio_level(camera, FLOOR_DB).await;
+    }
+    if !to_camera && let Err(e) = sw.set_audio_on(camera, false).await {
+        return (false, Err(e));
+    }
+    (true, Ok(()))
 }
 
 pub enum Target<'a> {
@@ -186,6 +262,80 @@ mod tests {
         h.stream.set_audio_level_state(MIC, FLOOR_DB);
         live.recapture(&*d.stream, &[MIC], down_threshold(FLOOR_DB)).await.unwrap();
         assert_eq!(live.0[&MIC], -6.0);
+    }
+
+    const CAM: AudioSourceId = AudioSourceId { input: 3, source: -65280 };
+    const FADE: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn sources_are_named_by_camera_or_socket() {
+        let mut names = BTreeMap::new();
+        names.insert(2, InputName { long: "Pulpit Cam".into(), short: "PULP".into(), default: false });
+        let at = |input, source| source_name(AudioSourceId { input, source }, &names);
+        assert_eq!(at(2, -65280), "2 · Pulpit Cam");
+        assert_eq!(at(5, -65280), "5 · Input 5");
+        assert_eq!(at(2, -256), "2 · Pulpit Cam (L)");
+        assert_eq!(at(1001, -65280), "XLR 1 (stereo)");
+        assert_eq!(at(1002, -255), "XLR 2 (R)");
+        assert_eq!(at(1201, -65280), "RCA (stereo)");
+        assert_eq!(at(1302, -65280), "Mic 2 (stereo)");
+        assert_eq!(at(2001, 7), "Audio input 2001 (source 7)");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn emergency_audio_cross_fades_to_the_camera_when_the_mics_are_up() {
+        let (d, log, h) = fake_devices();
+        h.stream.set_audio_level_state(MIC, -4.0);
+        h.stream.set_audio_level_state(CAM, -8.0);
+        let mut l = LiveLevels::default();
+        let (switched, r) = hand_over(&*d.stream, &[MIC], CAM, true, &mut l, down_threshold(FLOOR_DB), FADE).await;
+        assert!(switched && r.is_ok());
+        let calls = log.calls();
+        let on = calls.iter().position(|c| *c == Call::StreamSetAudioOn(CAM, true)).unwrap();
+        assert_eq!(calls[on - 1], Call::StreamSetAudioLevel(CAM, FLOOR_DB), "silent before it goes on");
+        assert_eq!(d.stream.audio_level(MIC).await.unwrap(), FLOOR_DB);
+        assert_eq!(d.stream.audio_level(CAM).await.unwrap(), -8.0, "up to its own fader level");
+        assert_eq!(l.0[&MIC], -4.0, "the mics' level is kept for coming back");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn emergency_audio_only_switches_while_the_stream_audio_is_down() {
+        let (d, log, h) = fake_devices();
+        h.stream.set_audio_level_state(MIC, FLOOR_DB);
+        let mut l = LiveLevels::default();
+        let (switched, r) = hand_over(&*d.stream, &[MIC], CAM, true, &mut l, down_threshold(FLOOR_DB), FADE).await;
+        assert!(switched && r.is_ok());
+        assert_eq!(
+            log.calls(),
+            vec![Call::StreamSetAudioLevel(CAM, FLOOR_DB), Call::StreamSetAudioOn(CAM, true)],
+            "left down for the sequences to bring up"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn back_to_normal_fades_the_mics_up_then_switches_the_camera_off() {
+        let (d, log, h) = fake_devices();
+        h.stream.set_audio_level_state(MIC, FLOOR_DB);
+        h.stream.set_audio_level_state(CAM, -2.0);
+        let mut l = LiveLevels(HashMap::from([(MIC, -4.0)]));
+        let (switched, r) = hand_over(&*d.stream, &[MIC], CAM, false, &mut l, down_threshold(FLOOR_DB), FADE).await;
+        assert!(switched && r.is_ok());
+        assert_eq!(d.stream.audio_level(MIC).await.unwrap(), -4.0);
+        assert_eq!(d.stream.audio_level(CAM).await.unwrap(), FLOOR_DB);
+        assert_eq!(log.calls().last(), Some(&Call::StreamSetAudioOn(CAM, false)));
+        assert_eq!(l.0[&CAM], -2.0, "the camera's level is kept for next time");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_fade_back_leaves_the_camera_on() {
+        let (d, log, h) = fake_devices();
+        h.stream.set_audio_level_state(MIC, FLOOR_DB);
+        h.stream.set_audio_level_state(CAM, -2.0);
+        h.stream.fail_times("set_audio_level", 100);
+        let mut l = LiveLevels::default();
+        let (switched, r) = hand_over(&*d.stream, &[MIC], CAM, false, &mut l, down_threshold(FLOOR_DB), FADE).await;
+        assert!(!switched && r.is_err());
+        assert!(!log.calls().contains(&Call::StreamSetAudioOn(CAM, false)));
     }
 
     #[test]

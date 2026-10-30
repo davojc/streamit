@@ -761,6 +761,7 @@ impl Probes {
                     preview: d.stream.preview().await.ok(),
                     stills: d.stream.stills(),
                     names: d.stream.input_names(),
+                    audio_sources: d.stream.audio_sources(),
                     ..TargetRead::default()
                 },
                 Target::ScreensAtem => TargetRead {

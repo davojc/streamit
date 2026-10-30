@@ -54,6 +54,9 @@ pub struct StreamAtemConfig {
     pub duck_db: f32,
     #[serde(with = "millis")]
     pub fade: Duration,
+    /// The input (1-based) whose own audio, from a camera's mic, stands in for the
+    /// stream audio sources when Emergency audio is switched on.
+    pub emergency_input: Option<u16>,
 }
 
 impl Default for StreamAtemConfig {
@@ -70,7 +73,15 @@ impl Default for StreamAtemConfig {
             shown_audio: Vec::new(),
             duck_db: -100.0,
             fade: Duration::from_secs(1),
+            emergency_input: None,
         }
+    }
+}
+
+impl StreamAtemConfig {
+    /// The emergency camera's audio (its stereo source), when an input is marked.
+    pub fn emergency_source(&self) -> Option<AudioSourceId> {
+        self.emergency_input.map(|input| AudioSourceId { input, source: crate::rollin::STEREO_SOURCE })
     }
 }
 
@@ -372,6 +383,15 @@ impl Config {
             outputs[m] = self.videohub.input8_output;
         }
         outputs
+    }
+
+    /// This config with the emergency camera as the only stream audio source, as it is
+    /// while Emergency audio is on; unchanged when no input is marked.
+    pub fn with_emergency_audio(mut self) -> Self {
+        if let Some(src) = self.stream_atem.emergency_source() {
+            self.stream_atem.mic_sources = vec![src];
+        }
+        self
     }
 
     /// Make Stream ATEM input `input` (1-based) the Media input. Its router output becomes

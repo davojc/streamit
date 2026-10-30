@@ -234,6 +234,19 @@ impl StreamSwitcher for SimSwitcher {
             }
         })
     }
+
+    /// Like a Television Studio HD8: the cameras, two XLRs and the RCA, all stereo.
+    fn audio_sources(&self) -> Vec<AudioSourceId> {
+        let stereo = |input| AudioSourceId { input, source: -65280 };
+        let mut v: Vec<AudioSourceId> = (1..=INPUTS).chain([1001, 1002, 1201]).map(stereo).collect();
+        for s in self.sim.lock().fairlight.keys() {
+            if !v.contains(s) {
+                v.push(*s);
+            }
+        }
+        v.sort_by_key(|s| (s.input, s.source));
+        v
+    }
 }
 
 /// The pretend VideoHub's input labels (input 1 first); the rest have none.

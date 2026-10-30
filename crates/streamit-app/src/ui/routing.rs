@@ -405,7 +405,7 @@ impl StreamItApp {
         if target.is_atem() {
             self.job_badges(ui, rect, target, i);
             r.context_menu(|ui| {
-                self.input_menu(ui, target, i, snap.job.is_some());
+                self.input_menu(ui, target, i, snap.job.is_some(), snap.emergency_audio);
                 ui.separator();
                 self.name_menu(ui, snap, target, input);
             });

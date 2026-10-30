@@ -138,6 +138,8 @@ pub struct TargetState {
     pub stills: Vec<Option<String>>,
     /// What the ATEM calls each of its inputs, by input number.
     pub names: BTreeMap<u16, InputName>,
+    /// The Fairlight sources the ATEM reports (only the Stream ATEM's are read).
+    pub audio_sources: Vec<crate::config::AudioSourceId>,
 }
 
 impl TargetState {
@@ -317,6 +319,7 @@ pub struct TargetRead {
     pub preview: Option<u16>,
     pub stills: Vec<Option<String>>,
     pub names: BTreeMap<u16, InputName>,
+    pub audio_sources: Vec<crate::config::AudioSourceId>,
 }
 
 /// Everything one routing read found (the health poll sends these to the engine).
@@ -368,6 +371,7 @@ mod tests {
             preview: None,
             stills: vec![],
             names: Default::default(),
+            audio_sources: Vec::new(),
         }
     }
 
