@@ -958,16 +958,23 @@ impl Engine {
                 if n == 0 {
                     return self.ignore(&cmd, "inputs and outputs are numbered from 1");
                 }
+                let what = format!("{kind:?}").to_lowercase();
+                // Read first: the snapshot cannot be written while it is borrowed.
+                let taken = self.snap.borrow().routing.same_name(kind, n, &text);
+                if let Some(other) = taken {
+                    let msg = format!(
+                        "VideoHub: {what} {other} is already called “{}”, so {what} {n} keeps its name",
+                        text.trim()
+                    );
+                    return set_warning(&self.snap, msg);
+                }
                 info!(?kind, n, text = %text, "renaming on the VideoHub");
                 let (hub, snap) = (self.d.hub.clone(), self.snap.clone());
                 tokio::spawn(
                     async move {
                         match hub.set_label(kind, n, &text).await {
                             Ok(()) => snap.send_modify(|s| s.routing.set_label(kind, n, &text)),
-                            Err(e) => {
-                                let what = format!("{kind:?} {n}").to_lowercase();
-                                set_warning(&snap, format!("VideoHub: could not rename {what}: {e}"));
-                            }
+                            Err(e) => set_warning(&snap, format!("VideoHub: could not rename {what} {n}: {e}")),
                         }
                     }
                     .in_current_span(),
@@ -4014,6 +4021,26 @@ mod tests {
         let s = until(&mut e, "a warning", |s| s.last_warning.as_deref().is_some_and(|w| w.contains("rename"))).await;
         assert!(s.last_warning.unwrap().contains("output 37"));
         assert_eq!(s.routing.own_output_label(37), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_videohub_name_already_in_use_is_refused() {
+        let (d, _log, _h) = rig();
+        let mut e = Engine::spawn(d, rt_cfg());
+        let mut first = read([1; 4], [1; 4], 1);
+        if let Command::RoutingRead(read) = &mut first {
+            read.labels = vec!["Cam 1".into(), String::new(), String::new(), "Drums".into()];
+        }
+        send(&e, first).await;
+        until(&mut e, "the labels", |s| s.routing.own_label(4) == Some("Drums")).await;
+        // Refused before the VideoHub is asked: the fake one would refuse with "could not rename".
+        send(&e, Command::SetLabel { kind: LabelKind::Input, n: 9, text: " drums ".into() }).await;
+        let s = until(&mut e, "a warning", |s| s.last_warning.is_some()).await;
+        assert_eq!(
+            s.last_warning.as_deref(),
+            Some("VideoHub: input 4 is already called “drums”, so input 9 keeps its name")
+        );
+        assert_eq!(s.routing.own_label(9), None);
     }
 
     #[tokio::test(start_paused = true)]

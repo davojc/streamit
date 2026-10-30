@@ -266,6 +266,18 @@ impl RoutingState {
         }
     }
 
+    /// The other input or output of `kind` already called `text` (ignoring case and spaces
+    /// at the ends), if there is one. A blank name is never taken.
+    pub fn same_name(&self, kind: LabelKind, n: u16, text: &str) -> Option<u16> {
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        (1..=u16::try_from(self.labels_of(kind).len()).unwrap_or(u16::MAX))
+            .filter(|&other| other != n)
+            .find(|&other| own(self.labels_of(kind), other).is_some_and(|l| l.eq_ignore_ascii_case(text)))
+    }
+
     /// Sets label `n` (1-based) of `kind`, growing the list if it is shorter.
     pub fn set_label(&mut self, kind: LabelKind, n: u16, text: &str) {
         let list = match kind {
@@ -413,6 +425,20 @@ mod tests {
         assert_eq!(t.snapshot_inputs(), Some(vec![5, 0, 7]));
         let empty = atem(&[0, 0], &[None, None], 1);
         assert_eq!(empty.snapshot_inputs(), None, "nothing is fed by the router");
+    }
+
+    #[test]
+    fn a_name_is_taken_by_another_port_of_the_same_kind_whatever_its_case() {
+        let r = RoutingState {
+            labels: vec!["Drums".into(), String::new(), "Guitar".into()],
+            output_labels: vec!["MV top left".into()],
+            ..RoutingState::default()
+        };
+        assert_eq!(r.same_name(LabelKind::Input, 5, " drums "), Some(1));
+        assert_eq!(r.same_name(LabelKind::Input, 1, "Drums"), None, "its own name");
+        assert_eq!(r.same_name(LabelKind::Input, 5, "MV top left"), None, "outputs are apart");
+        assert_eq!(r.same_name(LabelKind::Output, 2, "mv TOP left"), Some(1));
+        assert_eq!(r.same_name(LabelKind::Input, 5, "  "), None, "a blank name is never taken");
     }
 
     #[test]

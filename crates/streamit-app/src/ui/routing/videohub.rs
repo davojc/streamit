@@ -332,6 +332,13 @@ impl StreamItApp {
         if !r.has_focus() && !r.lost_focus() {
             r.request_focus();
         }
+        // Another input (or output) already has this name: say which, at the field's end.
+        // Sending it anyway is refused with a warning at the top of the page.
+        if let Some(other) = routing.same_name(kind, n, &text).filter(|_| text.trim() != current.trim()) {
+            let label = format!("SAME AS {other}");
+            let w = ui.painter().layout_no_wrap(label.clone(), theme::heading_font(10.5), theme::AMBER).size().x + 8.0;
+            setup::badge(ui, egui::pos2(r.rect.right() - w - 4.0, r.rect.center().y - 8.0), &label, theme::AMBER);
+        }
         self.routes_ui.drafts.insert(key, text.clone());
         if r.lost_focus() {
             let escaped = ui.input(|i| i.key_pressed(egui::Key::Escape));
