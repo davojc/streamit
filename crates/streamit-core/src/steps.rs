@@ -14,6 +14,8 @@ pub enum StepGroup {
 pub enum StepId {
     LevelsRead,
     OpeningStill,
+    /// Only when the VideoHub feeds input 8.
+    MediaRouted,
     PrepareAudioDown,
     EncoderStarted,
     YouTubeReceiving,
@@ -33,9 +35,10 @@ pub enum StepId {
 }
 
 impl StepId {
-    pub const PREPARE: [StepId; 6] = [
+    pub const PREPARE: [StepId; 7] = [
         StepId::LevelsRead,
         StepId::OpeningStill,
+        StepId::MediaRouted,
         StepId::PrepareAudioDown,
         StepId::EncoderStarted,
         StepId::YouTubeReceiving,
@@ -55,9 +58,8 @@ impl StepId {
     pub fn group(self) -> StepGroup {
         use StepId::*;
         match self {
-            LevelsRead | OpeningStill | PrepareAudioDown | EncoderStarted | YouTubeReceiving | YouTubeTesting => {
-                StepGroup::Prepare
-            }
+            LevelsRead | OpeningStill | MediaRouted | PrepareAudioDown | EncoderStarted | YouTubeReceiving
+            | YouTubeTesting => StepGroup::Prepare,
             HallCountdown | StreamCountdown | CountdownVideo | YouTubePublic => StepGroup::Countdown,
             ClosingVideo | ClosingStill | EndAudioDown | ClosingHold | YouTubeEnded | EncoderStopped => StepGroup::End,
         }
@@ -68,6 +70,7 @@ impl StepId {
         match self {
             LevelsRead => "Stream audio levels read",
             OpeningStill => "Opening still on air",
+            MediaRouted => "Input 8 on its normal source",
             PrepareAudioDown | EndAudioDown => "Stream audio faded down",
             EncoderStarted => "Web Presenter streaming",
             YouTubeReceiving => "YouTube receiving",
@@ -173,6 +176,6 @@ mod tests {
         assert_eq!(of_group(&s, StepGroup::Countdown)[0].mark, StepMark::Failed("x".into()));
         reset(&mut s, StepGroup::Prepare);
         assert_eq!(of_group(&s, StepGroup::Prepare), fresh(StepGroup::Prepare));
-        assert_eq!(s.len(), 16);
+        assert_eq!(s.len(), 17);
     }
 }

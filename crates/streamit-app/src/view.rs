@@ -882,9 +882,10 @@ pub fn step_rows(s: &Snapshot, c: &Config, g: StepGroup) -> Vec<StepRow> {
     steps::of_group(&s.steps, g)
         .into_iter()
         // The stream step only when the countdown goes online too; the closing countdown's
-        // only when it plays.
+        // only when it plays; input 8's route only when the VideoHub feeds it.
         .filter(|st| st.id != StepId::StreamCountdown || c.playout.countdown_to_stream)
         .filter(|st| st.id != StepId::ClosingVideo || c.playout.closing_plays())
+        .filter(|st| st.id != StepId::MediaRouted || c.videohub.input8_output != 0)
         .map(|st| {
             let (tone, detail, time) = match st.mark {
                 StepMark::Todo => (Tone::Grey, todo_detail(st.id, c), None),
@@ -920,6 +921,7 @@ pub fn steps_tone(rows: &[StepRow]) -> Tone {
 fn todo_detail(id: StepId, c: &Config) -> Option<String> {
     Some(match id {
         StepId::OpeningStill => "Online sees “Stream starting soon…”".into(),
+        StepId::MediaRouted => "As the Stream ATEM’s Default preset has it".into(),
         StepId::YouTubeReceiving => "Waits up to 60 s".into(),
         StepId::YouTubeTesting => "Still private".into(),
         StepId::HallCountdown => format!("Screens ATEM input {}", c.screens_atem.decklink_input),

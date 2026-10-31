@@ -2595,7 +2595,7 @@ mod tests {
         h.encoder.fail_next("start");
         send(&e, Command::Prepare).await;
         let s = until(&mut e, "Prepared(Warning)", |s| matches!(s.stage, Stage::Prepared(Readiness::Warning(_)))).await;
-        let m = &marks(&s, StepGroup::Prepare)[3];
+        let m = &marks(&s, StepGroup::Prepare)[4];
         assert!(matches!(m, StepMark::Failed(_)), "{m:?}");
     }
 

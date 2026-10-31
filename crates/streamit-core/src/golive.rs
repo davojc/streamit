@@ -192,6 +192,16 @@ pub async fn prepare(
     }
     step(StepId::OpeningStill, failed_since(&problems, before));
 
+    // Input 8 off the opening still's way, so routing it cannot put anything on air.
+    if c.videohub.input8_output != 0 {
+        step(StepId::MediaRouted, StepMark::Now(None));
+        let r = media_to_normal(d, c).await;
+        step(StepId::MediaRouted, StepMark::of(&r));
+        if let Err(e) = r {
+            problem(&mut problems, &warn, e);
+        }
+    }
+
     waiting("Fading the stream audio down");
     step(StepId::PrepareAudioDown, StepMark::Now(None));
     let r = fade(&*d.stream, &sa.mic_sources, Target::Floor, sa.fade).await;
@@ -528,6 +538,30 @@ pub async fn countdown(
 }
 
 /// Input 8's sound, which carries the countdown video's when it goes to the stream.
+/// The VideoHub route feeding input 8 back to what it normally shows (the Default
+/// preset's input), in case something left it on the DeckLink. Not while input 8 is on
+/// air. Without a known normal source, only input 8 left on the DeckLink is a problem.
+async fn media_to_normal(d: &Devices, c: &Config) -> std::result::Result<(), String> {
+    let hub = &c.videohub;
+    let now = d.hub.route_of(hub.input8_output).await.map_err(|e| format!("Could not read the input 8 route: {e}"))?;
+    let normal = c.media_normal_input();
+    if normal == 0 {
+        if hub.decklink_input != 0 && now == hub.decklink_input {
+            return Err(crate::recovery::UNKNOWN_NORMAL_ROUTE.into());
+        }
+        return Ok(());
+    }
+    if now == normal {
+        return Ok(());
+    }
+    match d.stream.program().await {
+        Ok(p) if p == c.stream_atem.decklink_input => return Err("Input 8 is on air, so its route was left".into()),
+        Ok(_) => {}
+        Err(e) => return Err(format!("Could not read the Stream ATEM program: {e}")),
+    }
+    d.hub.route(hub.input8_output, normal).await.map_err(|e| format!("Could not route input 8 back: {e}"))
+}
+
 pub(crate) fn countdown_audio(c: &Config) -> AudioSourceId {
     AudioSourceId { input: c.stream_atem.decklink_input, source: crate::rollin::STEREO_SOURCE }
 }
@@ -1029,6 +1063,57 @@ mod tests {
         assert_eq!(calls.len(), 3 + 20 + 2);
         assert!(warns.lock().unwrap().is_empty());
         assert_eq!(progress.lock().unwrap().last(), Some(&Readiness::Ready));
+    }
+
+    /// The VideoHub feeds input 8 from output 20; the DeckLink is router input 30 and
+    /// Cam 8 (input 8's normal source, per the fallback) router input 5.
+    fn routed() -> Config {
+        let mut c = Config::default();
+        c.videohub.input8_output = 20;
+        c.videohub.decklink_input = 30;
+        c.videohub.fallback_normal_input = 5;
+        c
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prepare_puts_input_8_back_on_its_normal_source_after_the_still() {
+        let (d, log, h) = fake_devices();
+        h.hub.set_route(20, 30);
+        let mut levels = LiveLevels::default();
+        let (warns, w) = sink();
+        let r = prepare(&d, &routed(), "b", &mut levels, |_| {}, w, |_| {}, |_, _| {}).await;
+        assert_eq!(r, Readiness::Ready, "{:?}", warns.lock().unwrap());
+        assert_in_order(&log.calls(), &[Call::StreamAuto, Call::HubRoute { output: 20, input: 5 }, Call::EncoderStart]);
+        assert_eq!(h.hub.route_of(20).await.unwrap(), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prepare_leaves_input_8_alone_when_it_is_already_right() {
+        let (d, log, h) = fake_devices();
+        h.hub.set_route(20, 5);
+        let mut levels = LiveLevels::default();
+        let r = prepare(&d, &routed(), "b", &mut levels, |_| {}, |_| {}, |_| {}, |_, _| {}).await;
+        assert_eq!(r, Readiness::Ready);
+        assert!(!log.calls().iter().any(|c| matches!(c, Call::HubRoute { .. })));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prepare_warns_when_input_8_is_on_the_decklink_and_its_normal_source_is_unknown() {
+        let (d, log, h) = fake_devices();
+        h.hub.set_route(20, 30);
+        let mut c = routed();
+        c.videohub.fallback_normal_input = 0;
+        let mut levels = LiveLevels::default();
+        let (warns, w) = sink();
+        let r = prepare(&d, &c, "b", &mut levels, |_| {}, w, |_| {}, |_, _| {}).await;
+        assert!(matches!(r, Readiness::Warning(_)), "{r:?}");
+        assert!(warns.lock().unwrap().iter().any(|w| w.contains("Default")), "{:?}", warns.lock().unwrap());
+        assert!(!log.calls().iter().any(|c| matches!(c, Call::HubRoute { .. })));
+        // Not on the DeckLink: whatever it shows is left alone, without a warning.
+        h.hub.set_route(20, 7);
+        let (warns, w) = sink();
+        let r = prepare(&d, &c, "b", &mut levels, |_| {}, w, |_| {}, |_, _| {}).await;
+        assert_eq!(r, Readiness::Ready, "{:?}", warns.lock().unwrap());
     }
 
     #[tokio::test(start_paused = true)]
