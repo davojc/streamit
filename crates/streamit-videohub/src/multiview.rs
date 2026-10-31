@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use streamit_blockproto::{Block, Link, OnBlock, OnReset, Timings};
 use streamit_core::devices::{DeviceError, LabelKind, Result};
+use streamit_core::routing::VIEW_MV_INPUT;
 
 /// The MultiView 4's views.
 pub const VIEWS: u16 = 4;
@@ -63,9 +64,11 @@ impl MultiView {
     }
 }
 
-/// The labels each view should have so it names the VideoHub input on it: (view 1..=4,
-/// label) for every view whose current label differs. `dests` is the VideoHub input on
-/// each view (`None` when not fed or not known: left alone); `hub_label` names an input.
+/// The labels each view should have so it names the VideoHub input on it: (MultiView
+/// input 1..=4, label) for every view whose current label differs. `dests` is the
+/// VideoHub input on each view, in `routing::VIEWS` order (`None` when not fed or not
+/// known: left alone); `current` is the labels by MultiView input; `hub_label` names an
+/// input.
 pub fn labels_to_set(
     dests: &[Option<u16>],
     current: &[String],
@@ -73,12 +76,11 @@ pub fn labels_to_set(
 ) -> Vec<(u16, String)> {
     dests
         .iter()
-        .enumerate()
-        .take(usize::from(VIEWS))
-        .filter_map(|(i, d)| {
+        .zip(VIEW_MV_INPUT)
+        .filter_map(|(d, mv_in)| {
             let want = hub_label((*d)?);
-            let now = current.get(i).map(String::as_str).unwrap_or("");
-            (!want.trim().is_empty() && want.trim() != now.trim()).then(|| (i as u16 + 1, want.trim().to_string()))
+            let now = current.get(usize::from(mv_in) - 1).map(String::as_str).unwrap_or("");
+            (!want.trim().is_empty() && want.trim() != now.trim()).then(|| (mv_in, want.trim().to_string()))
         })
         .collect()
 }
@@ -94,8 +96,25 @@ mod tests {
             5 => "ProPresenter".to_string(),
             _ => String::new(),
         };
-        let current = vec!["Camera 1".to_string(), "Old".to_string(), "x".to_string()];
+        // By MultiView input: 1 (top left) is right; 3 (top right) is not.
+        let current = vec!["Camera 1".to_string(), "x".to_string(), "Old".to_string()];
         let dests = [Some(1), Some(5), None, Some(9)];
-        assert_eq!(labels_to_set(&dests, &current, names), vec![(2, "ProPresenter".to_string())]);
+        assert_eq!(labels_to_set(&dests, &current, names), vec![(3, "ProPresenter".to_string())]);
+    }
+
+    #[test]
+    fn each_corner_names_the_multiview_input_shown_there() {
+        // The MultiView 4 numbers its inputs down the columns: 1 and 2 on the left.
+        let names = |n: u16| format!("Source {n}");
+        let dests = [Some(11), Some(12), Some(13), Some(14)]; // TL, TR, BL, BR
+        assert_eq!(
+            labels_to_set(&dests, &[], names),
+            vec![
+                (1, "Source 11".to_string()),
+                (3, "Source 12".to_string()),
+                (2, "Source 13".to_string()),
+                (4, "Source 14".to_string()),
+            ]
+        );
     }
 }

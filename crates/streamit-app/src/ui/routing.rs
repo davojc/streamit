@@ -18,7 +18,8 @@ use std::collections::HashMap;
 use streamit_core::devices::LabelKind;
 use streamit_core::engine::{Command, DeviceHealth, DeviceKind, Snapshot};
 use streamit_core::routing::{
-    PRESET_SLOTS, Preset, RoutingState, Target, TargetState, locked, preset_name, with_preset, without_preset,
+    PRESET_SLOTS, Preset, RoutingState, Target, TargetState, VIEW_MV_INPUT, locked, preset_name, with_preset,
+    without_preset,
 };
 use tracing::info;
 
@@ -382,7 +383,7 @@ impl StreamItApp {
         let input = i as u16 + 1;
         let own = target.is_atem().then(|| state.own_name(input)).flatten();
         let where_ = match (target, own.and_then(|_| state.names.get(&input))) {
-            (Target::MultiView, _) => format!("{} · MV in {}", target.dest_name(i).to_uppercase(), i + 1),
+            (Target::MultiView, _) => format!("{} · MV in {}", target.dest_name(i).to_uppercase(), VIEW_MV_INPUT[i]),
             (_, Some(n)) if !n.short.trim().is_empty() => {
                 format!("{} · {}", target.dest_name(i).to_uppercase(), n.short.trim())
             }
@@ -831,7 +832,7 @@ impl StreamItApp {
                             // The Media input's output is the one StreamIt routes videos through.
                             let is_media = t == Target::StreamAtem && Some(i) == media;
                             let name = if t == Target::MultiView {
-                                format!("{} (MV in {})", t.dest_name(i), i + 1)
+                                format!("{} (MV in {})", t.dest_name(i), VIEW_MV_INPUT[i])
                             } else if is_media {
                                 format!("{} (media)", t.dest_name(i))
                             } else {

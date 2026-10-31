@@ -18,6 +18,9 @@ pub enum Target {
 pub const VIEWS: [&str; 4] = ["Top left", "Top right", "Bottom left", "Bottom right"];
 /// Short names of the views, for the Stream Deck and the input badges.
 pub const VIEW_KEYS: [&str; 4] = ["TL", "TR", "BL", "BR"];
+/// The MultiView input (1-based) each view shows: the MultiView 4 numbers its inputs
+/// down the columns, 1 and 2 on the left, 3 and 4 on the right.
+pub const VIEW_MV_INPUT: [u16; 4] = [1, 3, 2, 4];
 /// Inputs on each ATEM that can be fed by the VideoHub.
 pub const ATEM_INPUTS: usize = 8;
 /// Preset slots per target, numbered from 1.
