@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- StreamIt's icon: a play mark sending out broadcast waves, with a red live dot.
+       streamit.ico and streamit.png are drawn from this by tools/make_icon.py. -->
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="#2563eb"/>
+  <path d="M74 78 L74 178 L150 128 Z" fill="#ffffff" stroke="#ffffff" stroke-width="10" stroke-linejoin="round"/>
+  <path d="M172 92 A52 52 0 0 1 172 164" fill="none" stroke="#ffffff" stroke-width="16" stroke-linecap="round"/>
+  <path d="M196 70 A82 82 0 0 1 196 186" fill="none" stroke="#9cc2ff" stroke-width="16" stroke-linecap="round"/>
+  <circle cx="206" cy="50" r="20" fill="#e5484d" stroke="#2563eb" stroke-width="8"/>
+</svg>

@@ -47,6 +47,9 @@ streamit-eos = { version = "0.1.6", path = "../streamit-eos" }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
 
+[build-dependencies]
+winresource = "0.1.31"
+
 [dev-dependencies]
 streamit-core = { path = "../streamit-core", features = ["fakes"] }
 tokio = { workspace = true, features = ["full", "test-util"] }

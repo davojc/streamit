@@ -106,6 +106,7 @@ fn run_app() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("StreamIt")
+            .with_icon(window_icon())
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([960.0, 640.0]),
         ..Default::default()
@@ -189,6 +190,13 @@ fn backup_bad(path: &Path) -> std::io::Result<Option<PathBuf>> {
         .ok_or_else(|| std::io::Error::other("too many .bad copies"))?;
     std::fs::copy(path, &bad)?;
     Ok(Some(bad))
+}
+
+/// StreamIt's icon for the window and its taskbar button (the exe's own icon is built in
+/// by build.rs).
+fn window_icon() -> std::sync::Arc<eframe::egui::IconData> {
+    let png = include_bytes!("../assets/icon/streamit.png");
+    std::sync::Arc::new(eframe::icon_data::from_png_bytes(png).expect("the built-in icon is a valid PNG"))
 }
 
 #[cfg(test)]
