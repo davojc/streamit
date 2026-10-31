@@ -18,8 +18,8 @@ use std::time::Duration;
 use streamit_core::config::AudioSourceId;
 use streamit_core::devices::{
     AudioInput, BroadcastCheck, BroadcastSummary, Broadcasts, ChatPage, Counter, Encoder, EncoderStatus, Fix, Health,
-    InputName, LabelKind, Lighting, LightingStatus, LiveDetails, Phase, Player, PlayerEvent, Result, Router, Still,
-    StreamSwitcher, Switcher,
+    InputName, LabelKind, Lighting, LightingStatus, LiveDetails, Monitor, Phase, Player, PlayerEvent, Result, Router,
+    Still, StreamSwitcher, Switcher,
 };
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -254,6 +254,13 @@ impl<T: Counter + ?Sized> Counter for Logged<T> {
     }
     async fn clear(&self) -> Result<()> {
         done(self.device, "clear()".into(), self.inner.clear().await)
+    }
+}
+
+#[async_trait]
+impl<T: Monitor + ?Sized> Monitor for Logged<T> {
+    async fn set_solo(&self, input: Option<u16>) -> Result<()> {
+        done(self.device, format!("set_solo({input:?})"), self.inner.set_solo(input).await)
     }
 }
 

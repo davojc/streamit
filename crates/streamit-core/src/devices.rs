@@ -323,6 +323,23 @@ pub trait Player: Send + Sync {
     fn events(&self) -> tokio::sync::broadcast::Receiver<PlayerEvent>;
 }
 
+/// The MultiView 4 the operators watch: which of its inputs, if any, fills the screen.
+#[async_trait]
+pub trait Monitor: Send + Sync {
+    /// Shows MultiView input `input` (1..=4) full screen, or all four views with `None`.
+    async fn set_solo(&self, input: Option<u16>) -> Result<()>;
+}
+
+/// No MultiView set up: full screen is refused.
+pub struct NoMonitor;
+
+#[async_trait]
+impl Monitor for NoMonitor {
+    async fn set_solo(&self, _: Option<u16>) -> Result<()> {
+        Err(DeviceError::Refused("no MultiView is set up".into()))
+    }
+}
+
 #[async_trait]
 pub trait Counter: Send + Sync {
     async fn show(&self, remaining: Duration) -> Result<()>;
@@ -357,4 +374,5 @@ pub struct Devices {
     pub player: Arc<dyn Player>,
     pub counter: Arc<dyn Counter>,
     pub lights: Arc<dyn Lighting>,
+    pub monitor: Arc<dyn Monitor>,
 }

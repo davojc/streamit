@@ -366,6 +366,18 @@ pub fn build_devices(sim: &SimHandle) -> Devices {
         player: Arc::new(sim.player()),
         counter: Arc::new(sim.counter()),
         lights: Arc::new(sim.lighting()),
+        monitor: Arc::new(PretendMonitor),
+    }
+}
+
+/// The simulation has no MultiView picture: full screen is accepted and shown on the
+/// Stream Deck and the Routing page only.
+struct PretendMonitor;
+
+#[async_trait::async_trait]
+impl streamit_core::devices::Monitor for PretendMonitor {
+    async fn set_solo(&self, _: Option<u16>) -> streamit_core::devices::Result<()> {
+        Ok(())
     }
 }
 

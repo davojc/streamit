@@ -36,6 +36,8 @@ pub struct KeyLook {
     pub fg: Rgb,
     /// This key is blinking right now (the colours already reflect the phase).
     pub blink: bool,
+    /// A frame around the key, to pick it out.
+    pub border: Option<Rgb>,
 }
 
 /// The pages, one per window tab: the window and the deck always show the same one.
@@ -274,6 +276,10 @@ pub fn press_for(page: Page, key: u8, snap: &Snapshot) -> Option<Press> {
         Page::Service => return service_press(key, snap),
         Page::Videos => video_press(key, snap),
         Page::Scenes => scene_slot(key).and_then(|i| snap.scenes.get(i)).map(|s| Command::GoScene(s.id)),
+        // A view key shows that view full screen; pressed again, all four.
+        Page::Routing(Target::MultiView) if let Some(v) = MV_KEYS.iter().position(|&k| k == key) => {
+            Some(Command::FullScreen(if snap.full_screen == Some(v) { None } else { Some(v) }))
+        }
         Page::Routing(t) => {
             return preset_slot(key)
                 .filter(|&slot| snap.routing.target(t).preset(slot).is_some())
@@ -349,7 +355,7 @@ fn service_press(key: u8, snap: &Snapshot) -> Option<Press> {
 }
 
 fn look(text: impl Into<String>, bg: Rgb, fg: Rgb) -> KeyLook {
-    KeyLook { text: text.into(), bg, fg, blink: false }
+    KeyLook { text: text.into(), bg, fg, blink: false, border: None }
 }
 
 fn dim(text: &str) -> KeyLook {
@@ -637,9 +643,18 @@ fn target_look(t: Target, key: u8, snap: &Snapshot, blink_phase: bool, armed: Op
     }
     if t == Target::MultiView {
         if let Some(v) = MV_KEYS.iter().position(|&k| k == key) {
-            let text = format!("{}\n{}", VIEW_KEYS[v], wrap_cue_name(&label(state.dest(v)), CUE_LINE_WIDTH));
-            // In the view's own colour, so the key matches that view in the window.
-            return look(text, VIEW_COLOURS[v], BLACK);
+            let name = wrap_cue_name(&label(state.dest(v)), CUE_LINE_WIDTH);
+            return match snap.full_screen {
+                // Full screen: framed in white; the other views dimmed.
+                Some(f) if f == v => {
+                    let mut l = look(format!("{} FULL\n{name}", VIEW_KEYS[v]), VIEW_COLOURS[v], BLACK);
+                    l.border = Some(WHITE);
+                    l
+                }
+                Some(_) => look(format!("{}\n{name}", VIEW_KEYS[v]), DIM_BG, DIM_FG),
+                // In the view's own colour, so the key matches that view in the window.
+                None => look(format!("{}\n{name}", VIEW_KEYS[v]), VIEW_COLOURS[v], BLACK),
+            };
         }
         return blank();
     }

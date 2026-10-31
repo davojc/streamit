@@ -433,9 +433,6 @@ fn view_keys_show_what_each_view_has_on_it() {
     assert_eq!(appearance(mv, 20, &s, true).text, "TR\nCAM 2");
     assert_eq!(appearance(mv, 27, &s, true).text, "BL\nCHOIR");
     assert_eq!(appearance(mv, 28, &s, true).text, "BR\n?", "not known");
-    for k in [19, 20, 27, 28] {
-        assert_eq!(press_for(mv, k, &s), None, "the view keys only show");
-    }
 }
 
 #[test]
@@ -480,4 +477,32 @@ fn cue_names_wrap_to_three_lines_with_ellipsis() {
     assert!(w.lines().all(|l| l.chars().count() <= 9));
     let long = wrap_cue_name("Supercalifragilisticexpialidocious", 9);
     assert!(long.lines().count() <= 3 && long.ends_with('…'));
+}
+
+#[test]
+fn a_view_key_toggles_that_view_full_screen() {
+    let mv = Page::Routing(Target::MultiView);
+    let mut s = Snapshot::default();
+    // TL, TR, BL, BR.
+    for (v, &key) in MV_KEYS.iter().enumerate() {
+        assert_eq!(press_for(mv, key, &s), Some(Press::Command(Command::FullScreen(Some(v)))));
+    }
+    s.full_screen = Some(1);
+    assert_eq!(press_for(mv, MV_KEYS[1], &s), Some(Press::Command(Command::FullScreen(None))), "again: all four");
+    assert_eq!(press_for(mv, MV_KEYS[3], &s), Some(Press::Command(Command::FullScreen(Some(3)))), "another: that one");
+}
+
+#[test]
+fn the_full_screen_view_is_marked_and_the_others_dimmed() {
+    let mv = Page::Routing(Target::MultiView);
+    let mut s = Snapshot::default();
+    let normal = appearance(mv, MV_KEYS[1], &s, true);
+    assert!(normal.text.starts_with("TR\n"), "{normal:?}");
+    assert_eq!(normal.border, None);
+    s.full_screen = Some(1);
+    let full = appearance(mv, MV_KEYS[1], &s, true);
+    assert!(full.text.starts_with("TR FULL\n"), "{full:?}");
+    assert_eq!(full.border, Some(WHITE));
+    let other = appearance(mv, MV_KEYS[0], &s, true);
+    assert_eq!((other.bg, other.border), (DIM_BG, None));
 }

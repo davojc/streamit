@@ -15,11 +15,11 @@ use std::time::Duration;
 use streamit_core::config::{AudioSourceId, Config, OscFraming};
 use streamit_core::devices::{
     self, BroadcastCheck, BroadcastSummary, Broadcasts, Counter, DeviceError, Devices, Encoder, EncoderStatus, Fix,
-    Health, Lighting, LightingStatus, Phase, Player, PlayerEvent, Router, StreamSwitcher, Switcher,
+    Health, Lighting, LightingStatus, Monitor, NoMonitor, Phase, Player, PlayerEvent, Router, StreamSwitcher, Switcher,
 };
 use streamit_core::engine::{AudioReading, Command, DeviceHealth, DeviceKind, Snapshot};
 use streamit_core::golive::Stage;
-use streamit_core::routing::{RoutingRead, Target, TargetRead};
+use streamit_core::routing::{RoutingRead, Target, TargetRead, VIEW_MV_INPUT};
 use streamit_videohub::multiview::{MultiView, labels_to_set};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -481,6 +481,7 @@ pub fn logged(d: Devices) -> Devices {
         player: Logged::wrap("DeckLink", d.player),
         counter: Logged::wrap("NDI", d.counter),
         lights: Logged::wrap("Lighting", d.lights),
+        monitor: Logged::wrap("MultiView", d.monitor),
     }
 }
 
@@ -538,6 +539,14 @@ pub async fn build(c: &Config) -> Wired {
         (false, _) => Absent::new("no lighting console set up (Settings › Equipment)"),
     };
     let (player, counter, tasks) = playout(c).await;
+    let multiview = c
+        .multiview_device
+        .is_set()
+        .then(|| socket_addr(&c.multiview_device.address, MULTIVIEW_PORT).map(MultiView::connect));
+    let monitor: Arc<dyn Monitor> = match &multiview {
+        Some(Ok(mv)) => mv.clone(),
+        _ => Arc::new(NoMonitor),
+    };
     let devices = logged(Devices {
         stream,
         screens,
@@ -547,11 +556,8 @@ pub async fn build(c: &Config) -> Wired {
         player: player.clone() as Arc<dyn Player>,
         counter: counter.clone() as Arc<dyn Counter>,
         lights,
+        monitor,
     });
-    let multiview = c
-        .multiview_device
-        .is_set()
-        .then(|| socket_addr(&c.multiview_device.address, MULTIVIEW_PORT).map(MultiView::connect));
     let probes =
         Probes { devices: devices.clone(), player, counter, lighting: c.lighting.is_set(), ndi: !c.ndi.off, multiview };
     // Stand-ins never come up, so only wait for the devices that were really built.
@@ -673,6 +679,14 @@ impl Probes {
                 }
             }
         }
+    }
+
+    /// The MultiView view (`routing::VIEWS` order) the MultiView shows full screen, with
+    /// `Some(None)` for all four; `None` when there is no MultiView or it is not known.
+    pub fn full_screen(&self) -> Option<Option<usize>> {
+        let Some(Ok(mv)) = &self.multiview else { return None };
+        let input = mv.solo().ok()?;
+        Some(input.and_then(|n| VIEW_MV_INPUT.iter().position(|&i| i == n)))
     }
 
     /// Probes for devices that are all there from the start (the pretend ones): the
@@ -858,6 +872,7 @@ pub fn spawn_health_poll(
             let mut last_routing = None;
             // MultiView view labels sent and refused, so a refusal is not resent every poll.
             let mut views_tried = std::collections::HashMap::new();
+            let mut last_full_screen = None;
             let mut last_lighting = None;
             let mut last_audio = None;
             let mut stream_checked: Option<tokio::time::Instant> = None;
@@ -919,6 +934,14 @@ pub fn spawn_health_poll(
                 }
                 let routing = probes.read_routing(&c).await;
                 probes.name_views(&routing.0, &routing.2[Target::MultiView.index()].dests, &mut views_tried).await;
+                if let Some(view) = probes.full_screen()
+                    && last_full_screen != Some(view)
+                {
+                    if tx.send(Command::MultiViewRead(view)).await.is_err() {
+                        return;
+                    }
+                    last_full_screen = Some(view);
+                }
                 if last_routing.as_ref() != Some(&routing) {
                     let (labels, output_labels, targets, routes) = routing.clone();
                     let read = RoutingRead { labels, output_labels, targets, media: c.media_dest(), routes };

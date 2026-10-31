@@ -26,7 +26,7 @@ use crate::end::{EndOutcome, end_service};
 use crate::golive::{self, CountdownOutcome, CountdownReport, Readiness, Stage, Stage0Report, T0Error};
 use crate::recovery::{self, Assessment, Offer};
 use crate::rollin::{self, Cue, CueList, CueState, Destination, RollinOutcome, RollinReport, TestTo};
-use crate::routing::{Preset, RoutingRead, RoutingState, Target, TargetState, locked};
+use crate::routing::{Preset, RoutingRead, RoutingState, Target, TargetState, VIEW_MV_INPUT, VIEWS, locked};
 use crate::scenes::{self, MAX_SCENES, Scene};
 use crate::steps::{self, Step, StepGroup, StepId, StepMark};
 use std::collections::BTreeMap;
@@ -124,6 +124,11 @@ pub enum Command {
     },
     /// What the VideoHub and the ATEMs report for routing, from the health poll.
     RoutingRead(Box<RoutingRead>),
+    /// Show MultiView view `view` (`routing::VIEWS` order) full screen, or all four views
+    /// with `None`.
+    FullScreen(Option<usize>),
+    /// The view the MultiView reports full screen (`None`: all four), from the poll.
+    MultiViewRead(Option<usize>),
     /// Fire cue `cue` in cue list `list` on the lighting console.
     FireLightingCue {
         list: u32,
@@ -195,6 +200,8 @@ pub struct Snapshot {
     pub mics_ducked: bool,
     /// The emergency camera's audio stands in for the stream audio sources.
     pub emergency_audio: bool,
+    /// The MultiView view (`routing::VIEWS` order) shown full screen; `None`: all four.
+    pub full_screen: Option<usize>,
     pub offers: Vec<Offer>,
     pub device_status: BTreeMap<DeviceKind, DeviceHealth>,
     pub last_warning: Option<String>,
@@ -294,6 +301,7 @@ impl Default for Snapshot {
             playing: None,
             mics_ducked: false,
             emergency_audio: false,
+            full_screen: None,
             offers: Vec::new(),
             device_status: BTreeMap::new(),
             last_warning: None,
@@ -926,6 +934,34 @@ impl Engine {
                 }
                 let what = format!("{} {}: input {input}", target.name(), target.dest_name(dest));
                 self.route_dests(target, vec![(dest, input)], what);
+            }
+            Command::FullScreen(view) => {
+                let view = *view;
+                if view.is_some_and(|v| v >= VIEW_MV_INPUT.len()) {
+                    return self.ignore(&cmd, "no such MultiView view");
+                }
+                let input = view.map(|v| VIEW_MV_INPUT[v]);
+                info!(?view, ?input, "MultiView full screen");
+                let (monitor, snap) = (self.d.monitor.clone(), self.snap.clone());
+                tokio::spawn(
+                    async move {
+                        match monitor.set_solo(input).await {
+                            Ok(()) => snap.send_modify(|s| s.full_screen = view),
+                            Err(e) => {
+                                let what = match view {
+                                    Some(v) => format!("show {} full screen", VIEWS[v].to_lowercase()),
+                                    None => "go back to all four views".into(),
+                                };
+                                set_warning(&snap, format!("MultiView: could not {what}: {e}"));
+                            }
+                        }
+                    }
+                    .in_current_span(),
+                );
+            }
+            Command::MultiViewRead(view) => {
+                let view = *view;
+                self.set(|s| s.full_screen = view);
             }
             Command::RouteOutput { output, input } => {
                 let (output, input) = (*output, *input);
@@ -4003,6 +4039,34 @@ mod tests {
         assert_eq!(s.routing.target(Target::MultiView).dests, vec![None, None, Some(12), None]);
         send(&e, Command::Route { target: Target::StreamAtem, dest: 3, input: 25 }).await;
         until_call(&log, Call::HubRoute { output: 4, input: 25 }).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_screen_shows_the_multiview_input_in_that_corner_and_back() {
+        let (d, log, _h) = rig();
+        let mut e = Engine::spawn(d, rt_cfg());
+        // Top right is MultiView input 3.
+        send(&e, Command::FullScreen(Some(1))).await;
+        until_call(&log, Call::MonitorSolo(Some(3))).await;
+        until(&mut e, "top right full screen", |s| s.full_screen == Some(1)).await;
+        send(&e, Command::FullScreen(None)).await;
+        until_call(&log, Call::MonitorSolo(None)).await;
+        until(&mut e, "all four", |s| s.full_screen.is_none()).await;
+        // What the MultiView reports wins.
+        send(&e, Command::MultiViewRead(Some(2))).await;
+        until(&mut e, "bottom left from the MultiView", |s| s.full_screen == Some(2)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_full_screen_warns_and_changes_nothing() {
+        let (d, log, h) = rig();
+        let mut e = Engine::spawn(d, rt_cfg());
+        h.monitor.fail_next("set_solo");
+        send(&e, Command::FullScreen(Some(0))).await;
+        until_call(&log, Call::MonitorSolo(Some(1))).await;
+        let s =
+            until(&mut e, "a warning", |s| s.last_warning.as_deref().is_some_and(|w| w.contains("MultiView"))).await;
+        assert_eq!(s.full_screen, None);
     }
 
     #[tokio::test(start_paused = true)]

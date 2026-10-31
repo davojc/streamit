@@ -390,11 +390,15 @@ impl StreamItApp {
             _ => target.dest_name(i).to_uppercase(),
         };
         p.text(rect.left_top() + vec2(8.0, 6.0), Align2::LEFT_TOP, where_, theme::heading_font(small_font), col);
-        if pgm || pvw {
+        // The view the MultiView shows full screen (from the Stream Deck).
+        let full = target == Target::MultiView && snap.full_screen == Some(i);
+        if pgm || pvw || full {
             let (text, bg, fg) = if pgm {
                 ("ON AIR", theme::RED, Color32::WHITE)
-            } else {
+            } else if pvw {
                 ("PREVIEW", theme::GREEN, Color32::from_rgb(6, 19, 12))
+            } else {
+                ("FULL SCREEN", Color32::WHITE, Color32::BLACK)
             };
             let g = p.layout_no_wrap(text.into(), theme::heading_font(10.0), fg);
             let tag = Rect::from_min_size(rect.right_top() + vec2(-g.size().x - 14.0, 5.0), g.size() + vec2(8.0, 2.0));

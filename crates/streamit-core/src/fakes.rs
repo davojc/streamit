@@ -19,7 +19,10 @@ pub enum Call {
     ScreensSetPreview(u16),
     ScreensSetProgram(u16),
     ScreensAuto,
-    HubRoute { output: u16, input: u16 },
+    HubRoute {
+        output: u16,
+        input: u16,
+    },
     EncoderStart,
     EncoderStop,
     YtFix(Fix),
@@ -30,6 +33,8 @@ pub enum Call {
     PlayerStop,
     CounterShow(Duration),
     CounterClear,
+    /// The MultiView input shown full screen (`None`: all four).
+    MonitorSolo(Option<u16>),
     LightsFireCue(u32, String),
 }
 
@@ -540,6 +545,27 @@ impl Counter for FakeCounter {
     }
 }
 
+#[derive(Clone)]
+pub struct FakeMonitor {
+    log: CallLog,
+    fails: Failures,
+}
+
+impl FakeMonitor {
+    /// The next call to `method` fails once.
+    pub fn fail_next(&self, method: &str) {
+        self.fails.add(method, 1);
+    }
+}
+
+#[async_trait]
+impl Monitor for FakeMonitor {
+    async fn set_solo(&self, input: Option<u16>) -> Result<()> {
+        self.log.push(Call::MonitorSolo(input));
+        self.fails.check("set_solo")
+    }
+}
+
 /// A lighting console that records the cues fired and reports the last one active.
 #[derive(Clone)]
 pub struct FakeLighting {
@@ -580,6 +606,7 @@ pub struct FakeHandles {
     pub player: FakePlayer,
     pub counter: FakeCounter,
     pub lights: FakeLighting,
+    pub monitor: FakeMonitor,
 }
 
 pub fn fake_devices() -> (Devices, CallLog, FakeHandles) {
@@ -614,6 +641,7 @@ pub fn fake_devices() -> (Devices, CallLog, FakeHandles) {
     };
     let counter = FakeCounter { log: log.clone(), fails: Failures::default() };
     let lights = FakeLighting { log: log.clone(), fails: Failures::default(), status: Arc::default() };
+    let monitor = FakeMonitor { log: log.clone(), fails: Failures::default() };
     let devices = Devices {
         stream: Arc::new(stream.clone()),
         screens: Arc::new(screens.clone()),
@@ -623,8 +651,9 @@ pub fn fake_devices() -> (Devices, CallLog, FakeHandles) {
         player: Arc::new(player.clone()),
         counter: Arc::new(counter.clone()),
         lights: Arc::new(lights.clone()),
+        monitor: Arc::new(monitor.clone()),
     };
-    (devices, log, FakeHandles { stream, screens, hub, encoder, yt, player, counter, lights })
+    (devices, log, FakeHandles { stream, screens, hub, encoder, yt, player, counter, lights, monitor })
 }
 
 #[cfg(test)]

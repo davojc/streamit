@@ -47,8 +47,18 @@ fn px(c: Rgb) -> ImgRgb<u8> {
     ImgRgb([c.0, c.1, c.2])
 }
 
+/// How wide a key's frame is, in pixels.
+const BORDER_PX: u32 = 5;
+
 pub fn render_key(look: &KeyLook) -> DynamicImage {
     let mut img = RgbImage::from_pixel(KEY_PX, KEY_PX, px(look.bg));
+    if let Some(b) = look.border {
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            if x < BORDER_PX || y < BORDER_PX || x >= KEY_PX - BORDER_PX || y >= KEY_PX - BORDER_PX {
+                *p = px(b);
+            }
+        }
+    }
     let lines: Vec<&str> = look.text.lines().collect();
     if !lines.is_empty() {
         let font = font();
@@ -95,7 +105,7 @@ mod tests {
     use crate::layout::{BLUE, WHITE};
 
     fn look(text: &str) -> KeyLook {
-        KeyLook { text: text.into(), bg: BLUE, fg: WHITE, blink: false }
+        KeyLook { text: text.into(), bg: BLUE, fg: WHITE, blink: false, border: None }
     }
 
     #[test]
@@ -104,6 +114,15 @@ mod tests {
         assert_eq!(img.dimensions(), (96, 96));
         assert_eq!(img.get_pixel(0, 0).0, [BLUE.0, BLUE.1, BLUE.2]);
         assert!(img.pixels().any(|p| p.0[0] > 200 && p.0[2] > 200), "white text pixels exist");
+    }
+
+    #[test]
+    fn a_border_frames_the_key() {
+        let mut l = look("");
+        l.border = Some(WHITE);
+        let img = render_key(&l).to_rgb8();
+        assert_eq!(img.get_pixel(0, 0).0, [255, 255, 255]);
+        assert_eq!(img.get_pixel(48, 48).0, [BLUE.0, BLUE.1, BLUE.2]);
     }
 
     #[test]
