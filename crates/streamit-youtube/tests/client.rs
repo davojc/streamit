@@ -288,6 +288,8 @@ async fn transition_posts_expected_query() {
             .and(query_param("broadcastStatus", name))
             .and(query_param("id", "x"))
             .and(query_param("part", "status"))
+            // Google answers a POST without a length with 411 Length Required.
+            .and(header("content-length", "0"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"x"})))
             .expect(1)
             .mount(&s)

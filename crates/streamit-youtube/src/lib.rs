@@ -67,6 +67,9 @@ impl YouTubeClient {
             quota::meter().add(quota::cost(&method, path));
             if let Some(b) = body {
                 req = req.json(b);
+            } else if method != Method::GET {
+                // Google refuses a bodyless POST with 411 Length Required.
+                req = req.header(reqwest::header::CONTENT_LENGTH, 0).body("");
             }
             let resp = req.send().await.map_err(auth::net_err)?;
             let status = resp.status();
