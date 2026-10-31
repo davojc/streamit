@@ -37,7 +37,9 @@ pub async fn assess(d: &Devices, c: &Config, bid: Option<&str>, player_active: b
     let stream_prog = d.stream.program().await.ok();
     let screens_prog = d.screens.program().await.ok();
     let hub = &c.videohub;
-    let route_on_decklink = if hub.input8_output != 0 && hub.decklink_input != 0 {
+    // Only a route Recover can put back counts: without a Default preset saying what
+    // input 8 normally shows, offering Recover for it would never end.
+    let route_on_decklink = if hub.input8_output != 0 && hub.decklink_input != 0 && c.media_normal_input() != 0 {
         d.hub.route_of(hub.input8_output).await.ok() == Some(hub.decklink_input)
     } else {
         false
@@ -87,11 +89,17 @@ pub async fn assess(d: &Devices, c: &Config, bid: Option<&str>, player_active: b
     Assessment { stage, offer, broadcast_unknown, mics_down: mic_muted }
 }
 
+/// What to do when input 8 is left on the DeckLink and StreamIt does not know what it
+/// normally shows.
+pub const UNKNOWN_NORMAL_ROUTE: &str = "Input 8 is still routed from the DeckLink, and no Default preset says what it      normally shows. Route it by hand on Routing › Stream ATEM, then save a preset and mark it Default so Recover can      put it back next time";
+
 /// One-press fix for a crash during a video. Every step is attempted; failures
 /// are collected and returned together. The route restore is always last, and is
-/// skipped (a failure) while the Stream ATEM is still on the DeckLink input.
-pub async fn recover(d: &Devices, c: &Config, levels: &LiveLevels) -> Result<()> {
+/// skipped (a failure) while the Stream ATEM is still on the DeckLink input. Done, it
+/// returns notes for the operator: a route it could not know how to put back.
+pub async fn recover(d: &Devices, c: &Config, levels: &LiveLevels) -> Result<Vec<String>> {
     let sa = &c.stream_atem;
+    let mut notes: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     let mut fail = |what: &str, e: crate::devices::DeviceError| failures.push(format!("{what}: {e}"));
 
@@ -164,10 +172,9 @@ pub async fn recover(d: &Devices, c: &Config, levels: &LiveLevels) -> Result<()>
             Ok(p) if p != sa.decklink_input => {
                 let normal = c.media_normal_input();
                 if normal == 0 {
-                    failures.push(
-                        "No Default preset says what input 8 normally shows, so its VideoHub route was not restored"
-                            .into(),
-                    );
+                    if d.hub.route_of(hub.input8_output).await.is_ok_and(|r| r == hub.decklink_input) {
+                        notes.push(UNKNOWN_NORMAL_ROUTE.into());
+                    }
                 } else if let Err(e) = d.hub.route(hub.input8_output, normal).await {
                     fail("Could not restore the VideoHub route for input 8", e);
                 }
@@ -177,7 +184,7 @@ pub async fn recover(d: &Devices, c: &Config, levels: &LiveLevels) -> Result<()>
         }
     }
 
-    if failures.is_empty() { Ok(()) } else { Err(crate::devices::DeviceError::Other(failures.join("; "))) }
+    if failures.is_empty() { Ok(notes) } else { Err(crate::devices::DeviceError::Other(failures.join("; "))) }
 }
 
 #[cfg(test)]
@@ -439,6 +446,34 @@ mod tests {
         recover(&d, &cfg(), &LiveLevels::default()).await.unwrap();
         assert!(!log.calls().iter().any(|c| matches!(c, Call::StreamSetPreview(_))));
         assert!(log.calls().contains(&Call::StreamAuto));
+    }
+
+    /// No Default preset (nor fallback) says what input 8 normally shows.
+    fn cfg_unknown_normal() -> Config {
+        let mut c = cfg();
+        c.videohub.fallback_normal_input = 0;
+        c
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_normal_route_is_a_note_not_a_failure() {
+        let (d, log, h) = rig();
+        h.hub.set_route(OUT, DK);
+        let notes = recover(&d, &cfg_unknown_normal(), &LiveLevels::default()).await.unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("Default"), "{notes:?}");
+        assert!(!log.calls().iter().any(|c| matches!(c, Call::HubRoute { .. })));
+        // Input 8 not on the DeckLink: nothing to say.
+        h.hub.set_route(OUT, CAM8);
+        assert!(recover(&d, &cfg_unknown_normal(), &LiveLevels::default()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_route_recover_cannot_restore_does_not_keep_offering_recover() {
+        let (d, _l, h) = rig();
+        h.hub.set_route(OUT, DK);
+        assert!(assess(&d, &cfg_unknown_normal(), None, false).await.offer.is_empty());
+        assert_eq!(assess(&d, &cfg(), None, false).await.offer, vec![Offer::Recover]);
     }
 
     #[tokio::test(start_paused = true)]

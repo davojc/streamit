@@ -421,10 +421,14 @@ impl Config {
     }
 
     /// The router input the Media input normally shows: the Default preset's, else the
-    /// one set before Default presets (0 = not known).
+    /// one set before Default presets (0 = not known). Never the DeckLink: a preset
+    /// saved while a video played does not say what it normally shows.
     pub fn media_normal_input(&self) -> u16 {
-        let from_default =
-            self.media_dest().and_then(|m| self.stream_routing.normal_preset().map(|p| p.input(m))).filter(|&i| i != 0);
+        let decklink = self.videohub.decklink_input;
+        let from_default = self
+            .media_dest()
+            .and_then(|m| self.stream_routing.normal_preset().map(|p| p.input(m)))
+            .filter(|&i| i != 0 && i != decklink);
         from_default.unwrap_or(self.videohub.fallback_normal_input)
     }
 
@@ -578,6 +582,10 @@ mod tests {
         assert_eq!(c.media_normal_input(), 13, "slot 2 is not the default");
         c.stream_routing.default_preset = Some(2);
         assert_eq!(c.media_normal_input(), 5);
+        // Saved while a video played: the DeckLink is not what it normally shows.
+        c.videohub.decklink_input = 40;
+        c.stream_routing.presets[0].inputs[7] = 40;
+        assert_eq!(c.media_normal_input(), 13);
     }
 
     #[test]

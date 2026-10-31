@@ -1642,7 +1642,12 @@ impl Engine {
             async move {
                 let l = lock(&levels).clone();
                 let ok = match recovery::recover(&d, &c, &l).await {
-                    Ok(()) => true,
+                    Ok(notes) => {
+                        if !notes.is_empty() {
+                            set_warning(&snap, format!("Recover finished: {}", notes.join("; ")));
+                        }
+                        true
+                    }
                     Err(e) => {
                         set_warning(&snap, format!("Recover could not finish: {e}"));
                         false
