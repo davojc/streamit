@@ -230,6 +230,8 @@ pub struct PlayoutConfig {
     /// The countdown video also goes online: routed to Stream ATEM input 8 and put on
     /// program with its sound. Off: online sees the opening still until T-0.
     pub countdown_to_stream: bool,
+    /// Gain trim applied by the player, in dB, as a video's level is.
+    pub countdown_gain_db: f32,
     /// The closing countdown plays at End Service, before the closing still.
     pub closing_on: bool,
     pub closing_file: PathBuf,
@@ -237,6 +239,7 @@ pub struct PlayoutConfig {
     /// audio faded down first).
     pub closing_to_hall: bool,
     pub closing_to_stream: bool,
+    pub closing_gain_db: f32,
 }
 
 impl PlayoutConfig {
@@ -254,10 +257,12 @@ impl Default for PlayoutConfig {
             countdown_on: true,
             countdown_file: PathBuf::from("countdown.mp4"),
             countdown_to_stream: false,
+            countdown_gain_db: 0.0,
             closing_on: false,
             closing_file: PathBuf::from("closing.mp4"),
             closing_to_hall: true,
             closing_to_stream: true,
+            closing_gain_db: 0.0,
         }
     }
 }

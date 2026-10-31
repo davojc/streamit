@@ -243,6 +243,7 @@ impl StreamItApp {
                         );
                     }
                     ui.horizontal_wrapped(|ui| self.countdown_switches(ui, which, config));
+                    ui.horizontal(|ui| self.countdown_level(ui, which, config));
                     ui.horizontal_wrapped(|ui| self.countdown_test(ui, snap, which, config, engine));
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -298,7 +299,13 @@ impl StreamItApp {
                 {
                     changed = Some(Box::new(move |c| c.playout.closing_on = on));
                 }
-                if ui.add_enabled(on, egui::Checkbox::new(&mut hall, "Hall screens")).changed() {
+                if ui
+                    .add_enabled(on, egui::Checkbox::new(&mut hall, "Hall screens"))
+                    .on_hover_text(
+                        "The stream audio fades down as it starts, so its sound from the hall speakers does not go                          online.",
+                    )
+                    .changed()
+                {
                     changed = Some(Box::new(move |c| c.playout.closing_to_hall = hall));
                 }
                 if ui
@@ -315,6 +322,32 @@ impl StreamItApp {
         }
         if let Some(change) = changed {
             self.save_setup(change);
+        }
+    }
+
+    /// The countdown's level, as a video's: a trim the player applies. Saved at once.
+    fn countdown_level(&mut self, ui: &mut Ui, which: Countdown, config: &Config) {
+        let p = &config.playout;
+        let mut db = match which {
+            Countdown::Opening => p.countdown_gain_db,
+            Countdown::Closing => p.closing_gain_db,
+        };
+        ui.label(RichText::new("Level").size(14.0).color(theme::MUTED));
+        let changed = ui
+            .scope(|ui| {
+                ui.visuals_mut().selection.bg_fill = theme::BLUE;
+                ui.spacing_mut().slider_width = 220.0;
+                ui.add(egui::Slider::new(&mut db, -20.0..=6.0).step_by(1.0).show_value(false).trailing_fill(true))
+                    .on_hover_text("Turn down a countdown that came in too loud.")
+                    .changed()
+            })
+            .inner;
+        ui.label(RichText::new(view::fmt_db(db)).font(theme::mono(15.0)));
+        if changed {
+            self.save_setup(move |c| match which {
+                Countdown::Opening => c.playout.countdown_gain_db = db,
+                Countdown::Closing => c.playout.closing_gain_db = db,
+            });
         }
     }
 

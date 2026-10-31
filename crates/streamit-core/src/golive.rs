@@ -337,7 +337,7 @@ pub async fn countdown(
     // Subscribe before playing so `Ended` cannot be missed.
     let mut events = d.player.events();
     step(StepId::CountdownVideo, StepMark::Now(Some("Loading".into())));
-    let duration = match d.player.load(&c.playout.countdown_file, 0.0).await {
+    let duration = match d.player.load(&c.playout.countdown_file, c.playout.countdown_gain_db).await {
         Ok(d) => d,
         Err(e) => {
             step(StepId::CountdownVideo, StepMark::Failed(e.to_string()));
@@ -371,6 +371,12 @@ pub async fn countdown(
                 warn(format!("The countdown plays to the hall only: {e}"));
             }
         }
+    }
+    // Not online: none of its sound either.
+    if stream_route.is_none()
+        && let Err(e) = keep_countdown_off_stream(d, c).await
+    {
+        warn(format!("Could not turn off input 8 audio: {e}"));
     }
     if let Err(e) = d.player.play().await {
         return video_failed(d, c, &progress, &warn, &report, None, stream_route, duration, e.to_string()).await;
@@ -524,6 +530,16 @@ pub async fn countdown(
 /// Input 8's sound, which carries the countdown video's when it goes to the stream.
 pub(crate) fn countdown_audio(c: &Config) -> AudioSourceId {
     AudioSourceId { input: c.stream_atem.decklink_input, source: crate::rollin::STEREO_SOURCE }
+}
+
+/// A countdown that is not going online: input 8's sound off, so the video's sound
+/// cannot reach the stream. Left alone when input 8 is one of the stream audio sources.
+pub(crate) async fn keep_countdown_off_stream(d: &Devices, c: &Config) -> Result<()> {
+    let in8 = countdown_audio(c);
+    if c.stream_atem.mic_sources.iter().any(|m| m.input == in8.input) {
+        return Ok(());
+    }
+    d.stream.set_audio_on(in8, false).await
 }
 
 /// The countdown online too: route input 8 to the DeckLink while it is off program, as
@@ -1158,7 +1174,7 @@ mod tests {
         let run = spawn_countdown(&d, &c, Readiness::Ready, LiveLevels::default());
         sleep(Duration::from_secs(3)).await;
         assert_eq!(h.stream.program().await.unwrap(), STILL);
-        assert!(!log.calls().iter().any(|c| matches!(c, Call::HubRoute { .. } | Call::StreamSetAudioOn(..))));
+        assert!(!log.calls().iter().any(|c| matches!(c, Call::HubRoute { .. } | Call::StreamSetAudioOn(_, true))));
         h.player.emit(PlayerEvent::Ended);
         assert!(matches!(run.task.await.unwrap().unwrap(), CountdownOutcome::Live { .. }));
         let warns = run.warns.lock().unwrap();
@@ -1166,6 +1182,28 @@ mod tests {
             warns.iter().any(|w| w == "The countdown plays to the hall only: VideoHub not configured"),
             "{warns:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hall_only_countdown_plays_at_its_level_with_input_8_off() {
+        let (d, log, h) = fake_devices();
+        let mut c = Config::default();
+        c.playout.countdown_gain_db = -4.0;
+        h.player.set_duration(Duration::from_secs(60));
+        h.player.set_position(Some(Duration::ZERO));
+        let run = spawn_countdown(&d, &c, Readiness::Ready, LiveLevels::default());
+        sleep(MS(250)).await;
+        assert_in_order(
+            &log.calls(),
+            &[
+                Call::PlayerLoad(PathBuf::from("countdown.mp4"), -4.0),
+                Call::StreamSetAudioOn(IN8, false),
+                Call::PlayerPlay,
+            ],
+        );
+        assert!(!log.calls().contains(&Call::StreamSetAudioOn(IN8, true)));
+        run.cancel.cancel();
+        run.task.await.unwrap().unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -1177,11 +1215,12 @@ mod tests {
         let run = spawn_countdown(&d, &c, Readiness::Ready, LiveLevels::default());
         sleep(MS(250)).await;
         assert_eq!(
-            log.calls()[..4],
+            log.calls()[..5],
             [
                 Call::PlayerLoad(PathBuf::from("countdown.mp4"), 0.0),
                 Call::ScreensSetPreview(8),
                 Call::ScreensAuto,
+                Call::StreamSetAudioOn(IN8, false),
                 Call::PlayerPlay,
             ]
         );
@@ -1386,15 +1425,16 @@ mod tests {
         assert!(run.task.await.unwrap().is_err());
         let calls = log.calls();
         assert_eq!(
-            calls[..4],
+            calls[..5],
             [
                 Call::PlayerLoad(PathBuf::from("countdown.mp4"), 0.0),
                 Call::ScreensSetPreview(8),
                 Call::ScreensAuto,
+                Call::StreamSetAudioOn(IN8, false),
                 Call::PlayerPlay,
             ]
         );
-        assert_eq!(calls[4..], RECOVER);
+        assert_eq!(calls[5..], RECOVER);
         assert!(run.warns.lock().unwrap().iter().any(|w| w.contains("Go Live")));
     }
 

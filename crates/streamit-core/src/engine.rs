@@ -750,16 +750,16 @@ impl Engine {
                     return self.ignore(&cmd, &why);
                 }
                 let p = &self.config().playout;
-                let (name, path) = if *closing {
-                    ("Closing countdown", p.closing_file.clone())
+                let (name, path, gain_db) = if *closing {
+                    ("Closing countdown", p.closing_file.clone(), p.closing_gain_db)
                 } else {
-                    ("Opening countdown", p.countdown_file.clone())
+                    ("Opening countdown", p.countdown_file.clone(), p.countdown_gain_db)
                 };
                 let cue = Cue {
                     path,
                     name: name.into(),
                     destination: Destination::HallAndOnline,
-                    gain_db: 0.0,
+                    gain_db,
                     return_input: None,
                     scene: None,
                 };
@@ -3074,10 +3074,12 @@ mod tests {
         let mut e = Engine::spawn(d, cfg(vec![]));
         send(&e, Command::Countdown).await;
         until(&mut e, "Countdown", |s| matches!(s.stage, Stage::Countdown { .. })).await;
+        // The countdown itself turns input 8's sound off as it starts (hall only).
+        let before = log.calls().len();
         send(&e, Command::Recover).await;
         sleep(Duration::from_secs(3)).await;
         let in8_off = Call::StreamSetAudioOn(AudioSourceId { input: 8, source: -65280 }, false);
-        assert!(!log.calls().contains(&in8_off), "{:?}", log.calls());
+        assert!(!log.calls()[before..].contains(&in8_off), "{:?}", log.calls());
         assert!(matches!(snap(&e).stage, Stage::Countdown { .. }));
         assert!(!log.calls().contains(&Call::PlayerStop), "the countdown keeps running");
     }

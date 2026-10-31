@@ -6,7 +6,9 @@
 use crate::audio::{Target, fade};
 use crate::config::Config;
 use crate::devices::{Devices, Phase, PlayerEvent};
-use crate::golive::{GO_PUBLIC_WAIT, Stage, countdown_audio, cut, stream_to_countdown, transition_with_retry};
+use crate::golive::{
+    GO_PUBLIC_WAIT, Stage, countdown_audio, cut, keep_countdown_off_stream, stream_to_countdown, transition_with_retry,
+};
 use crate::steps::{StepId, StepMark};
 use std::sync::Arc;
 use std::time::Duration;
@@ -125,7 +127,8 @@ pub async fn end_service(
 }
 
 /// The closing countdown: to the hall screens and/or online (the stream audio faded down
-/// first, then input 8 routed to the DeckLink with its sound), until it ends or End
+/// first either way, then input 8 routed to the DeckLink with its sound, or input 8's
+/// sound kept off when it is not going online), until it ends or End
 /// Service is pressed again. The hall goes back to what it showed. Returns input 8's
 /// route before, when the stream was put on it: the closing still's cut takes the stream
 /// off it, then the caller puts the route back.
@@ -140,7 +143,7 @@ async fn closing_countdown(
     let p = &c.playout;
     let mut events = d.player.events();
     step(StepId::ClosingVideo, StepMark::Now(Some("Loading".into())));
-    let duration = match d.player.load(&p.closing_file, 0.0).await {
+    let duration = match d.player.load(&p.closing_file, p.closing_gain_db).await {
         Ok(t) => t,
         Err(e) => {
             step(StepId::ClosingVideo, StepMark::Failed(e.to_string()));
@@ -158,16 +161,23 @@ async fn closing_countdown(
             warnings.push(format!("Could not switch the hall to the closing countdown: {e}"));
         }
     }
+    // The stream audio goes down either way: in the hall only, the mics would carry the
+    // video's sound from the hall speakers.
+    let r = fade(&*d.stream, &c.stream_atem.mic_sources, Target::Floor, c.stream_atem.fade).await;
+    if let Err(e) = r {
+        warnings.push(format!("Could not fade the stream audio down: {e}"));
+    }
     let mut stream_route = None;
     if p.closing_to_stream {
-        let r = fade(&*d.stream, &c.stream_atem.mic_sources, Target::Floor, c.stream_atem.fade).await;
-        if let Err(e) = r {
-            warnings.push(format!("Could not fade the stream audio down: {e}"));
-        }
         match stream_to_countdown(d, c).await {
             Ok(prev) => stream_route = Some(prev),
             Err(e) => warnings.push(format!("The closing countdown does not go online: {e}")),
         }
+    }
+    if stream_route.is_none()
+        && let Err(e) = keep_countdown_off_stream(d, c).await
+    {
+        warnings.push(format!("Could not turn off input 8 audio: {e}"));
     }
     let mut mark = StepMark::done();
     if let Err(e) = d.player.play().await {
@@ -347,6 +357,31 @@ mod tests {
         assert!(!calls.iter().any(|x| matches!(x, Call::HubRoute { .. })), "hall only: no route");
         assert!(!calls.contains(&Call::YtTransition(Phase::Complete)), "the hold still runs");
         task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hall_only_closing_countdown_keeps_its_sound_off_the_stream() {
+        // The hall PA plays it: the stream mics would carry it, and input 8 must be off.
+        let (d, log, h, mut c) = closing();
+        c.playout.closing_to_stream = false;
+        c.playout.closing_gain_db = -6.0;
+        let (d2, c2) = (d.clone(), c.clone());
+        let task = tokio::spawn(async move { end_service(&d2, &c2, "b", Arc::default(), |_| {}, |_, _| {}).await });
+        sleep(Duration::from_secs(5)).await;
+        h.player.emit(PlayerEvent::Ended);
+        let out = task.await.unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        let calls = log.calls();
+        assert_in_order(
+            &calls,
+            &[
+                Call::PlayerLoad(c.playout.closing_file.clone(), -6.0),
+                Call::StreamSetAudioLevel(MIC, FLOOR_DB),
+                Call::StreamSetAudioOn(IN8, false),
+                Call::PlayerPlay,
+            ],
+        );
+        assert!(!calls.contains(&Call::StreamSetAudioOn(IN8, true)));
     }
 
     #[tokio::test(start_paused = true)]
