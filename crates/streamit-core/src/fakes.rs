@@ -237,17 +237,19 @@ impl StreamSwitcher for FakeSwitcher {
     }
     async fn set_audio_on(&self, src: AudioSourceId, on: bool) -> Result<()> {
         self.log.push(Call::StreamSetAudioOn(src, on));
-        self.fails.check("set_audio_on")
+        self.fails.check("set_audio_on")?;
+        let mut st = self.st.lock().unwrap();
+        let fader_db = *st.levels.get(&src).unwrap_or(&0.0);
+        let input = st.inputs.entry(src).or_insert(AudioInput { mix: AudioMix::Off, fader_db });
+        input.mix = if on { AudioMix::On } else { AudioMix::Off };
+        Ok(())
     }
+    /// As an ATEM: an input never switched on reports Off.
     async fn audio_input(&self, src: AudioSourceId) -> Result<AudioInput> {
         self.fails.check("audio_input")?;
-        self.st
-            .lock()
-            .unwrap()
-            .inputs
-            .get(&src)
-            .copied()
-            .ok_or_else(|| DeviceError::Refused(format!("no audio input {}/{}", src.input, src.source)))
+        let st = self.st.lock().unwrap();
+        let fader_db = *st.levels.get(&src).unwrap_or(&0.0);
+        Ok(st.inputs.get(&src).map_or(AudioInput { mix: AudioMix::Off, fader_db }, |i| AudioInput { fader_db, ..*i }))
     }
 }
 

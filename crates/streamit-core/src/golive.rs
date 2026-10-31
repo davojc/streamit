@@ -3,7 +3,7 @@
 //! Device errors never abort `prepare`; they become warnings. In `countdown` only a
 //! failure to load or play the countdown video (or the video itself failing) ends it
 //! with `Err`; every other device error is a warning and the sequence carries on.
-use crate::audio::{LiveLevels, Target, down_threshold, fade};
+use crate::audio::{LiveLevels, Target, down_threshold, fade, switch_off, switch_on};
 use crate::config::{AudioSourceId, Config};
 use crate::devices::{
     BroadcastCheck, BroadcastSummary, DeviceError, Devices, Health, Phase, PlayerEvent, Result, Switcher,
@@ -520,7 +520,7 @@ pub async fn countdown(
     // T-0 cut the stream off input 8: its sound off, its route back.
     if let Some(prev) = stream_route {
         let mut problems = Vec::new();
-        if let Err(e) = d.stream.set_audio_on(countdown_audio(c), false).await {
+        if let Err(e) = switch_off(&*d.stream, countdown_audio(c), c.stream_atem.fade).await {
             problems.push(format!("Could not turn off input 8 audio: {e}"));
         }
         crate::rollin::restore_route(d, c, prev, &mut problems).await;
@@ -573,7 +573,7 @@ pub(crate) async fn keep_countdown_off_stream(d: &Devices, c: &Config) -> Result
     if c.stream_atem.mic_sources.iter().any(|m| m.input == in8.input) {
         return Ok(());
     }
-    d.stream.set_audio_on(in8, false).await
+    switch_off(&*d.stream, in8, c.stream_atem.fade).await
 }
 
 /// The countdown online too: route input 8 to the DeckLink while it is off program, as
@@ -603,18 +603,15 @@ pub(crate) async fn stream_to_countdown(d: &Devices, c: &Config) -> std::result:
     }
     sleep(hub.settle).await;
     let in8 = countdown_audio(c);
-    let audio = async {
-        d.stream.set_audio_on(in8, true).await?;
-        d.stream.set_audio_level(in8, 0.0).await
-    };
-    if let Err(e) = audio.await {
+    // Before the countdown plays, so its fade up is silent.
+    if let Err(e) = switch_on(&*d.stream, in8, 0.0, sa.fade).await {
         problems.push(format!("Could not turn on input 8 audio: {e}"));
     } else if let Err(e) = cut(&*d.stream, sa.decklink_input).await {
         problems.push(format!("Could not switch the stream to the countdown: {e}"));
     } else {
         return Ok(prev);
     }
-    if let Err(e) = d.stream.set_audio_on(in8, false).await {
+    if let Err(e) = switch_off(&*d.stream, in8, sa.fade).await {
         problems.push(format!("Could not turn off input 8 audio: {e}"));
     }
     crate::rollin::restore_route(d, c, prev, &mut problems).await;
@@ -625,7 +622,7 @@ pub(crate) async fn stream_to_countdown(d: &Devices, c: &Config) -> std::result:
 /// stream back to the opening still (one Auto), then input 8's route back to `prev`.
 async fn stream_off_countdown(d: &Devices, c: &Config, prev: u16, warn: &impl Fn(String)) {
     let mut problems = Vec::new();
-    if let Err(e) = d.stream.set_audio_on(countdown_audio(c), false).await {
+    if let Err(e) = switch_off(&*d.stream, countdown_audio(c), c.stream_atem.fade).await {
         problems.push(format!("Could not turn off input 8 audio: {e}"));
     }
     if let Err(e) = d.stream.wait_transition_done(crate::rollin::TRANSITION_TIMEOUT).await {

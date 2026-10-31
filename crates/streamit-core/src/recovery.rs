@@ -1,6 +1,6 @@
 //! Startup assessment and recovery. `assess` only reads; it never changes a device.
 //! `recover` is the one-press fix for a crash during a video.
-use crate::audio::{LiveLevels, Target, down_threshold, fade};
+use crate::audio::{LiveLevels, Target, down_threshold, fade, switch_off};
 use crate::config::{AudioSourceId, Config};
 use crate::devices::{Devices, EncoderStatus, Result};
 use crate::golive::{Readiness, Stage, cut};
@@ -161,7 +161,7 @@ pub async fn recover(d: &Devices, c: &Config, levels: &LiveLevels) -> Result<Vec
 
     // 4. Input 8 audio off.
     let in8 = AudioSourceId { input: sa.decklink_input, source: STEREO_SOURCE };
-    if let Err(e) = d.stream.set_audio_on(in8, false).await {
+    if let Err(e) = switch_off(&*d.stream, in8, sa.fade).await {
         fail("Could not turn off input 8 audio", e);
     }
 

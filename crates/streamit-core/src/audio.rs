@@ -1,5 +1,5 @@
 use crate::config::{AudioSourceId, write_atomic};
-use crate::devices::{InputName, Result, StreamSwitcher};
+use crate::devices::{AudioMix, InputName, Result, StreamSwitcher};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -167,6 +167,34 @@ pub async fn hand_over(
     (true, Ok(()))
 }
 
+/// Switches a source on without a jump: its level to the floor first, then on, then
+/// faded up to `to_db` over `over`.
+pub async fn switch_on(sw: &dyn StreamSwitcher, src: AudioSourceId, to_db: f32, over: Duration) -> Result<()> {
+    on_at_floor(sw, src).await?;
+    fade(sw, &[src], Target::Level(to_db), over).await
+}
+
+/// The first half of `switch_on`, for a caller that fades the source up alongside
+/// something else: its level to the floor, then on.
+pub async fn on_at_floor(sw: &dyn StreamSwitcher, src: AudioSourceId) -> Result<()> {
+    sw.set_audio_level(src, FLOOR_DB).await?;
+    sw.set_audio_on(src, true).await
+}
+
+/// Switches a source off without a cut: faded to the floor over `over`, then off. A
+/// source already off, or already at the floor, is not faded. It goes off even when the
+/// fade fails; the fade's error is still returned.
+pub async fn switch_off(sw: &dyn StreamSwitcher, src: AudioSourceId, over: Duration) -> Result<()> {
+    let off = sw.audio_input(src).await.is_ok_and(|i| i.mix == AudioMix::Off);
+    let faded = match sw.audio_level(src).await {
+        _ if off => Ok(()),
+        Ok(db) if db <= FLOOR_DB => Ok(()),
+        _ => fade(sw, &[src], Target::Floor, over).await,
+    };
+    let off = sw.set_audio_on(src, false).await;
+    faded.and(off)
+}
+
 pub enum Target<'a> {
     Floor,
     /// One level for every source (the duck level).
@@ -218,6 +246,7 @@ pub async fn fade(sw: &dyn StreamSwitcher, srcs: &[AudioSourceId], to: Target<'_
 mod tests {
     use super::*;
     use crate::config::AudioSourceId;
+    use crate::devices::AudioInput;
     use crate::fakes::{Call, fake_devices};
     use std::time::Duration;
 
@@ -231,6 +260,53 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    const IN8: AudioSourceId = AudioSourceId { input: 8, source: -65280 };
+
+    #[tokio::test(start_paused = true)]
+    async fn switching_on_starts_at_the_floor_then_turns_on_then_fades_up() {
+        let (d, log, h) = fake_devices();
+        h.stream.set_audio_level_state(IN8, -6.0);
+        switch_on(&*d.stream, IN8, 0.0, Duration::from_secs(1)).await.unwrap();
+        let calls = log.calls();
+        assert_eq!(calls[..2], [Call::StreamSetAudioLevel(IN8, FLOOR_DB), Call::StreamSetAudioOn(IN8, true)]);
+        let ups = level_calls(calls[2..].to_vec());
+        assert_eq!(ups.len(), 20, "a fade, not a jump: {ups:?}");
+        assert!(ups.windows(2).all(|w| w[0] < w[1]), "{ups:?}");
+        assert_eq!(ups.last(), Some(&0.0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn switching_off_fades_down_then_turns_off() {
+        let (d, log, h) = fake_devices();
+        h.stream.set_audio_level_state(IN8, 0.0);
+        h.stream.set_audio_input_state(IN8, AudioInput { mix: AudioMix::On, fader_db: 0.0 });
+        switch_off(&*d.stream, IN8, Duration::from_secs(1)).await.unwrap();
+        let calls = log.calls();
+        assert_eq!(calls.last(), Some(&Call::StreamSetAudioOn(IN8, false)));
+        let downs = level_calls(calls[..calls.len() - 1].to_vec());
+        assert_eq!(downs.len(), 20, "{downs:?}");
+        assert_eq!(downs.last(), Some(&FLOOR_DB));
+        // Already at the floor, or already off: straight off, no fade.
+        let (d, log, h) = fake_devices();
+        h.stream.set_audio_level_state(IN8, FLOOR_DB);
+        h.stream.set_audio_input_state(IN8, AudioInput { mix: AudioMix::On, fader_db: FLOOR_DB });
+        switch_off(&*d.stream, IN8, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(log.calls(), vec![Call::StreamSetAudioOn(IN8, false)]);
+        let (d, log, _h) = fake_devices();
+        switch_off(&*d.stream, IN8, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(log.calls(), vec![Call::StreamSetAudioOn(IN8, false)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn switching_off_still_turns_off_when_the_fade_fails() {
+        let (d, log, h) = fake_devices();
+        h.stream.set_audio_level_state(IN8, 0.0);
+        h.stream.set_audio_input_state(IN8, AudioInput { mix: AudioMix::On, fader_db: 0.0 });
+        h.stream.fail_next("set_audio_level");
+        assert!(switch_off(&*d.stream, IN8, Duration::from_secs(1)).await.is_err());
+        assert_eq!(log.calls().last(), Some(&Call::StreamSetAudioOn(IN8, false)));
     }
 
     #[tokio::test(start_paused = true)]

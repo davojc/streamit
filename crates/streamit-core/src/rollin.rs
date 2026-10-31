@@ -8,7 +8,7 @@
 //!
 //! Device errors once the roll-in has started never stop the return path; they are
 //! collected and the outcome becomes `Failed { recover_needed: true, .. }`.
-use crate::audio::{LiveLevels, Target, all_down, down_threshold, fade};
+use crate::audio::{LiveLevels, Target, all_down, down_threshold, fade, on_at_floor, switch_off};
 use crate::config::{AudioSourceId, Config};
 use crate::devices::{Devices, PlayerEvent};
 use crate::golive::{COUNTER_TICK, cut};
@@ -339,15 +339,16 @@ pub async fn play_reporting(
     // were already down (R24: then they are left exactly as they were, before and after).
     let video_audio = dest.uses_stream();
     let mics_down = video_audio && !held_down;
-    if video_audio {
-        if let Err(e) = d.stream.set_audio_on(in8, true).await {
-            note(&mut problems, format!("Could not turn on input 8 audio: {e}"));
-        }
-        if let Err(e) = d.stream.set_audio_level(in8, 0.0).await {
-            note(&mut problems, format!("Could not set the input 8 audio level: {e}"));
-        }
-    }
-    // 4. Play, with the mic fade-down running alongside.
+    // Input 8 goes on silent; it fades up as the video plays.
+    let in8_on = video_audio
+        && match on_at_floor(&*d.stream, in8).await {
+            Ok(()) => true,
+            Err(e) => {
+                note(&mut problems, format!("Could not turn on input 8 audio: {e}"));
+                false
+            }
+        };
+    // 4. Play, with the mic fade-down and input 8's fade-up running alongside.
     if mics_down {
         mics_ducked(true);
     }
@@ -355,14 +356,18 @@ pub async fn play_reporting(
         // R21: roll-ins duck to duck_db (the floor when duck_db is at or below it).
         if mics_down { fade(&*d.stream, &sa.mic_sources, Target::duck(sa.duck_db), sa.fade).await } else { Ok(()) }
     };
+    let fade_up = async { if in8_on { fade(&*d.stream, &[in8], Target::Level(0.0), sa.fade).await } else { Ok(()) } };
     let screens_and_play = async {
         let screens =
             if dest.screens_picture() { Some(cut(&*d.screens, c.screens_atem.decklink_input).await) } else { None };
         (screens, d.player.play().await)
     };
-    let (faded, (screens, played)) = tokio::join!(fade_down, screens_and_play);
+    let (faded, faded_up, (screens, played)) = tokio::join!(fade_down, fade_up, screens_and_play);
     if let Err(e) = faded {
         note(&mut problems, format!("Could not fade the stream audio down: {e}"));
+    }
+    if let Err(e) = faded_up {
+        note(&mut problems, format!("Could not fade input 8 audio up: {e}"));
     }
     let screens_cut = matches!(screens, Some(Ok(())));
     if let Some(Err(e)) = screens {
@@ -421,7 +426,7 @@ pub async fn play_reporting(
     // R10: when the video was cut short, its sound goes first so it never lingers online.
     let cut_short = !matches!(end, End::Ended);
     let audio_off_first = video_audio && cut_short;
-    if audio_off_first && let Err(e) = d.stream.set_audio_on(in8, false).await {
+    if audio_off_first && let Err(e) = switch_off(&*d.stream, in8, sa.fade).await {
         note(&mut problems, format!("Could not turn off input 8 audio: {e}"));
     }
     // R11: the hall leaves the DeckLink first, before the stream's return transition.
@@ -470,16 +475,23 @@ pub async fn play_reporting(
             }
         }
     }
-    if mics_down && !unmuted {
-        match fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await {
-            Ok(()) => mics_ducked(false),
-            Err(e) => note(&mut problems, format!("Could not fade the stream audio up: {e}")),
+    // The mics come back up as input 8 fades down and goes off.
+    let mics_up = async {
+        if mics_down && !unmuted {
+            Some(fade(&*d.stream, &sa.mic_sources, Target::Live(levels), sa.fade).await)
+        } else {
+            None
         }
+    };
+    let in8_off =
+        async { if video_audio && !audio_off_first { switch_off(&*d.stream, in8, sa.fade).await } else { Ok(()) } };
+    let (up, off) = tokio::join!(mics_up, in8_off);
+    match up {
+        Some(Ok(())) => mics_ducked(false),
+        Some(Err(e)) => note(&mut problems, format!("Could not fade the stream audio up: {e}")),
+        None => {}
     }
-    if video_audio
-        && !audio_off_first
-        && let Err(e) = d.stream.set_audio_on(in8, false).await
-    {
+    if let Err(e) = off {
         note(&mut problems, format!("Could not turn off input 8 audio: {e}"));
     }
     if cut_short && let Err(e) = d.player.stop().await {
@@ -780,11 +792,13 @@ mod tests {
                 Call::HubRoute { output: OUT, input: DK },
                 Call::StreamSetPreview(8),
                 Call::StreamAuto,
+                // Input 8 goes on silent, and fades up only once the video plays.
+                Call::StreamSetAudioLevel(IN8, FLOOR_DB),
                 Call::StreamSetAudioOn(IN8, true),
-                Call::StreamSetAudioLevel(IN8, 0.0),
                 Call::ScreensSetPreview(8),
                 Call::ScreensAuto,
                 Call::PlayerPlay,
+                Call::StreamSetAudioLevel(IN8, 0.0),
             ],
         );
         assert!(calls.contains(&Call::StreamSetAudioLevel(MIC, FLOOR_DB)));
@@ -798,6 +812,12 @@ mod tests {
                 Call::StreamSetAudioOn(IN8, false),
                 Call::HubRoute { output: OUT, input: CAM8 },
             ],
+        );
+        // Off only once faded down.
+        let off = pos(&calls, &Call::StreamSetAudioOn(IN8, false));
+        assert_eq!(
+            calls[..off].iter().rev().find(|c| matches!(c, Call::StreamSetAudioLevel(s, _) if *s == IN8)),
+            Some(&Call::StreamSetAudioLevel(IN8, FLOOR_DB))
         );
         assert_eq!(calls.last(), Some(&Call::HubRoute { output: OUT, input: CAM8 }));
         assert!(!calls.contains(&Call::PlayerStop));

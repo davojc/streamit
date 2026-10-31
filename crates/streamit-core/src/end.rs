@@ -3,7 +3,7 @@
 //!
 //! Device errors never abort the sequence; they become warnings. The encoder is
 //! stopped even when YouTube fails or hangs.
-use crate::audio::{Target, fade};
+use crate::audio::{Target, fade, switch_off};
 use crate::config::Config;
 use crate::devices::{Devices, Phase, PlayerEvent};
 use crate::golive::{
@@ -58,7 +58,7 @@ pub async fn end_service(
     }
     // Off the closing countdown: input 8's sound off and its route back.
     if let Some(prev) = stream_route {
-        if let Err(e) = d.stream.set_audio_on(countdown_audio(c), false).await {
+        if let Err(e) = switch_off(&*d.stream, countdown_audio(c), sa.fade).await {
             warnings.push(format!("Could not turn off input 8 audio: {e}"));
         }
         crate::rollin::restore_route(d, c, prev, &mut warnings).await;

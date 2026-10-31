@@ -466,7 +466,10 @@ impl SimControl {
     pub fn snapshot(&self) -> SimView {
         let w = self.sim.lock();
         let speed = self.sim.clock.speed();
-        let mut mic_levels: Vec<_> = w.fairlight.iter().map(|(s, db)| (*s, *db)).collect();
+        // Input 8 carries the videos, not a mic: `in8_audio_on` reports it.
+        let in8 = self.cfg.stream_atem.decklink_input;
+        let mut mic_levels: Vec<_> =
+            w.fairlight.iter().filter(|(s, _)| s.input != in8).map(|(s, db)| (*s, *db)).collect();
         mic_levels.sort_by_key(|(s, _)| (s.input, s.source));
         let routed = w.routes.get(&self.cfg.videohub.input8_output).copied().unwrap_or(0);
         let decklink = self.cfg.videohub.decklink_input;
